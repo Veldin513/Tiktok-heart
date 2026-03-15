@@ -1,0 +1,8 @@
+{
+  "default": [
+    {
+      "name": "sample_target",
+      "url": "@sample_target"
+    }
+  ]
+}

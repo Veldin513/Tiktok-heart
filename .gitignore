@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and reports
+*.log
+logs/*
+!logs/.gitkeep
+backups/*
+!backups/.gitkeep
+
+# Runtime control/state files
+control/*.json
+!control/*.example.json
+!control/.gitkeep
+
+# Runtime profile data
+profiles/*
+!profiles/.gitkeep
+
+# Playwright/browser data
+playwright-report/
+
+# Local artifacts
+*.tmp
+*.bak

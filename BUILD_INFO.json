@@ -1,0 +1,13 @@
+{
+  "build": "stable-merged-2026-03-13",
+  "tiktok_messenger_sha256": "c8adb59bc8ada3f29043d9c9ee78a4edae0aa7a1bd37287e7b38b1ff820e7a1c",
+  "known_good_plan_a_sha256": "c8adb59bc8ada3f29043d9c9ee78a4edae0aa7a1bd37287e7b38b1ff820e7a1c",
+  "project_adapter_sha256": "5e7a1bf6ced213323e39a8e7f36479f443a5c2dd743a889580b9370eaee6ab73",
+  "notes": [
+    "ProjectAdapter compatibility restored",
+    "Known-good Plan A file copied in explicitly",
+    "Toolbar split into two rows to prevent clipped action buttons",
+    "Worker logs moved into profiles/<profile>/logs and common logs into /logs",
+    "Auth debug log exposed in UI log selector"
+  ]
+}
