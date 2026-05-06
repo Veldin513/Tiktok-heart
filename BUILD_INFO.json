@@ -1,6 +1,6 @@
 {
-  "build": "tiktok-heart-2.0-2026-05-02",
-  "version": "2.0.0",
+  "build": "tiktok-heart-2.1-2026-05-06",
+  "version": "2.1.0",
   "notes": [
     "Python runtime moved into yara_app/",
     "Legacy Windows launchers moved into scripts/windows/",
@@ -11,6 +11,9 @@
     "Worker self-test and maintenance actions added to the desktop app",
     "Pinned auto-refresh control, TikTok Heart branding, and run history panel added",
     "Desktop shell renamed to app_shell and UI dark background mode added",
-    "Pytest runtime isolated from the real profile and logs"
+    "Pytest runtime isolated from the real profile and logs",
+    "Security scan is available inside the desktop app",
+    "UI performance panel added for slow local API requests",
+    "Manual refresh now queues behind in-flight auto-refresh"
   ]
 }

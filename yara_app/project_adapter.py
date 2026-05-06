@@ -337,6 +337,98 @@ class ProjectAdapter:
             "app_shell_perf": self.app_shell_perf_log_path,
         }
 
+    def app_shell_performance_summary(self) -> dict[str, Any]:
+        raw_lines = self.tail_file(self.app_shell_perf_log_path, lines=120)
+        events: list[dict[str, Any]] = []
+        for line in raw_lines:
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            elapsed_text = parts[-1]
+            if not elapsed_text.endswith("ms"):
+                continue
+            try:
+                elapsed_ms = float(elapsed_text[:-2])
+            except ValueError:
+                continue
+            events.append({
+                "time": " ".join(parts[:2]),
+                "method": parts[2],
+                "path": parts[3],
+                "elapsed_ms": elapsed_ms,
+                "line": line,
+            })
+
+        latest = events[-1] if events else None
+        worst = max(events, key=lambda item: float(item.get("elapsed_ms") or 0), default=None)
+        warning_count = sum(1 for item in events if float(item.get("elapsed_ms") or 0) >= 1000)
+        status = "ok"
+        if warning_count:
+            status = "warning"
+        if worst and float(worst.get("elapsed_ms") or 0) >= 2500:
+            status = "critical"
+        return {
+            "exists": self.app_shell_perf_log_path.exists(),
+            "path": str(self.app_shell_perf_log_path),
+            "slow_count": len(events),
+            "warning_count": warning_count,
+            "latest": latest,
+            "worst": worst,
+            "events": list(reversed(events[-8:])),
+            "status": status,
+        }
+
+    def run_security_scan(self, *, tracked_only: bool = True) -> dict[str, Any]:
+        script = self.base_dir / "scripts" / "security_scan.py"
+        if not script.exists():
+            return {
+                "ok": False,
+                "exit_code": None,
+                "error": f"Security scan script not found: {script}",
+                "stdout": "",
+                "stderr": "",
+                "lines": [],
+            }
+
+        command = [sys.executable, str(script)]
+        if tracked_only:
+            command.append("--tracked-only")
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.base_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=90,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "exit_code": None,
+                "error": "Security scan timed out.",
+                "stdout": exc.stdout or "",
+                "stderr": exc.stderr or "",
+                "lines": [],
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }
+
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        return {
+            "ok": completed.returncode == 0,
+            "exit_code": completed.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "lines": [line for line in stdout.splitlines() if line.strip()],
+            "error_lines": [line for line in stderr.splitlines() if line.strip()],
+            "tracked_only": tracked_only,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+
     def validate_project(self) -> dict[str, Any]:
         self.ensure_runtime_files()
         critical_errors: list[str] = []
@@ -2610,7 +2702,7 @@ $action = @($task.Actions)[0]
     def app_metadata(self) -> dict[str, Any]:
         build_info = self._read_json(self.base_dir / "BUILD_INFO.json", {})
         package_info = self._read_json(self.base_dir / "package.json", {})
-        version = "2.0.0"
+        version = "2.1.0"
         if isinstance(package_info, dict):
             version = str(package_info.get("version") or version)
         return {
@@ -3208,6 +3300,7 @@ $action = @($task.Actions)[0]
             "state": state,
             "run": run,
             "run_history": run_history,
+            "performance": self.app_shell_performance_summary(),
             "file_details": self._build_file_details(),
             "health": health,
             "health_score": health.get("score", 0),

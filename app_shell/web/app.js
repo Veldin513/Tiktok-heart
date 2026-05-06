@@ -12,6 +12,7 @@ const state = {
   })(),
   refreshTimer: null,
   refreshInFlight: false,
+  refreshQueued: false,
   activeView: "overview",
   selectedProfileKey: null,
   messageLoaded: false,
@@ -198,6 +199,7 @@ function renderDiagnostics(diag) {
   renderProfiles(diag);
   renderDiagnosticsPanel(diag);
   renderOverviewSummary(diag);
+  renderPerformanceSummary(diag.performance || {});
 }
 
 function renderHealth(health) {
@@ -590,6 +592,53 @@ function renderOverviewSummary(diag) {
   ].join("\n");
 }
 
+function renderPerformanceSummary(performance = {}) {
+  const box = $("#performance-summary");
+  if (!box) return;
+  const latest = performance.latest || {};
+  const worst = performance.worst || {};
+  const events = Array.isArray(performance.events) ? performance.events : [];
+  const status = performance.status || "ok";
+  const statusKind = status === "critical" ? "bad" : status === "warning" ? "warn" : "ok";
+  const statusLabel = status === "critical" ? "критично" : status === "warning" ? "есть задержки" : "спокойно";
+  const latestMs = latest.elapsed_ms !== undefined ? `${Math.round(Number(latest.elapsed_ms || 0))} ms` : "--";
+  const worstMs = worst.elapsed_ms !== undefined ? `${Math.round(Number(worst.elapsed_ms || 0))} ms` : "--";
+  const rows = [
+    ["Статус", statusLabel, statusKind],
+    ["Последний slow", latestMs, statusKind],
+    ["Худший", worstMs, statusKind],
+    ["Событий", String(performance.slow_count || 0), Number(performance.warning_count || 0) ? "warn" : "ok"],
+  ];
+  const visibleEvents = events.length
+    ? events
+    : [{ method: "", path: "Медленных запросов пока нет", elapsed_ms: 0, time: "" }];
+
+  box.innerHTML = `
+    <div class="performance-cards">
+      ${rows.map(([label, value, kind]) => `
+        <div class="performance-card ${badgeKind(kind)}">
+          <strong>${escapeHtml(value)}</strong>
+          <span>${escapeHtml(label)}</span>
+        </div>
+      `).join("")}
+    </div>
+    <div class="performance-events">
+      ${visibleEvents.map((item) => {
+        const title = [item.method, item.path].filter(Boolean).join(" ") || item.path || "--";
+        const meta = item.elapsed_ms
+          ? `${Math.round(Number(item.elapsed_ms))} ms · ${item.time || ""}`
+          : "лог пуст";
+        return `
+          <div class="performance-event">
+            <span>${escapeHtml(title)}</span>
+            <small>${escapeHtml(meta)}</small>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function renderBrowser(browser) {
   state.selectedBrowserProfile = browser || {};
   const rows = [
@@ -796,7 +845,12 @@ function escapeHtml(value) {
 }
 
 async function refresh(options = {}) {
-  if (state.refreshInFlight) return;
+  if (state.refreshInFlight) {
+    if (!options.silent) {
+      state.refreshQueued = true;
+    }
+    return;
+  }
   state.refreshInFlight = true;
   const status = $("#refresh-state");
   if (status) {
@@ -824,6 +878,10 @@ async function refresh(options = {}) {
     throw error;
   } finally {
     state.refreshInFlight = false;
+    if (state.refreshQueued) {
+      state.refreshQueued = false;
+      refresh({ silent: true }).catch((error) => toast(error.message));
+    }
   }
 }
 
@@ -863,6 +921,15 @@ function renderMaintenanceResult(title, result = {}) {
   if (result.included_count !== undefined) lines.push(`files: ${result.included_count}`);
   if (result.error_count) lines.push(`warnings: ${result.error_count}`);
   if (result.path) lines.push(`path: ${result.path}`);
+  if (result.error) lines.push(`error: ${result.error}`);
+  if (Array.isArray(result.lines) && result.lines.length) {
+    lines.push("", ...result.lines.slice(0, 10));
+  }
+  if (Array.isArray(result.error_lines) && result.error_lines.length) {
+    lines.push("", ...result.error_lines.slice(0, 10));
+  }
+  if (result.exit_code !== undefined) lines.push(`exit_code: ${result.exit_code ?? "--"}`);
+  if (result.duration_ms !== undefined) lines.push(`duration: ${result.duration_ms} ms`);
   box.textContent = lines.join("\n").trim();
   flashChange(box.closest(".panel") || box);
 }
@@ -918,6 +985,17 @@ function bindActions() {
     const button = event.target.closest("[data-go-view]");
     if (!button) return;
     activateView(button.dataset.goView);
+  });
+
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-open-log-source]");
+    if (!button) return;
+    activateView("logs");
+    const source = $("#log-source");
+    if (source) {
+      source.value = button.dataset.openLogSource || "app_shell_perf";
+    }
+    loadLogs().catch((error) => toast(error.message));
   });
 
   document.addEventListener("click", async (event) => {
@@ -1159,6 +1237,24 @@ function bindActions() {
       });
       renderMaintenanceResult("Worker self-test", result);
       toast(result.ok ? "Self-test пройден" : "Self-test требует внимания");
+      await refresh();
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $("#security-scan-button").addEventListener("click", async () => {
+    const button = $("#security-scan-button");
+    button.disabled = true;
+    try {
+      const result = await api("/api/security-scan", {
+        method: "POST",
+        body: JSON.stringify({ tracked_only: true }),
+      });
+      renderMaintenanceResult("Security scan", result);
+      toast(result.ok ? "Security scan чистый" : "Security scan требует внимания");
       await refresh();
     } catch (error) {
       toast(error.message);

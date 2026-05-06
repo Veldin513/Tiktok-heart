@@ -1,6 +1,6 @@
 [package]
 name = "yara-control"
-version = "2.0.0"
+version = "2.1.0"
 description = "TikTok Heart desktop shell"
 authors = ["Yara"]
 edition = "2021"

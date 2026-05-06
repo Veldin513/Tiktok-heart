@@ -19,6 +19,13 @@ TikTok Heart is a Windows desktop control app for a local TikTok worker. It keep
 - Public-safe source backups that exclude private runtime data.
 - Diagnostics, logs, health checks, and maintenance tools.
 
+### 2.1 Highlights
+
+- Security scan can be started from the Services tab.
+- Overview includes a performance panel for slow local API requests.
+- Manual Refresh is queued behind active auto-refresh instead of being dropped.
+- Build metadata and release artifacts are aligned to version 2.1.0.
+
 ### Project Layout
 
 ```text
@@ -182,6 +189,13 @@ TikTok Heart - Windows-приложение для локального TikTok w
 - Backup авторизации выбранного профиля.
 - Backup исходников без приватных runtime-данных.
 - Диагностика, логи, здоровье проекта и обслуживание.
+
+### Что нового в 2.1
+
+- Security scan запускается прямо из вкладки "Сервисы".
+- В обзоре появилась панель производительности для медленных локальных API-запросов.
+- Ручное обновление теперь ставится в очередь, если автообновление уже выполняется.
+- Метаданные сборки и релизные артефакты приведены к версии 2.1.0.
 
 ### Структура проекта
 

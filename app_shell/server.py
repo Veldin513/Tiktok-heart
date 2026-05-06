@@ -169,7 +169,7 @@ class AppShellHandler(BaseHTTPRequestHandler):
     _diagnostics_cache_at = 0.0
     _diagnostics_cache_ttl = 5.0
 
-    server_version = "TikTokHeartDesktop/2.0"
+    server_version = "TikTokHeartDesktop/2.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -328,6 +328,9 @@ class AppShellHandler(BaseHTTPRequestHandler):
                     return
                 if parsed.path == "/api/worker-self-test":
                     self._handle_worker_self_test(payload)
+                    return
+                if parsed.path == "/api/security-scan":
+                    self._handle_security_scan(payload)
                     return
             except Exception as exc:  # noqa: BLE001
                 self._send_error_json(exc)
@@ -614,6 +617,12 @@ class AppShellHandler(BaseHTTPRequestHandler):
 
     def _handle_worker_self_test(self, _payload: dict[str, Any]) -> None:
         result = self.adapter.worker_starter_self_test()
+        self._send_json({"ok": True, "data": result})
+
+    def _handle_security_scan(self, payload: dict[str, Any]) -> None:
+        result = self.adapter.run_security_scan(
+            tracked_only=bool(payload.get("tracked_only", True)),
+        )
         self._send_json({"ok": True, "data": result})
 
 
