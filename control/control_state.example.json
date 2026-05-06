@@ -1,0 +1,11 @@
+{
+  "active_profile": "default",
+  "cooldown_hours": 12,
+  "dry_run": true,
+  "paused": false,
+  "stop_requested": false,
+  "last_run_pid": null,
+  "last_run_started_at": null,
+  "telegram_bot_pid": null,
+  "telegram_bot_started_at": null
+}

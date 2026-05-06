@@ -1,0 +1,9 @@
+{
+  "token": "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE",
+  "allowed_chat_ids": [123456789],
+  "poll_timeout": 50,
+  "connect_timeout": 65,
+  "page_size": 6,
+  "state_file": "control/telegram_bot_v2_state.json",
+  "admin_name": "Admin"
+}

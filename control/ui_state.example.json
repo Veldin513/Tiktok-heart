@@ -1,0 +1,11 @@
+{
+  "auto_refresh": true,
+  "selected_log": "log",
+  "log_filter": "all",
+  "log_search": "",
+  "log_line_limit": 160,
+  "target_search": "",
+  "compact_mode": true,
+  "restore_last_tab": false,
+  "selected_tab": 0
+}

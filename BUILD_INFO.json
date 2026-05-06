@@ -1,0 +1,16 @@
+{
+  "build": "tiktok-heart-2.0-2026-05-02",
+  "version": "2.0.0",
+  "notes": [
+    "Python runtime moved into yara_app/",
+    "Legacy Windows launchers moved into scripts/windows/",
+    "Tauri generated schemas and build caches removed from the source tree",
+    "Diagnostics schedule lookup optimized through schtasks with PowerShell fallback",
+    "Worker schedule starter fixed to use the project root",
+    "Worker reuses the logged-in Chromium context instead of opening TikTok twice",
+    "Worker self-test and maintenance actions added to the desktop app",
+    "Pinned auto-refresh control, TikTok Heart branding, and run history panel added",
+    "Desktop shell renamed to app_shell and UI dark background mode added",
+    "Pytest runtime isolated from the real profile and logs"
+  ]
+}

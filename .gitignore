@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Node / frontend
+node_modules/
+dist/
+playwright-report/
+
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and reports
+*.log
+*.log.*
+*.dump
+*.dmp
+logs/*
+!logs/.gitkeep
+backups/*
+!backups/.gitkeep
+
+# Runtime locks and local artifacts
+.desktop_app.lock
+control/*.lock
+*.tmp
+*.bak
+*.zip
+*.7z
+*.rar
+*.msi
+*.exe
+release/
+
+# Runtime control/state files
+control/*.json
+!control/*.example.json
+!control/.gitkeep
+
+# Runtime profile data
+profiles/*/browser/
+profiles/*/artifacts/
+profiles/*/logs/
+profiles/*/state/
+**/Cookies
+**/Login Data
+**/Local Storage/
+**/Session Storage/
+**/IndexedDB/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.ldb
+*.leveldb

@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TikTok Heart</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark"><img src="/app_icon.png" alt="" /></div>
+          <div>
+            <div class="brand-title">TikTok Heart</div>
+            <div class="brand-subtitle">Desktop worker</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="nav-item active" data-view="overview">Обзор</button>
+          <button class="nav-item" data-view="browser">Браузер</button>
+          <button class="nav-item" data-view="messages">Сообщения</button>
+          <button class="nav-item" data-view="profiles">Профили</button>
+          <button class="nav-item" data-view="services">Сервисы</button>
+          <button class="nav-item" data-view="diagnostics">Диагностика</button>
+          <button class="nav-item" data-view="logs">Логи</button>
+        </nav>
+        <div class="sidebar-footer">
+          <div class="footer-row">
+            <div class="refresh-stack">
+              <div class="muted-label">Автообновление</div>
+              <button id="refresh-toggle" class="soft-toggle on">Включено</button>
+            </div>
+            <button id="theme-toggle" class="icon-toggle theme-toggle" type="button" aria-label="Переключить тему" title="Переключить тему">
+              <span class="theme-glyph" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">Control center</div>
+            <h1 id="page-title">Обзор</h1>
+          </div>
+          <div class="top-actions">
+            <button class="btn secondary" data-action="toggle_dry_run" id="dry-run-button">LIVE</button>
+            <button class="btn ghost" id="refresh-button">Обновить</button>
+            <span id="refresh-state" class="refresh-state">ожидание</span>
+          </div>
+        </header>
+
+        <section class="status-strip">
+          <div class="status-pill" id="worker-pill">Worker</div>
+          <div class="status-pill" id="telegram-pill">Telegram</div>
+          <div class="status-pill" id="browser-pill">Browser</div>
+          <div class="status-pill" id="schedule-pill">Schedule</div>
+        </section>
+
+        <section class="view active" id="view-overview">
+          <div class="hero-grid">
+            <article class="health-panel">
+              <div class="panel-title">Готовность</div>
+              <div class="health-head">
+                <div>
+                  <div id="health-label" class="health-label">Проверка</div>
+                  <div id="health-summary" class="health-summary">Загрузка...</div>
+                </div>
+                <div class="health-score"><span id="health-score">--</span><small>/100</small></div>
+              </div>
+              <div class="score-track"><span id="health-score-fill"></span></div>
+              <div id="health-flags" class="health-flags"></div>
+            </article>
+            <article class="quick-card">
+              <div class="panel-title">Быстрые действия</div>
+              <div class="button-grid">
+                <button class="btn secondary" data-action="start_all">Запустить всё</button>
+                <button class="btn danger" data-action="stop_all">Остановить всё</button>
+                <button class="btn secondary" data-action="restart_all">Перезапустить всё</button>
+                <button class="btn secondary" data-action="toggle_pause">Пауза</button>
+                <button class="btn secondary" data-action="reset_runtime_flags">Сброс флагов</button>
+              </div>
+            </article>
+          </div>
+
+          <div class="card-grid six">
+            <article class="metric-card">
+              <div class="metric-label">Worker</div>
+              <div class="metric-value" id="worker-value">--</div>
+              <div class="metric-meta" id="worker-meta">PID: --</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Telegram</div>
+              <div class="metric-value" id="telegram-value">--</div>
+              <div class="metric-meta" id="telegram-meta">PID: --</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Профиль</div>
+              <div class="metric-value" id="profile-value">--</div>
+              <div class="metric-meta" id="profile-meta">--</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Сообщения</div>
+              <div class="metric-value" id="messages-value">--</div>
+              <div class="metric-meta" id="messages-meta">--</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Следующий запуск</div>
+              <div class="metric-value" id="schedule-value">--</div>
+              <div class="metric-meta" id="schedule-card-meta">--</div>
+            </article>
+            <article class="metric-card">
+              <div class="metric-label">Chromium</div>
+              <div class="metric-value" id="browser-size-value">--</div>
+              <div class="metric-meta" id="browser-size-meta">--</div>
+            </article>
+          </div>
+
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Операционная сводка</div>
+              <div id="setup-summary" class="setup-summary"></div>
+              <div id="overview-timeline" class="timeline-list"></div>
+              <div class="button-grid top-gap">
+                <button class="btn secondary" data-go-view="browser">Импорт из Chrome</button>
+                <button class="btn secondary" data-go-view="services">Автозапуск</button>
+                <button class="btn secondary" data-open-kind="browser_profile">Открыть профиль</button>
+                <button class="btn secondary" data-open-kind="logs">Логи</button>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Текущий прогон</div>
+              <div id="run-progress" class="run-progress"></div>
+              <pre id="run-state" class="mono-block"></pre>
+              <div id="run-history" class="history-list"></div>
+            </article>
+          </div>
+
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Сигналы</div>
+              <div id="health-signals" class="signal-list"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Что сделать</div>
+              <div id="recommendations" class="list-block"></div>
+            </article>
+          </div>
+          <pre id="setup-report" class="visually-hidden"></pre>
+        </section>
+
+        <section class="view" id="view-messages">
+          <div class="content-grid">
+            <article class="panel editor-panel">
+              <div class="panel-title">Пул сообщений</div>
+              <textarea id="message-editor" class="text-editor" spellcheck="false"></textarea>
+              <div class="editor-actions">
+                <button id="message-save" class="btn primary">Сохранить</button>
+                <button id="message-normalize" class="btn secondary">Нормализовать</button>
+                <button id="message-backup" class="btn secondary">Backup</button>
+                <span id="message-editor-state" class="hint">Готово</span>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Статистика</div>
+              <div id="message-stats" class="stat-grid"></div>
+              <div class="panel-title sub-title">Примеры</div>
+              <div id="message-sample" class="list-block"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-profiles">
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Профили</div>
+              <div id="profiles-list" class="profile-list"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Адресаты</div>
+              <div id="targets-list" class="target-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-browser">
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Chromium профиль</div>
+              <dl class="kv" id="browser-kv"></dl>
+              <div id="browser-storage" class="storage-summary"></div>
+              <div id="backup-list" class="backup-list"></div>
+              <button id="auth-backup-button" class="btn primary full">Backup авторизации</button>
+              <div id="auth-backup-result" class="hint backup-status"></div>
+              <button id="delete-selected-backups-button" class="btn danger full" disabled>Удалить выбранные</button>
+              <button id="prune-backups-button" class="btn secondary full">Удалить старые backup</button>
+              <button class="btn secondary full" data-open-kind="browser_profile">Открыть Chromium профиль</button>
+              <button class="btn secondary full" data-open-kind="backups">Открыть backup</button>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Импорт из Chrome</div>
+              <label class="field-label" for="chrome-profile">Профиль Chrome</label>
+              <select id="chrome-profile" class="select"></select>
+              <label class="field-label" for="bot-profile">Профиль бота</label>
+              <select id="bot-profile" class="select"></select>
+              <label class="field-label" for="import-mode">Режим импорта</label>
+              <select id="import-mode" class="select">
+                <option value="tiktok_session">TikTok session</option>
+                <option value="full_profile">Полный профиль Chrome</option>
+              </select>
+              <button id="import-button" class="btn primary full">Импортировать профиль</button>
+              <button id="compact-browser-button" class="btn secondary full">Очистить текущий профиль</button>
+              <p class="hint">Рекомендуемый режим копирует только TikTok/ByteDance cookies и небольшие session/storage файлы без кешей, расширений, истории и service workers. Перед импортом закрой Chrome и останови worker.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-services">
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Worker</div>
+              <div class="button-grid">
+                <button class="btn secondary" data-action="start_worker">Запустить</button>
+                <button class="btn secondary" data-action="stop_worker">Остановить</button>
+                <button class="btn secondary" data-action="restart_worker">Перезапустить</button>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Telegram</div>
+              <div class="button-grid">
+                <button class="btn secondary" data-action="start_telegram">Запустить</button>
+                <button class="btn secondary" data-action="stop_telegram">Остановить</button>
+                <button class="btn secondary" data-action="clear_telegram_lock">Очистить lock</button>
+              </div>
+            </article>
+            <article class="panel span-2">
+              <div class="panel-title">Автозапуск worker</div>
+              <div class="schedule-row">
+                <label><input id="schedule-enabled" type="checkbox" /> Включить</label>
+                <label><input id="schedule-logon" type="checkbox" /> При входе в Windows</label>
+                <label><input id="schedule-12h" type="checkbox" /> Каждые 12 часов</label>
+                <button id="schedule-save" class="btn primary">Сохранить</button>
+              </div>
+              <div id="schedule-meta" class="hint"></div>
+            </article>
+            <article class="panel span-2">
+              <div class="panel-title">Обслуживание 2.0</div>
+              <div class="button-grid">
+                <button id="worker-self-test-button" class="btn secondary">Self-test worker</button>
+                <button id="project-backup-button" class="btn secondary">Backup исходников</button>
+                <button id="maintenance-button" class="btn secondary">Очистить кэши и профиль</button>
+                <button class="btn secondary" data-open-kind="project">Открыть проект</button>
+              </div>
+              <pre id="maintenance-result" class="mono-block compact small-block"></pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-diagnostics">
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Сигналы</div>
+              <div id="diagnostic-issues" class="list-block"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Зависимости</div>
+              <div id="dependency-list" class="dependency-list"></div>
+            </article>
+            <article class="panel span-2">
+              <div class="panel-title row-title">
+                <span>Файлы проекта</span>
+                <span>
+                  <button class="btn secondary mini" data-export-diagnostics="json">Экспорт JSON</button>
+                  <button class="btn secondary mini" data-export-diagnostics="txt">Экспорт TXT</button>
+                  <button class="btn secondary mini" data-open-kind="project">Открыть проект</button>
+                </span>
+              </div>
+              <div id="file-list" class="file-list"></div>
+            </article>
+            <article class="panel span-2">
+              <div class="panel-title">Raw diagnostics</div>
+              <pre id="raw-diagnostics" class="mono-block compact"></pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-logs">
+          <article class="panel">
+            <div class="panel-title">Логи</div>
+            <div class="log-controls">
+              <select id="log-source" class="select compact-select"></select>
+              <select id="log-filter" class="select compact-select">
+                <option value="all">all</option>
+                <option value="errors">errors</option>
+                <option value="warnings">warnings</option>
+                <option value="success">success</option>
+                <option value="important">important</option>
+              </select>
+              <input id="log-search" class="input" placeholder="Поиск" />
+              <input id="log-lines" class="mini-input" type="number" min="40" max="900" step="20" value="160" />
+              <button id="logs-refresh" class="btn secondary">Обновить</button>
+              <button class="btn secondary" data-open-current-log>Открыть лог</button>
+              <button class="btn secondary" data-open-kind="logs">Папка логов</button>
+            </div>
+            <div id="logs-meta" class="hint">Загрузка...</div>
+            <pre id="logs" class="log-block"></pre>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
