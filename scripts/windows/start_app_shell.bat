@@ -2,11 +2,9 @@
 setlocal
 
 for %%I in ("%~dp0..\..") do set "ROOT=%%~fI\"
-set "PY=%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe"
-if not exist "%PY%" set "PY=python"
-set "PYW=%LOCALAPPDATA%\Python\pythoncore-3.14-64\pythonw.exe"
 
 cd /d "%ROOT%"
+call "%~dp0python_env.bat"
 
 set "PORT_FILE=%ROOT%control\app_shell_server.json"
 set "EXISTING_URL="
@@ -15,24 +13,28 @@ if exist "%PORT_FILE%" (
 )
 
 if defined EXISTING_URL (
-  curl.exe -fsS --max-time 1 "%EXISTING_URL%api/diagnostics" >nul 2>nul
+  curl.exe -fsS --max-time 1 "%EXISTING_URL%api/live" >nul 2>nul
   if not errorlevel 1 (
     start "" "%EXISTING_URL%"
     goto :done
   )
 )
 
-curl.exe -fsS --max-time 1 http://127.0.0.1:5874/api/diagnostics >nul 2>nul
+curl.exe -fsS --max-time 1 http://127.0.0.1:5874/api/live >nul 2>nul
 if not errorlevel 1 (
   start "" http://127.0.0.1:5874/
   goto :done
 )
 
-if exist "%PYW%" (
+if defined PYW (
   start "" "%PYW%" "%ROOT%app_shell\server.py" --open-browser
-) else (
+) else if defined PY (
   start "TikTok Heart" /min "%PY%" "%ROOT%app_shell\server.py" --open-browser
+) else (
+  echo Python executable was not found. Set YARA_PYTHON to a Python with project dependencies.
+  pause
 )
 
 :done
 endlocal
+exit /b 0

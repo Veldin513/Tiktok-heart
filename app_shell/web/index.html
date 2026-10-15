@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" data-ui-mode="simple">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>TikTok Heart</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=2.1.1" />
   </head>
   <body>
     <div class="app-shell">
@@ -13,7 +13,7 @@
           <div class="brand-mark"><img src="/app_icon.png" alt="" /></div>
           <div>
             <div class="brand-title">TikTok Heart</div>
-            <div class="brand-subtitle">Desktop worker</div>
+            <div class="brand-subtitle">Локальный центр управления</div>
           </div>
         </div>
         <nav class="nav">
@@ -21,9 +21,9 @@
           <button class="nav-item" data-view="browser">Браузер</button>
           <button class="nav-item" data-view="messages">Сообщения</button>
           <button class="nav-item" data-view="profiles">Профили</button>
-          <button class="nav-item" data-view="services">Сервисы</button>
-          <button class="nav-item" data-view="diagnostics">Диагностика</button>
-          <button class="nav-item" data-view="logs">Логи</button>
+          <button class="nav-item" data-view="services" data-advanced-nav>Управление</button>
+          <button class="nav-item" data-view="diagnostics" data-advanced-nav>Проверка</button>
+          <button class="nav-item" data-view="logs" data-advanced-nav>Журнал</button>
         </nav>
         <div class="sidebar-footer">
           <div class="footer-row">
@@ -41,11 +41,12 @@
       <main class="workspace">
         <header class="topbar">
           <div>
-            <div class="eyebrow">Control center</div>
+            <div class="eyebrow">Рабочее пространство</div>
             <h1 id="page-title">Обзор</h1>
           </div>
           <div class="top-actions">
-            <button class="btn secondary" data-action="toggle_dry_run" id="dry-run-button">LIVE</button>
+            <button class="btn secondary" data-action="toggle_dry_run" id="dry-run-button" data-advanced>LIVE</button>
+            <button class="btn ghost" id="mode-toggle" type="button">Расширенный режим</button>
             <button class="btn ghost" id="refresh-button">Обновить</button>
             <span id="refresh-state" class="refresh-state">ожидание</span>
           </div>
@@ -76,34 +77,24 @@
               <div class="panel-title">Быстрые действия</div>
               <div class="button-grid">
                 <button class="btn secondary" data-action="start_all">Запустить всё</button>
-                <button class="btn danger" data-action="stop_all">Остановить всё</button>
-                <button class="btn secondary" data-action="restart_all">Перезапустить всё</button>
                 <button class="btn secondary" data-action="toggle_pause">Пауза</button>
-                <button class="btn secondary" data-action="reset_runtime_flags">Сброс флагов</button>
+                <button class="btn danger" data-action="stop_all">Остановить всё</button>
               </div>
+              <details class="inline-disclosure">
+                <summary>Дополнительные действия</summary>
+                <div class="button-grid compact-actions">
+                  <button class="btn secondary" data-action="restart_all">Перезапустить всё</button>
+                  <button class="btn secondary" data-action="reset_runtime_flags">Сброс флагов</button>
+                </div>
+              </details>
             </article>
           </div>
 
           <div class="card-grid six">
             <article class="metric-card">
-              <div class="metric-label">Worker</div>
-              <div class="metric-value" id="worker-value">--</div>
-              <div class="metric-meta" id="worker-meta">PID: --</div>
-            </article>
-            <article class="metric-card">
-              <div class="metric-label">Telegram</div>
-              <div class="metric-value" id="telegram-value">--</div>
-              <div class="metric-meta" id="telegram-meta">PID: --</div>
-            </article>
-            <article class="metric-card">
               <div class="metric-label">Профиль</div>
               <div class="metric-value" id="profile-value">--</div>
               <div class="metric-meta" id="profile-meta">--</div>
-            </article>
-            <article class="metric-card">
-              <div class="metric-label">Сообщения</div>
-              <div class="metric-value" id="messages-value">--</div>
-              <div class="metric-meta" id="messages-meta">--</div>
             </article>
             <article class="metric-card">
               <div class="metric-label">Следующий запуск</div>
@@ -111,12 +102,28 @@
               <div class="metric-meta" id="schedule-card-meta">--</div>
             </article>
             <article class="metric-card">
-              <div class="metric-label">Chromium</div>
-              <div class="metric-value" id="browser-size-value">--</div>
-              <div class="metric-meta" id="browser-size-meta">--</div>
+              <div class="metric-label">Очередь</div>
+              <div class="metric-value" id="queue-value">--</div>
+              <div class="metric-meta" id="queue-meta">--</div>
             </article>
           </div>
 
+          <div class="content-grid focus-grid">
+            <article class="panel focus-card">
+              <div class="panel-title">Следующее действие</div>
+              <div id="focus-next" class="focus-value">--</div>
+              <div id="focus-next-meta" class="focus-meta">--</div>
+            </article>
+            <article class="panel focus-card">
+              <div class="panel-title">Что мешает</div>
+              <div id="focus-blocker" class="focus-value">--</div>
+              <div id="focus-blocker-meta" class="focus-meta">--</div>
+            </article>
+          </div>
+
+          <details id="overview-details" class="disclosure overview-disclosure">
+            <summary>Подробности и диагностика</summary>
+            <div class="disclosure-content">
           <div class="content-grid">
             <article class="panel">
               <div class="panel-title">Операционная сводка</div>
@@ -138,6 +145,16 @@
           </div>
 
           <div class="content-grid">
+            <article class="panel span-2">
+              <div class="panel-title row-title">
+                <span>Этапы работы</span>
+                <button id="overview-worker-self-test-button" class="btn secondary mini">Проверить без отправки</button>
+              </div>
+              <div id="worker-lifecycle" class="lifecycle-list"></div>
+            </article>
+          </div>
+
+          <div class="content-grid">
             <article class="panel">
               <div class="panel-title">Сигналы</div>
               <div id="health-signals" class="signal-list"></div>
@@ -150,12 +167,14 @@
           <div class="content-grid">
             <article class="panel span-2">
               <div class="panel-title row-title">
-                <span>Производительность 2.1</span>
+                <span>Быстродействие</span>
                 <button class="btn secondary mini" data-open-log-source="app_shell_perf">Открыть лог</button>
               </div>
               <div id="performance-summary" class="performance-grid"></div>
             </article>
           </div>
+            </div>
+          </details>
           <pre id="setup-report" class="visually-hidden"></pre>
         </section>
 
@@ -167,7 +186,7 @@
               <div class="editor-actions">
                 <button id="message-save" class="btn primary">Сохранить</button>
                 <button id="message-normalize" class="btn secondary">Нормализовать</button>
-                <button id="message-backup" class="btn secondary">Backup</button>
+                <button id="message-backup" class="btn secondary">Создать копию</button>
                 <span id="message-editor-state" class="hint">Готово</span>
               </div>
             </article>
@@ -196,16 +215,22 @@
         <section class="view" id="view-browser">
           <div class="content-grid">
             <article class="panel">
-              <div class="panel-title">Chromium профиль</div>
+              <div class="panel-title">Профиль браузера</div>
               <dl class="kv" id="browser-kv"></dl>
               <div id="browser-storage" class="storage-summary"></div>
+              <details class="disclosure browser-disclosure">
+                <summary>Резервные копии и восстановление</summary>
+                <div class="disclosure-content">
               <div id="backup-list" class="backup-list"></div>
-              <button id="auth-backup-button" class="btn primary full">Backup авторизации</button>
+              <button id="auth-backup-button" class="btn primary full">Создать копию авторизации</button>
               <div id="auth-backup-result" class="hint backup-status"></div>
-              <button id="delete-selected-backups-button" class="btn danger full" disabled>Удалить выбранные</button>
-              <button id="prune-backups-button" class="btn secondary full">Удалить старые backup</button>
-              <button class="btn secondary full" data-open-kind="browser_profile">Открыть Chromium профиль</button>
-              <button class="btn secondary full" data-open-kind="backups">Открыть backup</button>
+              <button id="restore-selected-backup-button" class="btn secondary full" disabled>Восстановить выбранную копию</button>
+              <button id="delete-selected-backups-button" class="btn danger full" disabled>Удалить выбранные копии</button>
+              <button id="prune-backups-button" class="btn secondary full">Удалить старые копии</button>
+              <button class="btn secondary full" data-open-kind="browser_profile">Открыть профиль браузера</button>
+              <button class="btn secondary full" data-open-kind="backups">Открыть папку с копиями</button>
+                </div>
+              </details>
             </article>
             <article class="panel">
               <div class="panel-title">Импорт из Chrome</div>
@@ -215,12 +240,12 @@
               <select id="bot-profile" class="select"></select>
               <label class="field-label" for="import-mode">Режим импорта</label>
               <select id="import-mode" class="select">
-                <option value="tiktok_session">TikTok session</option>
+                  <option value="tiktok_session">Только авторизация TikTok</option>
                 <option value="full_profile">Полный профиль Chrome</option>
               </select>
               <button id="import-button" class="btn primary full">Импортировать профиль</button>
-              <button id="compact-browser-button" class="btn secondary full">Очистить текущий профиль</button>
-              <p class="hint">Рекомендуемый режим копирует только TikTok/ByteDance cookies и небольшие session/storage файлы без кешей, расширений, истории и service workers. Перед импортом закрой Chrome и останови worker.</p>
+              <button id="compact-browser-button" class="btn secondary full">Очистить кэш профиля</button>
+              <p class="hint">Рекомендуемый режим переносит авторизацию TikTok и небольшие рабочие данные. Кэш, расширения, историю и фоновые данные браузера он не копирует. Перед импортом закройте Chrome и остановите worker.</p>
             </article>
           </div>
         </section>
@@ -243,23 +268,36 @@
                 <button class="btn secondary" data-action="clear_telegram_lock">Очистить lock</button>
               </div>
             </article>
-            <article class="panel span-2">
-              <div class="panel-title">Автозапуск worker</div>
+            <article class="panel span-2 schedule-panel">
+              <div class="panel-title row-title">
+                <span>Автозапуск</span>
+                <span id="schedule-mode" class="badge">Windows-старт</span>
+              </div>
               <div class="schedule-row">
-                <label><input id="schedule-enabled" type="checkbox" /> Включить</label>
-                <label><input id="schedule-logon" type="checkbox" /> При входе в Windows</label>
-                <label><input id="schedule-12h" type="checkbox" /> Каждые 12 часов</label>
+                <label class="setting-toggle">
+                  <input id="schedule-enabled" type="checkbox" />
+                  <span>
+                    <strong>Фоновый старт</strong>
+                    <small>включение ПК</small>
+                  </span>
+                </label>
+                <label class="setting-toggle">
+                  <input id="schedule-12h" type="checkbox" />
+                  <span>
+                    <strong>Повтор 12 часов</strong>
+                    <small>от запуска worker</small>
+                  </span>
+                </label>
                 <button id="schedule-save" class="btn primary">Сохранить</button>
               </div>
-              <div id="schedule-meta" class="hint"></div>
+              <div id="schedule-meta" class="schedule-meta"></div>
             </article>
             <article class="panel span-2">
-              <div class="panel-title">Обслуживание 2.1</div>
+              <div class="panel-title">Обслуживание</div>
               <div class="button-grid">
-                <button id="worker-self-test-button" class="btn secondary">Self-test worker</button>
-                <button id="security-scan-button" class="btn secondary">Security scan</button>
-                <button id="project-backup-button" class="btn secondary">Backup исходников</button>
-                <button id="maintenance-button" class="btn secondary">Очистить кэши и профиль</button>
+                <button id="worker-self-test-button" class="btn secondary">Проверить worker</button>
+                <button id="project-backup-button" class="btn secondary">Создать копию исходников</button>
+                <button id="maintenance-button" class="btn secondary">Очистить кэш и старые копии</button>
                 <button class="btn secondary" data-open-kind="project">Открыть проект</button>
               </div>
               <pre id="maintenance-result" class="mono-block compact small-block"></pre>
@@ -288,10 +326,12 @@
               </div>
               <div id="file-list" class="file-list"></div>
             </article>
-            <article class="panel span-2">
-              <div class="panel-title">Raw diagnostics</div>
-              <pre id="raw-diagnostics" class="mono-block compact"></pre>
-            </article>
+            <details class="disclosure span-2 raw-diagnostics">
+              <summary>Технические данные</summary>
+              <div class="disclosure-content">
+                <pre id="raw-diagnostics" class="mono-block compact"></pre>
+              </div>
+            </details>
           </div>
         </section>
 
@@ -321,6 +361,17 @@
     </div>
 
     <div id="toast" class="toast"></div>
-    <script src="/app.js"></script>
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <form method="dialog" class="confirm-card">
+        <div class="confirm-kicker">Требуется подтверждение</div>
+        <h2 id="confirm-title">Подтвердить действие</h2>
+        <p id="confirm-message"></p>
+        <div class="confirm-actions">
+          <button class="btn secondary" value="cancel">Отмена</button>
+          <button id="confirm-accept" class="btn danger" value="confirm">Продолжить</button>
+        </div>
+      </form>
+    </dialog>
+    <script src="/app.js?v=2.1.1"></script>
   </body>
 </html>

@@ -39,6 +39,43 @@ def test_toggle_profile_in_list(tmp_path: Path) -> None:
     assert updated.enabled is True
 
 
+def test_mapping_profiles_can_be_selected_by_key_without_fake_toggle(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "control" / "profiles.json",
+        {
+            "alpha": [{"name": "Alpha target", "url": "@alpha"}],
+            "beta": [{"name": "Beta target", "url": "@beta"}],
+        },
+    )
+    adapter = ProjectAdapter(tmp_path)
+
+    profiles = adapter.get_profiles()
+    assert all(profile.enabled for profile in profiles)
+    assert not any(profile.raw["supports_enabled"] for profile in profiles)
+
+    updated = adapter.set_active_profile_key("beta")
+
+    assert updated.key == "beta"
+    assert adapter.get_control_state()["active_profile"] == "beta"
+    assert next(profile for profile in adapter.get_profiles() if profile.key == "beta").active is True
+
+
+def test_mapping_profile_with_enabled_flag_can_be_toggled_by_key(tmp_path: Path) -> None:
+    write_json(
+        tmp_path / "control" / "profiles.json",
+        {
+            "alpha": {"name": "Alpha", "enabled": True, "targets": []},
+            "beta": {"name": "Beta", "enabled": False, "targets": []},
+        },
+    )
+    adapter = ProjectAdapter(tmp_path)
+
+    updated = adapter.toggle_profile_key("beta")
+
+    assert updated.enabled is True
+    assert adapter._read_json(adapter.profiles_path, {})["beta"]["enabled"] is True
+
+
 def test_message_pool_stats(tmp_path: Path) -> None:
     (tmp_path / "message_pool.txt").write_text("hello\n\nworld\n", encoding="utf-8")
     adapter = ProjectAdapter(tmp_path)

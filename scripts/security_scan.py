@@ -7,7 +7,6 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -77,9 +76,7 @@ def normalize(path: str | Path) -> str:
 def is_probably_text(path: Path) -> bool:
     if path.suffix.lower() in TEXT_EXTENSIONS:
         return True
-    if path.name in {".gitignore", ".gitattributes", "LICENSE"}:
-        return True
-    return False
+    return path.name in {".gitignore", ".gitattributes", "LICENSE"}
 
 
 def is_allowed(path: str, line: str) -> bool:

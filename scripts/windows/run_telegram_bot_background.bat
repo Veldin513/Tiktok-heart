@@ -2,9 +2,23 @@
 setlocal
 for %%I in ("%~dp0..\..") do cd /d "%%~fI"
 if not exist control mkdir control
-if exist "%LocalAppData%\Programs\Python\Python313\pythonw.exe" (
-  start "telegram-bot-v2" /min "%LocalAppData%\Programs\Python\Python313\pythonw.exe" -m yara_app.telegram_control_bot
-  exit /b
+call "%~dp0python_env.bat"
+if defined PYW (
+  start "telegram-bot-v2" /min "%PYW%" -m yara_app.telegram_control_bot
+  goto :done
 )
-start "telegram-bot-v2" /min pythonw.exe -m yara_app.telegram_control_bot
+if defined PY (
+  start "telegram-bot-v2" /min "%PY%" -m yara_app.telegram_control_bot
+  goto :done
+)
+where pythonw.exe >nul 2>nul
+if not errorlevel 1 (
+  start "telegram-bot-v2" /min pythonw.exe -m yara_app.telegram_control_bot
+  goto :done
+)
+echo Python executable was not found. Set YARA_PYTHON to a Python with project dependencies.
+pause
+
+:done
 endlocal
+exit /b

@@ -17,7 +17,6 @@ DEFAULT_COOLDOWN_HOURS = 12
 TIKTOK_BROWSER_CHANNEL = os.getenv('TIKTOK_BROWSER_CHANNEL', '').strip()
 WORK_BROWSER_HEADLESS = os.getenv('WORK_BROWSER_HEADLESS', '1') == '1'
 AUTH_BROWSER_HEADLESS = os.getenv('AUTH_BROWSER_HEADLESS', '0') == '1'
-ENABLE_WORK_BROWSER_ROUTING = False
 
 # Telegram
 def _csv_env(name: str) -> list[str]:
@@ -38,7 +37,6 @@ def _local_telegram_config() -> dict:
 _TG_LOCAL_CONFIG = _local_telegram_config()
 TG_TOKEN = os.getenv('TG_TOKEN', '').strip() or str(_TG_LOCAL_CONFIG.get("token") or "").strip()
 TG_CHAT_IDS = _csv_env('TG_CHAT_IDS') or [str(item).strip() for item in (_TG_LOCAL_CONFIG.get("allowed_chat_ids") or []) if str(item).strip()]
-TG_ALLOWED_CHAT_IDS = _csv_env('TG_ALLOWED_CHAT_IDS') or list(TG_CHAT_IDS)
 TG_DISABLE_NOTIFICATIONS = os.getenv('TG_DISABLE_NOTIFICATIONS', '0') == '1'
 
 # Files
@@ -67,27 +65,6 @@ def get_cli_profile(argv: list[str] | None = None) -> str | None:
     if not candidate or candidate.startswith("-") or "/" in candidate or "\\" in candidate or candidate.endswith(".py"):
         return None
     return candidate
-
-
-def load_message_variants() -> list[str]:
-    try:
-        if MESSAGE_POOL_FILE.exists():
-            lines = [line.strip() for line in MESSAGE_POOL_FILE.read_text(encoding="utf-8").splitlines()]
-            lines = [line for line in lines if line and not line.startswith("#")]
-            out = []
-            seen = set()
-            for item in lines:
-                if item not in seen:
-                    seen.add(item)
-                    out.append(item)
-            if out:
-                return out
-    except Exception:
-        pass
-    return list(DEFAULT_MESSAGES)
-
-
-MESSAGE_VARIANTS = load_message_variants()
 
 
 @dataclass

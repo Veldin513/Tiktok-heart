@@ -7,30 +7,15 @@ import os
 import time
 import urllib.error
 import urllib.request
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from yara_app.project_adapter import ProjectAdapter
 
-
 CONFIG_NAME = "telegram_bot_v2.json"
 LOCK_NAME = "telegram_bot_v2.lock"
-
-
-def parse_command(text: str) -> tuple[str, str]:
-    """Split a Telegram command into the command token and the remaining text.
-
-    The helper is intentionally tiny and dependency-free because it is used by
-    tests and can also serve future command-based entry points. Empty input
-    yields a pair of empty strings.
-    """
-
-    normalized = str(text or "").strip()
-    if not normalized:
-        return "", ""
-    command, _, rest = normalized.partition(" ")
-    return command, rest.strip()
 
 
 @dataclass(slots=True)
@@ -223,10 +208,8 @@ class TelegramControlBot:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     handle.write(payload)
             except Exception:
-                try:
+                with suppress(Exception):
                     os.close(fd)
-                except Exception:
-                    pass
                 raise
             return True
         return False

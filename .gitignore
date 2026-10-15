@@ -40,11 +40,12 @@ backups/*
 !backups/.gitkeep
 
 # Runtime locks and local artifacts
-.desktop_app.lock
 control/*.lock
 *.tmp
 *.bak
 *.zip
+*.tar.gz
+*.tgz
 *.7z
 *.rar
 *.msi

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
+
+import psutil
 
 import yara_app.runtime_paths as runtime_paths
 from yara_app.runtime_paths import ProfilePaths, RunLock, recover_browser_profile_after_reinstall
@@ -36,6 +39,20 @@ def test_run_lock_recovers_malformed_lock(tmp_path: Path) -> None:
 
     assert lock.acquire() is True
     assert lock_path.read_text(encoding="utf-8") == str(os.getpid())
+
+
+def test_run_lock_recovers_when_windows_reuses_the_saved_pid(tmp_path: Path, monkeypatch) -> None:
+    lock_path = tmp_path / "run.lock"
+    lock_path.write_text("1234", encoding="utf-8")
+    os.utime(lock_path, (100.0, 100.0))
+    monkeypatch.setattr(runtime_paths, "_process_is_running", lambda _pid: True)
+    monkeypatch.setattr(psutil, "Process", lambda _pid: SimpleNamespace(create_time=lambda: 200.0))
+
+    lock = RunLock(lock_path)
+
+    assert lock.acquire() is True
+    assert lock_path.read_text(encoding="utf-8") == str(os.getpid())
+    lock.release()
 
 
 def test_recover_browser_profile_moves_incompatible_user_data(tmp_path: Path, monkeypatch) -> None:

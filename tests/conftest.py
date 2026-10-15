@@ -5,7 +5,6 @@ import shutil
 import tempfile
 from pathlib import Path
 
-
 _TEST_RUNTIME = Path(tempfile.mkdtemp(prefix="yara_pytest_"))
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,4 +18,5 @@ if source_pool.exists():
 
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ANN001, ARG001
+    del exitstatus
     shutil.rmtree(_TEST_RUNTIME, ignore_errors=True)

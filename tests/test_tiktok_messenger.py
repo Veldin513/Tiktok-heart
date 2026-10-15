@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
-from yara_app.ttbot.models import ChatOpenMethod
-from yara_app.tiktok_messenger import ChatOpener
-from yara_app.ttbot.dispatch import TikTokSession
-from yara_app.ttbot.models import ChatOpenResult, Target
+from yara_app.tiktok_messenger import open_chat_by_list, open_chat_by_profile
 
 
 class FakeLocator:
@@ -81,12 +77,16 @@ class FakePage:
         hidden_legacy_opens_editor=None,
         hidden_list_opens_editor=False,
         legacy_hidden_first=False,
+        profile_button_opens_editor=True,
+        profile_wait_for_url_raises=False,
     ):
         self.legacy_opens_editor = legacy_opens_editor
         self.strict_opens_editor = strict_opens_editor
         self.visible_legacy_opens_editor = legacy_opens_editor if visible_legacy_opens_editor is None else visible_legacy_opens_editor
         self.hidden_legacy_opens_editor = legacy_opens_editor if hidden_legacy_opens_editor is None else hidden_legacy_opens_editor
         self.hidden_list_opens_editor = hidden_list_opens_editor
+        self.profile_button_opens_editor = profile_button_opens_editor
+        self.profile_wait_for_url_raises = profile_wait_for_url_raises
         self.mouse = FakeMouse()
         self.visible_legacy = FakeLocator(visible=True)
         self.hidden_legacy = FakeLocator(visible=False)
@@ -102,6 +102,8 @@ class FakePage:
         self.context = type('FakeContext', (), {'pages': [self]})()
 
     def get_by_text(self, *args, **kwargs):
+        if self.url != 'https://www.tiktok.com/messages':
+            return FakeLocator(count_value=0)
         return self.legacy
 
     def locator(self, selector):
@@ -119,10 +121,14 @@ class FakePage:
                     return None
                 if self.hidden_item.clicked and self.hidden_list_opens_editor:
                     return None
+                if self.profile_button.clicked and self.profile_button_opens_editor:
+                    return None
                 raise RuntimeError('editor missing')
 
             loc.wait_for = wait_for
             return loc
+        if selector in ('[data-e2e="message-button"]', 'button[data-e2e*="message"]', 'a[href*="/messages"]'):
+            return FakeLocator(count_value=0)
         if selector == 'button':
             return self.profile_button
         return FakeLocator()
@@ -133,35 +139,39 @@ class FakePage:
 
     def wait_for_url(self, *args, **kwargs):
         self.waited_for_url = True
+        if self.profile_wait_for_url_raises:
+            raise RuntimeError('url did not change')
 
 
 class MessengerTests(unittest.TestCase):
     def test_legacy_plan_a_is_preferred_when_it_works(self):
         page = FakePage(legacy_opens_editor=True, strict_opens_editor=True)
-        result = ChatOpener().open_chat(page, 'alice', '@alice')
-        self.assertTrue(result.ok)
-        self.assertEqual(result.method, ChatOpenMethod.LEGACY_LIST)
+        self.assertTrue(open_chat_by_list(page, 'alice'))
+
+    def test_visible_name_lookup_does_not_require_inbox_data_e2e_selector(self):
+        page = FakePage(legacy_opens_editor=True, strict_opens_editor=False)
+        page.list_locator = FakeLocator(count_value=0, children=[])
+
+        self.assertTrue(open_chat_by_list(page, 'alice'))
+        self.assertTrue(page.visible_legacy.clicked)
+        self.assertFalse(page.waited_for_url)
 
     def test_recovery_scan_is_used_when_exact_legacy_lookups_fail(self):
         page = FakePage(legacy_opens_editor=False, strict_opens_editor=True)
-        result = ChatOpener().open_chat(page, 'alice', '@alice')
-        self.assertTrue(result.ok)
-        self.assertEqual(result.method, ChatOpenMethod.LEGACY_LIST)
+        self.assertTrue(open_chat_by_list(page, 'alice'))
         self.assertTrue(page.strict_visible_item.clicked)
         self.assertFalse(page.waited_for_url)
 
     def test_profile_fallback_used_when_list_strategies_fail(self):
         page = FakePage(legacy_opens_editor=False, strict_opens_editor=False)
-        result = ChatOpener().open_chat(page, 'alice', '@alice')
-        self.assertTrue(result.ok)
-        self.assertEqual(result.method, ChatOpenMethod.PROFILE)
-        self.assertTrue(page.waited_for_url)
+        self.assertFalse(open_chat_by_list(page, 'alice'))
+        self.assertTrue(open_chat_by_profile(page, '@alice'))
+        self.assertTrue(page.profile_button.clicked)
+        self.assertFalse(page.waited_for_url)
 
     def test_unicode_name_uses_recovery_scan_before_profile(self):
         page = FakePage(legacy_opens_editor=False, strict_opens_editor=True, strict_text='er.mine')
-        result = ChatOpener().open_chat(page, 'ᵉʳ.ᵐⁱⁿᵉ', '@alice')
-        self.assertTrue(result.ok)
-        self.assertEqual(result.method, ChatOpenMethod.LEGACY_LIST)
+        self.assertTrue(open_chat_by_list(page, 'ᵉʳ.ᵐⁱⁿᵉ'))
         self.assertTrue(page.strict_visible_item.clicked)
         self.assertFalse(page.waited_for_url)
 
@@ -173,9 +183,7 @@ class MessengerTests(unittest.TestCase):
             strict_opens_editor=False,
             legacy_hidden_first=True,
         )
-        result = ChatOpener().open_chat(page, 'alice', '@alice')
-        self.assertTrue(result.ok)
-        self.assertEqual(result.method, ChatOpenMethod.LEGACY_LIST)
+        self.assertTrue(open_chat_by_list(page, 'alice'))
         self.assertTrue(page.visible_legacy.clicked)
         self.assertTrue(page.hidden_legacy.clicked)
 
@@ -188,11 +196,22 @@ class MessengerTests(unittest.TestCase):
             hidden_list_opens_editor=False,
             strict_text='other-user',
         )
-        result = ChatOpener().open_chat(page, 'alice', '@alice')
-        self.assertTrue(result.ok)
-        self.assertEqual(result.method, ChatOpenMethod.PROFILE)
+        self.assertFalse(open_chat_by_list(page, 'alice'))
+        self.assertTrue(open_chat_by_profile(page, '@alice'))
         self.assertTrue(page.visible_legacy.clicked)
-        self.assertTrue(page.waited_for_url)
+        self.assertTrue(page.profile_button.clicked)
+        self.assertFalse(page.waited_for_url)
+
+    def test_profile_fallback_accepts_ready_editor_without_url_change(self):
+        page = FakePage(
+            legacy_opens_editor=False,
+            strict_opens_editor=False,
+            profile_wait_for_url_raises=True,
+        )
+
+        self.assertTrue(open_chat_by_profile(page, '@alice'))
+        self.assertTrue(page.profile_button.clicked)
+        self.assertFalse(page.waited_for_url)
 
     def test_hidden_row_recovery_is_attempted_after_visible_row_recovery(self):
         page = FakePage(
@@ -205,33 +224,9 @@ class MessengerTests(unittest.TestCase):
         )
         page.strict_visible_item._text = 'other-user'
         page.list_locator = FakeLocator(children=[page.strict_visible_item, page.hidden_item])
-        result = ChatOpener().open_chat(page, 'alice', '@alice')
-        self.assertTrue(result.ok)
-        self.assertEqual(result.method, ChatOpenMethod.LEGACY_LIST)
+        self.assertTrue(open_chat_by_list(page, 'alice'))
         self.assertTrue(page.hidden_item.clicked)
         self.assertFalse(page.waited_for_url)
-
-
-class FakeChatOpener:
-    def __init__(self):
-        self.calls = []
-
-    def open_chat(self, page, target_name, profile_url=None):
-        self.calls.append((page, target_name, profile_url))
-        return ChatOpenResult(ok=True, method=ChatOpenMethod.LEGACY_LIST)
-
-
-class SessionTests(unittest.TestCase):
-    def test_session_reopens_messages_before_delegating_to_chat_opener(self):
-        page = FakePage()
-        opener = FakeChatOpener()
-        session = TikTokSession(page=page, chat_opener=opener, artifacts_dir=Path('.'), telegram=object())
-
-        result = session.open_chat(Target(name='alice', profile_url='@alice'))
-
-        self.assertTrue(result.ok)
-        self.assertEqual(page.goto_calls[-1], 'https://www.tiktok.com/messages')
-        self.assertEqual(opener.calls[-1][1:], ('alice', '@alice'))
 
 
 if __name__ == '__main__':

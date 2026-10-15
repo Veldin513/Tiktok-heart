@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+from scripts.start_worker_once import configure_boot_force_environment, run_self_test, wait_for_near_cooldown
 from yara_app.project_adapter import ProjectAdapter
 
 
@@ -50,3 +52,111 @@ def test_app_metadata_prefers_package_version(tmp_path: Path) -> None:
 
     assert meta["version"] == "2.0.0"
     assert meta["build"] == "test-build"
+
+
+def test_worker_self_test_can_skip_browser_probe(tmp_path: Path) -> None:
+    write_json(tmp_path / "control" / "profiles.json", {"alpha": [{"name": "target", "url": "@target"}]})
+    write_json(tmp_path / "control" / "control_state.json", {"active_profile": "alpha", "cooldown_hours": 12})
+    (tmp_path / "message_pool.txt").write_text("hello\n", encoding="utf-8")
+    main_script = tmp_path / "yara_app" / "tiktok_checker.py"
+    main_script.parent.mkdir(parents=True)
+    main_script.write_text("print('ok')\n", encoding="utf-8")
+
+    result = run_self_test(ProjectAdapter(tmp_path), browser=False)
+
+    assert result["safe_mode"] == "no_send"
+    assert result["browser_probe"]["enabled"] is False
+    assert result["queue"]["target_count"] == 1
+    assert result["message_count"] == 1
+
+
+def test_worker_starter_waits_for_near_cooldown(monkeypatch) -> None:
+    class FakeAdapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def queue_snapshot(self) -> dict:
+            self.calls += 1
+            return {
+                "target_count": 1,
+                "ready_count": 1,
+                "cooldown_count": 0,
+                "next_send_in_s": 0,
+            }
+
+    slept: list[int] = []
+    monkeypatch.setenv("WORKER_COOLDOWN_GRACE_SECONDS", "30")
+    refreshed, waited = wait_for_near_cooldown(
+        FakeAdapter(),
+        {
+            "target_count": 1,
+            "ready_count": 0,
+            "cooldown_count": 1,
+            "next_target": "target",
+            "next_send_in_s": 14,
+        },
+        sleep=slept.append,
+    )
+
+    assert waited is True
+    assert slept == [16]
+    assert refreshed["ready_count"] == 1
+
+
+def test_worker_starter_does_not_wait_for_far_cooldown(monkeypatch) -> None:
+    class FakeAdapter:
+        def queue_snapshot(self) -> dict:
+            raise AssertionError("far cooldown should not be rechecked")
+
+    monkeypatch.setenv("WORKER_COOLDOWN_GRACE_SECONDS", "30")
+    queue = {
+        "target_count": 1,
+        "ready_count": 0,
+        "cooldown_count": 1,
+        "next_send_in_s": 600,
+    }
+    refreshed, waited = wait_for_near_cooldown(FakeAdapter(), queue, sleep=lambda _seconds: None)
+
+    assert waited is False
+    assert refreshed is queue
+
+
+def test_worker_starter_sets_boot_force_for_recent_startup(monkeypatch) -> None:
+    monkeypatch.delenv("WORKER_FORCE_SEND_ON_BOOT", raising=False)
+    monkeypatch.setenv("WORKER_BOOT_FORCE_WINDOW_SECONDS", "900")
+    monkeypatch.setattr("scripts.start_worker_once.system_uptime_seconds", lambda: 120)
+
+    enabled = configure_boot_force_environment()
+
+    assert enabled is True
+    assert os.environ["WORKER_FORCE_SEND_ON_BOOT"] == "1"
+
+
+def test_worker_starter_uses_boot_force_once_per_windows_boot(tmp_path: Path, monkeypatch) -> None:
+    write_json(tmp_path / "control" / "profiles.json", {"alpha": [{"name": "target", "url": "@target"}]})
+    write_json(tmp_path / "control" / "control_state.json", {"active_profile": "alpha", "cooldown_hours": 12})
+    adapter = ProjectAdapter(tmp_path)
+
+    monkeypatch.setenv("WORKER_BOOT_FORCE_WINDOW_SECONDS", "900")
+    monkeypatch.setattr("scripts.start_worker_once.system_uptime_seconds", lambda: 120)
+    monkeypatch.delenv("WORKER_FORCE_SEND_ON_BOOT", raising=False)
+
+    assert configure_boot_force_environment(adapter) is True
+    assert os.environ["WORKER_FORCE_SEND_ON_BOOT"] == "1"
+
+    monkeypatch.delenv("WORKER_FORCE_SEND_ON_BOOT", raising=False)
+    assert configure_boot_force_environment(adapter) is False
+    assert "WORKER_FORCE_SEND_ON_BOOT" not in os.environ
+
+
+def test_worker_starter_forced_boot_bypass_ignores_uptime_window(tmp_path: Path, monkeypatch) -> None:
+    write_json(tmp_path / "control" / "profiles.json", {"alpha": [{"name": "target", "url": "@target"}]})
+    write_json(tmp_path / "control" / "control_state.json", {"active_profile": "alpha", "cooldown_hours": 12})
+    adapter = ProjectAdapter(tmp_path)
+
+    monkeypatch.setenv("WORKER_BOOT_FORCE_WINDOW_SECONDS", "900")
+    monkeypatch.setattr("scripts.start_worker_once.system_uptime_seconds", lambda: 7200)
+    monkeypatch.delenv("WORKER_FORCE_SEND_ON_BOOT", raising=False)
+
+    assert configure_boot_force_environment(adapter, force=True) is True
+    assert os.environ["WORKER_FORCE_SEND_ON_BOOT"] == "1"

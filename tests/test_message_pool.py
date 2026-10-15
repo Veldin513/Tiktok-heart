@@ -1,9 +1,9 @@
-from yara_app.config import MESSAGE_VARIANTS
 from yara_app.config import MessageSelector
+from yara_app.ttbot.models import ControlStore
 
 
 def test_message_pool_has_many_items():
-    assert len(MESSAGE_VARIANTS) >= 150
+    assert len(ControlStore().load_messages()) >= 150
 
 
 def test_message_selector_cycles_without_loss():

@@ -2,20 +2,19 @@ from __future__ import annotations
 
 import base64
 import json
-import importlib
 import logging
 import os
 import shutil
 import sys
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-_NATIVE_PATH_CLS = type(Path('.'))
-from typing import Iterable
-
 from yara_app.config import BASE_DIR
+
+_NATIVE_PATH_CLS = type(Path('.'))
 
 
 @dataclass(frozen=True)
@@ -50,7 +49,7 @@ class RunLock:
 
     def _discard_stale_lock(self) -> bool:
         pid = _read_lock_pid(self.path)
-        if pid is not None and _process_is_running(pid):
+        if pid is not None and _process_is_running(pid) and not _lock_pid_was_reused(self.path, pid):
             return False
         try:
             self.path.unlink()
@@ -106,6 +105,17 @@ def _process_is_running(pid: int) -> bool:
         os.kill(pid, 0)
         return True
     except OSError:
+        return False
+
+
+def _lock_pid_was_reused(path: Path, pid: int) -> bool:
+    try:
+        import psutil
+
+        return psutil.Process(pid).create_time() > path.stat().st_mtime + 1
+    except (ImportError, OSError):
+        return False
+    except psutil.Error:
         return False
 
 
@@ -301,16 +311,6 @@ def candidate_site_packages() -> list[Path]:
     return _unique_existing(candidates)
 
 
-def bootstrap_site_packages() -> list[str]:
-    added: list[str] = []
-    for path in candidate_site_packages():
-        text = str(path)
-        if text not in sys.path:
-            sys.path.insert(0, text)
-            added.append(text)
-    return added
-
-
 def extend_env_with_site_packages(env: dict[str, str] | None = None) -> dict[str, str]:
     payload = dict(env or os.environ)
     candidates = [str(path) for path in candidate_site_packages()]
@@ -323,26 +323,3 @@ def extend_env_with_site_packages(env: dict[str, str] | None = None) -> dict[str
             merged.append(item)
     payload["PYTHONPATH"] = os.pathsep.join(merged)
     return payload
-
-def bootstrap_optional_dependencies(names: Iterable[str] = ('pystray', 'PIL', 'psutil')) -> None:
-    """Try to import optional packages; if missing, extend sys.path and retry."""
-    missing = [name for name in names if not _try_import(name)]
-    if not missing:
-        return
-    bootstrap_site_packages()
-    for name in missing:
-        _try_import(name)
-
-
-def module_available(name: str) -> bool:
-    """Return True if the named module can be imported (after bootstrapping paths)."""
-    bootstrap_optional_dependencies((name,))
-    return _try_import(name)
-
-
-def _try_import(name: str) -> bool:
-    try:
-        importlib.import_module(name)
-        return True
-    except Exception:
-        return False

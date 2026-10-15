@@ -1,5 +1,5 @@
 @echo off
 setlocal
 for %%I in ("%~dp0..\..") do cd /d "%%~fI"
-python -m yara_app.tiktok_checker
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_worker.ps1"
 endlocal

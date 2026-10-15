@@ -1,14 +1,21 @@
 param(
-    [string]$TaskName = "Yara TikTok Worker"
+    [string]$TaskName = "Yara TikTok Worker",
+    [string]$StartupTaskName = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-Host "Removed scheduled task: $TaskName"
+if ([string]::IsNullOrWhiteSpace($StartupTaskName)) {
+    $StartupTaskName = "$TaskName Startup"
 }
-else {
-    Write-Host "Scheduled task was not found: $TaskName"
+
+foreach ($name in @($TaskName, $StartupTaskName)) {
+    $existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if ($existing) {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
+        Write-Host "Removed scheduled task: $name"
+    }
+    else {
+        Write-Host "Scheduled task was not found: $name"
+    }
 }

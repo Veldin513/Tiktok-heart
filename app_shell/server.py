@@ -15,17 +15,26 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 SERVER_STATE_FILE = PROJECT_ROOT / "control" / "app_shell_server.json"
+SERVER_LOCK_FILE = PROJECT_ROOT / "control" / "app_shell_server.lock"
 PERF_LOG_FILE = PROJECT_ROOT / "logs" / "app_shell_perf.log"
 SLOW_REQUEST_MS = int(os.getenv("APP_SHELL_SLOW_REQUEST_MS", "250"))
+MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
+    "object-src 'none'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from yara_app.project_adapter import ProjectAdapter  # noqa: E402
-
+from yara_app.single_instance import SingleInstanceGuard  # noqa: E402
 
 LOG_LABELS = {
     "worker_stdout": "Worker stdout",
@@ -51,17 +60,27 @@ def json_ready(value: Any) -> Any:
 
 
 def read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
-    raw_length = handler.headers.get("Content-Length") or "0"
+    raw_length = (handler.headers.get("Content-Length") or "0").strip()
     try:
-        length = min(max(0, int(raw_length)), 1024 * 1024 * 2)
+        length = int(raw_length)
     except ValueError:
-        length = 0
+        raise ValueError("Invalid Content-Length header.") from None
+    if length < 0:
+        raise ValueError("Invalid Content-Length header.")
+    if length > MAX_JSON_BODY_BYTES:
+        raise ValueError(f"Request body exceeds the {MAX_JSON_BODY_BYTES // (1024 * 1024)} MB limit.")
     if length <= 0:
         return {}
     payload = handler.rfile.read(length)
-    if not payload:
-        return {}
-    return json.loads(payload.decode("utf-8"))
+    if len(payload) != length:
+        raise ValueError("Incomplete request body.")
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Request body must be valid UTF-8 JSON.") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("JSON request body must be an object.")
+    return decoded
 
 
 def find_free_port(preferred: int) -> int:
@@ -96,6 +115,26 @@ def write_server_state(port: int, url: str) -> None:
         pass
 
 
+def read_live_server_url() -> str | None:
+    try:
+        payload = json.loads(SERVER_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        return None
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = int(parsed.port or 0)
+    if host not in {"127.0.0.1", "localhost"} or port <= 0:
+        return None
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return url
+    except OSError:
+        return None
+
+
 def append_perf_log(method: str, path: str, elapsed_ms: float) -> None:
     if elapsed_ms < SLOW_REQUEST_MS:
         return
@@ -106,7 +145,8 @@ def append_perf_log(method: str, path: str, elapsed_ms: float) -> None:
             handle.write(line)
     except OSError:
         pass
-    print(f"[perf] {method} {path} {elapsed_ms:.1f}ms", flush=True)
+    if os.getenv("APP_SHELL_PERF_STDOUT") == "1":
+        print(f"[perf] {method} {path} {elapsed_ms:.1f}ms", flush=True)
 
 
 def int_query(params: dict[str, list[str]], name: str, default: int, minimum: int, maximum: int) -> int:
@@ -143,9 +183,7 @@ def keep_log_line(line: str, *, mode: str, search: str) -> bool:
         for token in ("error", "warning", "success", "успех", "auth", "login", "captcha", "409", "ошибка")
     ) and "✅" not in line:
         return False
-    if search and search not in low:
-        return False
-    return True
+    return not (search and search not in low)
 
 
 def classify_log_line(line: str) -> str:
@@ -168,10 +206,16 @@ class AppShellHandler(BaseHTTPRequestHandler):
     _diagnostics_cache: dict[str, Any] | None = None
     _diagnostics_cache_at = 0.0
     _diagnostics_cache_ttl = 5.0
+    _live_cache: dict[str, Any] | None = None
+    _live_cache_at = 0.0
+    _live_cache_ttl = 1.25
+    _schedule_lock = threading.Lock()
 
     server_version = "TikTokHeartDesktop/2.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        if os.getenv("APP_SHELL_HTTP_LOG") != "1":
+            return
         timestamp = time.strftime("%H:%M:%S")
         print(f"[{timestamp}] {self.address_string()} {fmt % args}")
 
@@ -180,6 +224,7 @@ class AppShellHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -187,10 +232,16 @@ class AppShellHandler(BaseHTTPRequestHandler):
     def _send_error_json(self, exc: Exception, status: int = 500) -> None:
         self._send_json({"ok": False, "error": str(exc), "type": type(exc).__name__}, status)
 
+    def _send_security_headers(self) -> None:
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+
     @classmethod
     def _clear_diagnostics_cache(cls) -> None:
         cls._diagnostics_cache = None
         cls._diagnostics_cache_at = 0.0
+        cls._live_cache = None
+        cls._live_cache_at = 0.0
 
     def _get_diagnostics(self, *, fresh: bool = False) -> Any:
         now = time.time()
@@ -201,6 +252,17 @@ class AppShellHandler(BaseHTTPRequestHandler):
         data = self.adapter.diagnostics()
         self.__class__._diagnostics_cache = data
         self.__class__._diagnostics_cache_at = now
+        return data
+
+    def _get_live_status(self, *, fresh: bool = False) -> Any:
+        now = time.time()
+        cached = self.__class__._live_cache
+        cache_age = now - self.__class__._live_cache_at
+        if not fresh and cached is not None and cache_age < self.__class__._live_cache_ttl:
+            return cached
+        data = self.adapter.live_status()
+        self.__class__._live_cache = data
+        self.__class__._live_cache_at = now
         return data
 
     def _send_static(self, request_path: str) -> None:
@@ -218,12 +280,17 @@ class AppShellHandler(BaseHTTPRequestHandler):
             ".html": "text/html; charset=utf-8",
             ".css": "text/css; charset=utf-8",
             ".js": "application/javascript; charset=utf-8",
+            ".png": "image/png",
+            ".ico": "image/x-icon",
             ".svg": "image/svg+xml",
         }.get(suffix, "application/octet-stream")
         body = target.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -236,6 +303,10 @@ class AppShellHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/diagnostics":
                     query = parse_qs(parsed.query)
                     self._send_json({"ok": True, "data": self._get_diagnostics(fresh=query.get("fresh") == ["1"])})
+                    return
+                if parsed.path == "/api/live":
+                    query = parse_qs(parsed.query)
+                    self._send_json({"ok": True, "data": self._get_live_status(fresh=query.get("fresh") == ["1"])})
                     return
                 if parsed.path == "/api/chrome-profiles":
                     self._send_json({"ok": True, "data": self.adapter.list_google_chrome_profiles()})
@@ -267,6 +338,9 @@ class AppShellHandler(BaseHTTPRequestHandler):
                     diag = self._get_diagnostics(fresh=True)
                     self._send_json({"ok": True, "data": {"text": self._build_diagnostics_text(diag)}})
                     return
+            except ValueError as exc:
+                self._send_error_json(exc, HTTPStatus.BAD_REQUEST)
+                return
             except Exception as exc:  # noqa: BLE001
                 self._send_error_json(exc)
                 return
@@ -323,15 +397,21 @@ class AppShellHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/delete-backups":
                     self._handle_delete_backups(payload)
                     return
+                if parsed.path == "/api/restore-auth-backup":
+                    self._handle_restore_auth_backup(payload)
+                    return
+                if parsed.path == "/api/validate-auth-backup":
+                    self._handle_validate_auth_backup(payload)
+                    return
                 if parsed.path == "/api/maintenance":
                     self._handle_maintenance(payload)
                     return
                 if parsed.path == "/api/worker-self-test":
                     self._handle_worker_self_test(payload)
                     return
-                if parsed.path == "/api/security-scan":
-                    self._handle_security_scan(payload)
-                    return
+            except ValueError as exc:
+                self._send_error_json(exc, HTTPStatus.BAD_REQUEST)
+                return
             except Exception as exc:  # noqa: BLE001
                 self._send_error_json(exc)
                 return
@@ -428,7 +508,7 @@ class AppShellHandler(BaseHTTPRequestHandler):
             "",
             "Schedule",
             f"installed: {'yes' if schedule.get('installed') else 'no'}",
-            f"triggers: logon={bool(schedule.get('at_logon'))}, 12h={bool(schedule.get('every_12_hours'))}",
+            f"triggers: windows={bool(schedule.get('at_startup') or schedule.get('at_logon'))}, 12h={bool(schedule.get('every_12_hours'))}",
             f"next run: {schedule.get('next_run_time') or '—'}",
             "",
             "Current run",
@@ -445,15 +525,35 @@ class AppShellHandler(BaseHTTPRequestHandler):
         return "\n".join(lines).strip() + "\n"
 
     def _handle_schedule(self, payload: dict[str, Any]) -> None:
+        if not self.__class__._schedule_lock.acquire(blocking=False):
+            cached = self.adapter.get_worker_schedule_status_cached(max_age_seconds=300.0)
+            self._send_json({"ok": True, "data": {**cached, "busy": True}})
+            return
         enabled = bool(payload.get("enabled", True))
-        if not enabled:
-            result = self.adapter.unregister_worker_schedule()
-        else:
-            result = self.adapter.register_worker_schedule(
-                at_logon=bool(payload.get("at_logon", True)),
-                every_12_hours=bool(payload.get("every_12_hours", True)),
-            )
-        self._send_json({"ok": True, "data": result})
+        try:
+            if not enabled:
+                result = self.adapter.unregister_worker_schedule()
+            else:
+                result = self.adapter.register_worker_schedule(
+                    at_startup=True,
+                    at_logon=False,
+                    every_12_hours=bool(payload.get("every_12_hours", True)),
+                    first_run_at=self._schedule_first_run_anchor(),
+                )
+            self._send_json({"ok": True, "data": result})
+        finally:
+            self.__class__._schedule_lock.release()
+
+    def _schedule_first_run_anchor(self) -> str | None:
+        state = self.adapter.get_control_state()
+        active_profile = str(state.get("active_profile") or "") or None
+        queue = self.adapter.queue_snapshot(active_profile)
+        if int(queue.get("target_count") or 0) <= 0:
+            return None
+        if int(queue.get("ready_count") or 0) > 0:
+            return None
+        first_run_at = str(queue.get("next_send_at_text") or "").strip()
+        return first_run_at or None
 
     def _handle_message_pool(self, payload: dict[str, Any]) -> None:
         text = str(payload.get("text") or "")
@@ -473,10 +573,11 @@ class AppShellHandler(BaseHTTPRequestHandler):
     def _handle_profile_action(self, payload: dict[str, Any]) -> None:
         action = str(payload.get("action") or "").strip()
         index = int(payload.get("index") or 0)
+        profile_key = str(payload.get("profile_key") or "").strip()
         if action == "set_active":
-            result = self.adapter.set_active_profile(index)
+            result = self.adapter.set_active_profile_key(profile_key) if profile_key else self.adapter.set_active_profile(index)
         elif action == "toggle":
-            result = self.adapter.toggle_profile(index)
+            result = self.adapter.toggle_profile_key(profile_key) if profile_key else self.adapter.toggle_profile(index)
         else:
             raise ValueError(f"Unknown profile action: {action}")
         self._send_json({"ok": True, "data": result})
@@ -609,19 +710,32 @@ class AppShellHandler(BaseHTTPRequestHandler):
         )
         self._send_json({"ok": True, "data": result})
 
+    def _handle_restore_auth_backup(self, payload: dict[str, Any]) -> None:
+        result = self.adapter.restore_auth_backup(
+            profile_key=str(payload.get("bot_profile_key") or "") or None,
+            backup_name=str(payload.get("name") or ""),
+            include_global=bool(payload.get("include_global", False)),
+        )
+        self._send_json({"ok": True, "data": result})
+
+    def _handle_validate_auth_backup(self, payload: dict[str, Any]) -> None:
+        result = self.adapter.validate_auth_backup(
+            profile_key=str(payload.get("bot_profile_key") or "") or None,
+            backup_name=str(payload.get("name") or ""),
+            include_global=bool(payload.get("include_global", False)),
+            deep=bool(payload.get("deep", False)),
+        )
+        self._send_json({"ok": True, "data": result})
+
     def _handle_maintenance(self, payload: dict[str, Any]) -> None:
         result = self.adapter.run_maintenance(
             profile_key=str(payload.get("bot_profile_key") or "") or None,
         )
         self._send_json({"ok": True, "data": result})
 
-    def _handle_worker_self_test(self, _payload: dict[str, Any]) -> None:
-        result = self.adapter.worker_starter_self_test()
-        self._send_json({"ok": True, "data": result})
-
-    def _handle_security_scan(self, payload: dict[str, Any]) -> None:
-        result = self.adapter.run_security_scan(
-            tracked_only=bool(payload.get("tracked_only", True)),
+    def _handle_worker_self_test(self, payload: dict[str, Any]) -> None:
+        result = self.adapter.worker_starter_self_test(
+            no_browser=bool(payload.get("no_browser", True)),
         )
         self._send_json({"ok": True, "data": result})
 
@@ -632,22 +746,31 @@ def main() -> int:
     parser.add_argument("--open-browser", action="store_true")
     args = parser.parse_args()
 
-    port = find_free_port(args.port)
-    server = ThreadingHTTPServer(("127.0.0.1", port), AppShellHandler)
-    url = f"http://127.0.0.1:{port}/"
-    write_server_state(port, url)
-    print(f"TikTok Heart Desktop: {url}", flush=True)
-    print("Press Ctrl+C to stop.", flush=True)
-
-    if args.open_browser:
-        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-
+    guard = SingleInstanceGuard.acquire(SERVER_LOCK_FILE, app_name="app_shell_server")
+    if guard is None:
+        existing_url = read_live_server_url()
+        if existing_url:
+            print(f"TikTok Heart Desktop: {existing_url}", flush=True)
+        return 0
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping...")
+        port = find_free_port(args.port)
+        server = ThreadingHTTPServer(("127.0.0.1", port), AppShellHandler)
+        url = f"http://127.0.0.1:{port}/"
+        write_server_state(port, url)
+        print(f"TikTok Heart Desktop: {url}", flush=True)
+        print("Press Ctrl+C to stop.", flush=True)
+
+        if args.open_browser:
+            threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopping...")
+        finally:
+            server.server_close()
     finally:
-        server.server_close()
+        guard.release()
     return 0
 
 

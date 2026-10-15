@@ -1,6 +1,5 @@
 @echo off
 setlocal
 for %%I in ("%~dp0..\..") do cd /d "%%~fI"
-if not exist control mkdir control
-python -m yara_app.launcher
+call "scripts\windows\start_app_shell.bat"
 endlocal

@@ -7,9 +7,19 @@ import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from yara_app.config import (
+    CONTROL_DIR,
+    CONTROL_STATE_FILE,
+    DEFAULT_COOLDOWN_HOURS,
+    DEFAULT_MESSAGES,
+    DEFAULT_PROFILE_NAME,
+    DEFAULT_PROFILES,
+    MESSAGE_POOL_FILE,
+    PROFILES_FILE,
+)
 
 
 @dataclass(frozen=True)
@@ -26,7 +36,6 @@ class CooldownStatus:
 
     allowed: bool
     hours_passed: float | None
-    hours_left: float
     seconds_left: int
 
 
@@ -38,55 +47,18 @@ class StreakUpdate:
     is_new_day: bool
 
 
-class ChatOpenMethod(str, Enum):
-    LEGACY_LIST = 'legacy_list'
-    STRICT_LIST = 'strict_list'
-    PROFILE = 'profile'
-
-
-@dataclass(frozen=True)
-class ChatOpenResult:
-    """Result of attempting to open a chat."""
-
-    ok: bool
-    method: ChatOpenMethod | None = None
-    reason: str | None = None
-
-
 @dataclass(frozen=True)
 class TargetResult:
     """Processing outcome for one target."""
 
     target: Target
     success: bool
+    skipped: bool = False
     message: str | None = None
     streak_count: int | None = None
     is_new_day: bool = False
     reason: str | None = None
-    chat_method: ChatOpenMethod | None = None
     screenshot_path: Path | None = None
-
-
-@dataclass
-class BrowserRuntimePolicy:
-    """Mutable runtime toggles used by Playwright request interception."""
-
-    block_media: bool = True
-
-
-@dataclass(frozen=True)
-class DispatchSettings:
-    """Settings that affect one dispatch run."""
-
-    cooldown_hours: int
-    retry_attempts: int = 3
-    retry_delay_seconds: int = 10
-    internet_check_attempts: int = 5
-    internet_check_delay_seconds: int = 3
-    post_send_delay_seconds: float = 1.5
-    final_delay_seconds: int = 2
-    dry_run: bool = False
-    enable_telegram_notifications: bool = True
 
 
 @dataclass
@@ -105,7 +77,7 @@ class RunSummary:
         self.results.append(result)
         if result.success:
             self.success_count += 1
-        elif result.reason == 'cooldown':
+        elif result.skipped or result.reason == 'cooldown':
             self.skipped_count += 1
         else:
             self.failed_count += 1
@@ -133,6 +105,7 @@ class RunSummary:
             TargetResult(
                 target=Target(name=target),
                 success=success,
+                skipped=skipped,
                 message=message,
                 streak_count=streak_count,
                 reason=effective_reason,
@@ -156,8 +129,7 @@ class RunSummary:
                     'streak_count': r.streak_count,
                     'is_new_day': r.is_new_day,
                     'reason': r.reason,
-                    'skipped': r.reason == 'cooldown',
-                    'chat_method': r.chat_method.value if r.chat_method else None,
+                    'skipped': r.skipped or r.reason == 'cooldown',
                     'screenshot_path': str(r.screenshot_path) if r.screenshot_path else None,
                 }
                 for r in self.results
@@ -165,11 +137,8 @@ class RunSummary:
         }
 
 
-"""Unicode-safe helpers for target names.
-
-These helpers keep user-facing names intact while providing a stable internal
-representation for comparisons, matching and file-system keys.
-"""
+# Unicode-safe helpers keep user-facing names intact while providing stable
+# internal keys for comparisons, matching and file-system state files.
 
 _WHITESPACE_RE = re.compile(r"\s+", re.UNICODE)
 _NON_ALNUM_RE = re.compile(r"[\W_]+", re.UNICODE)
@@ -200,52 +169,6 @@ def normalize_display_name(value: str | None) -> str:
     return collapsed
 
 
-def canonical_name(value: str | None) -> str:
-    """Return a case-insensitive canonical representation of a name."""
-    return normalize_display_name(value).casefold()
-
-
-def compact_name_token(value: str | None) -> str:
-    """Return a comparison token with punctuation and spaces removed."""
-    canonical = canonical_name(value)
-    return _NON_ALNUM_RE.sub('', canonical)
-
-
-def build_name_variants(value: str | None) -> list[str]:
-    """Return deduplicated variants useful for UI text matching."""
-    raw = '' if value is None else str(value)
-    variants: list[str] = []
-    for candidate in (
-        raw,
-        raw.strip(),
-        normalize_display_name(raw),
-        canonical_name(raw),
-        compact_name_token(raw),
-    ):
-        if candidate and candidate not in variants:
-            variants.append(candidate)
-    return variants
-
-
-def names_match(candidate_text: str | None, target_name: str | None) -> bool:
-    """Compare two names with Unicode normalization and loose punctuation rules."""
-    candidate_canonical = canonical_name(candidate_text)
-    target_canonical = canonical_name(target_name)
-    if not candidate_canonical or not target_canonical:
-        return False
-
-    if candidate_canonical == target_canonical:
-        return True
-    if target_canonical in candidate_canonical:
-        return True
-
-    candidate_compact = compact_name_token(candidate_text)
-    target_compact = compact_name_token(target_name)
-    if not candidate_compact or not target_compact:
-        return False
-    return candidate_compact == target_compact or target_compact in candidate_compact
-
-
 def legacy_safe_filename(value: str | None) -> str:
     """Historical file-name strategy kept for backwards compatibility."""
     raw = '' if value is None else str(value)
@@ -267,58 +190,6 @@ def safe_name_key(value: str | None) -> str:
     digest = hashlib.sha1(digest_source.encode('utf-8')).hexdigest()[:10]
     prefix = ascii_slug[:40] if ascii_slug else 'target'
     return f'{prefix}_{digest}'
-
-
-@dataclass(frozen=True)
-class NotificationSettings:
-    token: str
-    chat_ids: tuple[str, ...]
-    enabled: bool = True
-
-
-@dataclass(frozen=True)
-class AppSettings:
-    dispatch: DispatchSettings
-    messages: tuple[str, ...]
-    notifications: NotificationSettings
-
-
-@dataclass(frozen=True)
-class ProfileConfig:
-    name: str
-    targets: tuple[Target, ...]
-
-
-def build_settings(*, dry_run: bool = False, telegram_enabled: bool = True) -> AppSettings:
-    """Build application settings from config constants and the live message pool.
-
-    Messages are loaded from the file-based pool via ControlStore so there is a
-    single loading path shared with tiktok_checker. config constants remain the
-    source of truth for everything else.
-    """
-    messages = tuple(ControlStore().load_messages())
-
-    return AppSettings(
-        dispatch=DispatchSettings(
-            cooldown_hours=DEFAULT_COOLDOWN_HOURS,
-            dry_run=dry_run,
-            enable_telegram_notifications=telegram_enabled,
-        ),
-        messages=messages,
-        notifications=NotificationSettings(
-            token=TG_TOKEN,
-            chat_ids=tuple(TG_CHAT_IDS),
-            enabled=telegram_enabled,
-        ),
-    )
-
-
-def build_profile_config(profile_name: str, raw_targets: Iterable[dict]) -> ProfileConfig:
-    targets = tuple(
-        Target(name=item['name'], profile_url=item.get('url'))
-        for item in raw_targets
-    )
-    return ProfileConfig(name=profile_name, targets=targets)
 
 
 class StateStore:
@@ -361,11 +232,11 @@ class StateStore:
     def get_cooldown_status(self, target_name: str) -> CooldownStatus:
         sent_at = self.get_last_send_at(target_name)
         if sent_at is None:
-            return CooldownStatus(True, None, 0, 0)
+            return CooldownStatus(True, None, 0)
         seconds_passed = max(0, time.time() - sent_at)
         cooldown_seconds = self.cooldown_hours * 3600
         seconds_left = max(0, cooldown_seconds - seconds_passed)
-        return CooldownStatus(seconds_left <= 0, seconds_passed / 3600, seconds_left / 3600, int(seconds_left))
+        return CooldownStatus(seconds_left <= 0, seconds_passed / 3600, int(seconds_left))
 
     def mark_sent_now(self, target_name: str) -> None:
         log_file, _, _, _ = self.get_target_files(target_name)
@@ -402,20 +273,6 @@ class StateStore:
             current_count += 1
         stats_file.write_text(f'{current_count}|{today}', encoding='utf-8')
         return StreakUpdate(current_count=current_count, is_new_day=is_new_day)
-
-
-from yara_app.config import (
-    CONTROL_DIR,
-    CONTROL_STATE_FILE,
-    DEFAULT_COOLDOWN_HOURS,
-    DEFAULT_MESSAGES,
-    DEFAULT_PROFILE_NAME,
-    DEFAULT_PROFILES,
-    MESSAGE_POOL_FILE,
-    PROFILES_FILE,
-    TG_CHAT_IDS,
-    TG_TOKEN,
-)
 
 
 @dataclass
@@ -463,9 +320,6 @@ class ControlStore:
     def load_profiles(self) -> dict[str, list[dict[str, str]]]:
         return json.loads(PROFILES_FILE.read_text(encoding='utf-8-sig'))
 
-    def save_profiles(self, profiles: dict[str, list[dict[str, str]]]) -> None:
-        PROFILES_FILE.write_text(json.dumps(profiles, ensure_ascii=False, indent=2), encoding='utf-8')
-
     def load_state(self) -> ControlState:
         raw = json.loads(CONTROL_STATE_FILE.read_text(encoding='utf-8-sig'))
         return ControlState(
@@ -502,50 +356,6 @@ class ControlStore:
         if profile_name not in profiles:
             raise ValueError(f'Профиль {profile_name!r} не найден')
 
-    def set_active_profile(self, profile_name: str) -> ControlState:
-        self.ensure_profile(profile_name)
-        return self.update_state(active_profile=profile_name)
-
-    def list_targets(self, profile_name: str | None = None) -> list[dict[str, str]]:
-        profiles = self.load_profiles()
-        profile = profile_name or self.load_state().active_profile
-        return list(profiles.get(profile, []))
-
-    def add_profile(self, profile_name: str) -> None:
-        profiles = self.load_profiles()
-        profiles.setdefault(profile_name, [])
-        self.save_profiles(profiles)
-
-    def remove_profile(self, profile_name: str) -> None:
-        profiles = self.load_profiles()
-        if profile_name not in profiles:
-            raise ValueError('Профиль не найден')
-        if profile_name == self.load_state().active_profile:
-            raise ValueError('Нельзя удалить активный профиль')
-        del profiles[profile_name]
-        self.save_profiles(profiles)
-
-    def add_target(self, profile_name: str, name: str, url: str | None) -> None:
-        profiles = self.load_profiles()
-        profiles.setdefault(profile_name, [])
-        exists = any(item.get('name') == name for item in profiles[profile_name])
-        if exists:
-            raise ValueError('Адресат уже существует')
-        entry = {'name': name}
-        if url:
-            entry['url'] = url
-        profiles[profile_name].append(entry)
-        self.save_profiles(profiles)
-
-    def remove_target(self, profile_name: str, name: str) -> None:
-        profiles = self.load_profiles()
-        items = profiles.get(profile_name, [])
-        new_items = [item for item in items if item.get('name') != name]
-        if len(new_items) == len(items):
-            raise ValueError('Адресат не найден')
-        profiles[profile_name] = new_items
-        self.save_profiles(profiles)
-
     def load_messages(self) -> list[str]:
         lines = [line.strip() for line in MESSAGE_POOL_FILE.read_text(encoding='utf-8').splitlines()]
         lines = [line for line in lines if line and not line.startswith('#')]
@@ -556,33 +366,3 @@ class ControlStore:
                 seen.add(item)
                 out.append(item)
         return out
-
-    def save_messages(self, messages: list[str]) -> None:
-        cleaned: list[str] = []
-        seen = set()
-        for item in messages:
-            text = item.strip()
-            if text and text not in seen:
-                seen.add(text)
-                cleaned.append(text)
-        MESSAGE_POOL_FILE.write_text("\n".join(cleaned) + "\n", encoding='utf-8')
-
-    def add_message(self, text: str) -> None:
-        messages = self.load_messages()
-        if text in messages:
-            raise ValueError('Сообщение уже существует')
-        messages.append(text)
-        self.save_messages(messages)
-
-    def remove_message(self, text: str) -> None:
-        messages = self.load_messages()
-        new_messages = [item for item in messages if item != text]
-        if len(new_messages) == len(messages):
-            raise ValueError('Сообщение не найдено')
-        self.save_messages(new_messages)
-
-    def request_stop(self) -> ControlState:
-        return self.update_state(stop_requested=True)
-
-    def clear_stop(self) -> ControlState:
-        return self.update_state(stop_requested=False)

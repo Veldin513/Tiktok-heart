@@ -40,8 +40,15 @@ def test_diagnostics_explains_json_statuses(tmp_path: Path) -> None:
     assert 'health_score' in diag
     assert 'issues' in diag
     assert 'recommendations' in diag
-    assert any(item['status'] == 'JSON корректен' for item in diag['file_details'])
-    assert any('Это не означает' in item['meaning'] for item in diag['file_details'] if item['kind'] == 'json')
+    json_items = [
+        item
+        for item in diag['file_details']
+        if item['kind'] == 'json' and item.get('file_kind') in {'profiles', 'control_state', 'telegram_config'}
+    ]
+    assert json_items
+    assert all(item['valid'] is True for item in json_items)
+    assert all('JSON' in item['status'] for item in json_items)
+    assert all(item['meaning'] for item in json_items)
 
 
 def test_start_worker_preserves_dry_run_before_launch(tmp_path: Path, monkeypatch) -> None:

@@ -39,24 +39,39 @@ def test_auth_backup_includes_authorization_files_and_skips_heavy_caches(tmp_pat
     assert "profiles/main/browser/user_data/Default/Cache/data_0" not in names
 
 
-def test_public_project_backup_excludes_runtime_private_files(tmp_path: Path) -> None:
+def test_public_project_backup_excludes_runtime_private_files(tmp_path: Path, monkeypatch) -> None:
     _write(tmp_path / "README.md", "# App")
+    _write(tmp_path / "pyproject.toml", "[tool.ruff]\n")
+    _write(tmp_path / "yara.zip", "old archive")
     _write(tmp_path / "app_shell" / "web" / "app.js", "console.log('ok')")
     _write(tmp_path / "control" / "control_state.example.json", "{}")
     _write(tmp_path / "control" / "control_state.json", "{}")
     _write(tmp_path / "profiles" / "main" / "browser" / "user_data" / "Default" / "Network" / "Cookies")
     _write(tmp_path / "logs" / "app.log", "private path")
+    _write(tmp_path / ".pytest_cache" / "blocked.txt", "cache")
+
+    original_iterdir = Path.iterdir
+
+    def guarded_iterdir(path: Path):
+        if path.name == ".pytest_cache":
+            raise AssertionError("public backup must not enter blocked cache directories")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
 
     result = ProjectAdapter(tmp_path).create_public_project_backup()
 
     with zipfile.ZipFile(result["path"]) as archive:
         names = set(archive.namelist())
     assert "README.md" in names
+    assert "pyproject.toml" in names
+    assert "yara.zip" not in names
     assert "app_shell/web/app.js" in names
     assert "control/control_state.example.json" in names
     assert "control/control_state.json" not in names
     assert not any(name.startswith("profiles/") for name in names)
     assert not any(name.startswith("logs/") for name in names)
+    assert not any(name.startswith(".pytest_cache/") for name in names)
 
 
 def test_prune_auth_backups_keeps_latest_for_selected_profile(tmp_path: Path) -> None:
@@ -96,3 +111,37 @@ def test_delete_selected_backups_is_limited_to_selected_profile(tmp_path: Path) 
     assert (auth_dir / "auth_backup_other_20260101_010101.zip").exists()
     assert not (browser_dir / "user_data_before_chrome_import_20260101").exists()
     assert (browser_dir / "user_data").exists()
+
+
+def test_restore_auth_backup_restores_selected_profile_and_makes_pre_restore_backup(tmp_path: Path) -> None:
+    adapter = ProjectAdapter(tmp_path)
+    _write(tmp_path / "profiles" / "main" / "browser" / "user_data" / "Local State", "old-local-state")
+    _write(tmp_path / "profiles" / "main" / "browser" / "user_data" / "Default" / "Network" / "Cookies", "old-cookies")
+    _write(tmp_path / "profiles" / "main" / "state" / "last_send_sample.txt", "old-state")
+
+    backup = adapter.create_auth_backup("main")
+    _write(tmp_path / "profiles" / "main" / "browser" / "user_data" / "Local State", "changed")
+    _write(tmp_path / "profiles" / "main" / "state" / "last_send_sample.txt", "changed-state")
+
+    result = adapter.restore_auth_backup("main", backup["name"])
+
+    assert result["ok"] is True
+    assert result["restored_count"] >= 3
+    assert (tmp_path / "profiles" / "main" / "browser" / "user_data" / "Local State").read_text(encoding="utf-8") == "old-local-state"
+    assert (tmp_path / "profiles" / "main" / "state" / "last_send_sample.txt").read_text(encoding="utf-8") == "old-state"
+    assert Path(result["pre_restore_backup"]["path"]).exists()
+
+
+def test_restore_auth_backup_rejects_zip_slip_member(tmp_path: Path) -> None:
+    adapter = ProjectAdapter(tmp_path)
+    backup_dir = tmp_path / "backups" / "auth"
+    backup_dir.mkdir(parents=True)
+    backup = backup_dir / "auth_backup_main_20260103_010101.zip"
+    with zipfile.ZipFile(backup, "w") as archive:
+        archive.writestr("BACKUP_MANIFEST.json", json.dumps({"profile_key": "main"}))
+        archive.writestr("../outside.txt", "bad")
+
+    validation = adapter.validate_auth_backup("main", backup.name, deep=True)
+
+    assert validation["ok"] is False
+    assert validation["blocked_count"] == 1

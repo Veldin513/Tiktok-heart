@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from yara_app.config import get_cli_profile
 import yara_app.config as config
+from yara_app.config import get_cli_profile
 
 
 def test_get_cli_profile_ignores_test_paths_and_options() -> None:

@@ -6,20 +6,41 @@ import json
 import logging
 import os
 import time
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass
 from playwright.sync_api import sync_playwright
 
-from yara_app.auth_flow import attach_auth_debug_listeners, auth_backoff_seconds_left, clear_auth_backoff, dump_auth_state, get_latest_tiktok_page, handle_captcha, init_auth_browser, init_work_browser, interactive_auth, is_logged_in, safe_close_context
-from yara_app.config import BOT_NAME, MessageSelector, TG_CHAT_IDS, TG_DISABLE_NOTIFICATIONS, TG_TOKEN, get_cli_profile
+from yara_app.auth_flow import (
+    attach_auth_debug_listeners,
+    auth_backoff_seconds_left,
+    block_heavy_content,
+    clear_auth_backoff,
+    dump_auth_state,
+    get_latest_tiktok_page,
+    handle_captcha,
+    init_auth_browser,
+    init_work_browser,
+    interactive_auth,
+    is_logged_in,
+    safe_close_context,
+)
+from yara_app.config import BOT_NAME, TG_CHAT_IDS, TG_DISABLE_NOTIFICATIONS, TG_TOKEN, MessageSelector, get_cli_profile
 from yara_app.project_adapter import ProjectAdapter
-from yara_app.ttbot.models import ControlStore, RunSummary, StateStore, Target
-from yara_app.runtime_paths import RunLock, build_profile_paths, configure_logging, format_duration, init_auth_runtime, recover_browser_profile_after_reinstall
+from yara_app.runtime_paths import (
+    RunLock,
+    build_profile_paths,
+    configure_logging,
+    format_duration,
+    init_auth_runtime,
+    recover_browser_profile_after_reinstall,
+)
 from yara_app.tiktok_messenger import open_chat_by_list, open_chat_by_profile, open_messages, send_message
+from yara_app.ttbot.models import ControlStore, RunSummary, StateStore, Target, safe_name_key
 
 try:
     import requests  # type: ignore
@@ -101,23 +122,6 @@ class TelegramClient:
                 payload['reply_markup'] = reply_markup
             self._post('sendMessage', json_payload=payload)
 
-    def send_text_chunks(self, text: str, max_len: int = 3500, *, chat_ids: list[str] | None = None) -> None:
-        if len(text) <= max_len:
-            self.send_text(text, chat_ids=chat_ids)
-            return
-        chunk: list[str] = []
-        size = 0
-        for line in text.splitlines(True):
-            if size + len(line) > max_len and chunk:
-                self.send_text(''.join(chunk).rstrip(), chat_ids=chat_ids)
-                chunk = [line]
-                size = len(line)
-            else:
-                chunk.append(line)
-                size += len(line)
-        if chunk:
-            self.send_text(''.join(chunk).rstrip(), chat_ids=chat_ids)
-
     def send_photo(self, photo_path: str | Path, caption: str | None = None) -> None:
         if not self.enabled:
             return
@@ -130,20 +134,6 @@ class TelegramClient:
                 if caption:
                     data['caption'] = caption
                 self._post('sendPhoto', data=data, files={'photo': photo_file}, timeout=30)
-
-    def send_document(self, doc_path: str | Path, caption: str | None = None, *, chat_ids: list[str] | None = None) -> None:
-        if not self.enabled:
-            return
-        doc_path = Path(doc_path)
-        if not doc_path.exists():
-            return
-        targets = chat_ids or self.chat_ids
-        for chat_id in targets:
-            with doc_path.open('rb') as doc_file:
-                data = {'chat_id': chat_id}
-                if caption:
-                    data['caption'] = caption
-                self._post('sendDocument', data=data, files={'document': doc_file}, timeout=30)
 
     def send_photo_with_keyboard(self, photo_path: str | Path, caption: str, keyboard: dict[str, Any]) -> list[tuple[str, int]]:
         sent_messages: list[tuple[str, int]] = []
@@ -205,7 +195,18 @@ message_selector = MessageSelector(control_store.load_messages())
 auth_coord_adapter = ProjectAdapter()
 RUN_STATE_FILE = PATHS.artifacts_dir / 'run_state.json'
 RUN_HISTORY_FILE = PATHS.artifacts_dir / 'run_history.jsonl'
+RUN_HISTORY_MAX_BYTES = 1_500_000
+RUN_HISTORY_KEEP_BYTES = 500_000
 AUTH_BACKOFF_FILE = PATHS.state_dir / 'auth_backoff.json'
+TARGET_GUARD_DIR = PATHS.state_dir / 'target_send_guards'
+TARGET_SEND_GUARD_SECONDS = max(30, int(os.getenv('TIKTOK_TARGET_GUARD_SECONDS', '300')))
+CAPTCHA_SELECTORS = (
+    '#captcha-verify-image',
+    '.captcha-disable-scroll',
+    'div[id^="secsdk-captcha"]',
+    '#arkose-iframe',
+    'iframe[src*="captcha"]',
+)
 
 
 def _suspend_control_bot_for_auth() -> bool:
@@ -249,6 +250,25 @@ def _write_run_state(**data) -> None:
     RUN_STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
+def trim_run_history(path: Path, *, max_bytes: int = RUN_HISTORY_MAX_BYTES, keep_bytes: int = RUN_HISTORY_KEEP_BYTES) -> None:
+    """Keep history bounded without splitting a JSONL record in half."""
+    try:
+        if path.stat().st_size <= max_bytes:
+            return
+        with path.open('rb') as handle:
+            handle.seek(-min(keep_bytes, path.stat().st_size), os.SEEK_END)
+            payload = handle.read()
+        separator = payload.find(b'\n')
+        if separator < 0:
+            return
+        payload = payload[separator + 1:]
+        temporary = path.with_suffix(f'{path.suffix}.tmp')
+        temporary.write_bytes(payload)
+        temporary.replace(path)
+    except OSError as exc:
+        logger.warning('Не удалось сократить run history: %s', exc)
+
+
 def _append_run_history(event: str, **data: Any) -> None:
     payload = {
         'timestamp': time.time(),
@@ -261,8 +281,56 @@ def _append_run_history(event: str, **data: Any) -> None:
         RUN_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with RUN_HISTORY_FILE.open('a', encoding='utf-8') as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n')
+        trim_run_history(RUN_HISTORY_FILE)
     except Exception as exc:
         logger.warning('Не удалось записать run history: %s', exc)
+
+def _compact_payload(data: dict[str, Any]) -> str:
+    parts = []
+    for key, value in data.items():
+        if value is None:
+            continue
+        text = str(value)
+        if len(text) > 120:
+            text = text[:117] + '...'
+        parts.append(f'{key}={text}')
+    return ' '.join(parts)
+
+
+def log_lifecycle(stage: str, **data: Any) -> None:
+    logger.info('[lifecycle] %s %s', stage, _compact_payload(data))
+    _append_run_history('lifecycle', stage=stage, **data)
+
+
+@contextmanager
+def timed_phase(phase: str, **data: Any):
+    started = time.perf_counter()
+    logger.info('[phase:%s] start %s', phase, _compact_payload(data))
+    ok = False
+    error = ''
+    try:
+        yield
+        ok = True
+    except Exception as exc:
+        error = str(exc)
+        raise
+    finally:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        payload = {**data, 'elapsed_ms': elapsed_ms, 'ok': ok}
+        if error:
+            payload['error'] = error[:300]
+        logger.info('[phase:%s] finish %sms ok=%s', phase, elapsed_ms, ok)
+        _append_run_history('phase_timing', phase=phase, **payload)
+
+
+def detect_captcha(page, *, timeout_ms: int = 700) -> dict[str, Any]:
+    for selector in CAPTCHA_SELECTORS:
+        try:
+            if page.locator(selector).first.is_visible(timeout=timeout_ms):
+                return {'found': True, 'selector': selector}
+        except Exception:
+            continue
+    return {'found': False, 'selector': ''}
 
 
 def wait_for_internet() -> bool:
@@ -286,12 +354,118 @@ def apply_stealth_script(page) -> None:
     page.add_init_script(stealth_script)
 
 
+def apply_work_resource_filter(page) -> None:
+    try:
+        page.route('**/*', lambda route: block_heavy_content(route, True))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning('Не удалось включить фильтр тяжёлых ресурсов: %s', exc)
+
+
 def save_run_summary(summary: RunSummary) -> None:
     (PATHS.artifacts_dir / 'run_summary.json').write_text(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
 
 
 def send_start_message(targets: list[Target], *, dry_run: bool) -> None:
     tg.send_run_started(bot_name=BOT_NAME, profile_name=ACTIVE_PROFILE, target_count=len(targets), dry_run=dry_run)
+
+
+def force_send_on_boot() -> bool:
+    return str(os.getenv('WORKER_FORCE_SEND_ON_BOOT') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def ready_targets_for_run(targets: list[Target], summary: RunSummary) -> list[Target]:
+    ready: list[Target] = []
+    boot_force = force_send_on_boot()
+    for target in targets:
+        cooldown = store.get_cooldown_status(target.name)
+        if cooldown.allowed:
+            ready.append(target)
+            continue
+        if boot_force:
+            logger.info('[%s] Cooldown preflight bypassed by PC startup exception. Left %s.', target.name, format_duration(cooldown.seconds_left))
+            _append_run_history(
+                'target_cooldown_bypass',
+                target=target.name,
+                reason='pc_startup',
+                seconds_left=cooldown.seconds_left,
+                preflight=True,
+            )
+            ready.append(target)
+            continue
+        passed_text = 'unknown' if cooldown.hours_passed is None else format_duration(int(cooldown.hours_passed * 3600))
+        left_text = format_duration(cooldown.seconds_left)
+        logger.info('[%s] Cooldown preflight: passed %s, left %s. Browser start skipped.', target.name, passed_text, left_text)
+        summary.add_result(target=target.name, success=False, skipped=True, reason='cooldown')
+        _append_run_history(
+            'target_result',
+            target=target.name,
+            success=False,
+            skipped=True,
+            reason='cooldown',
+            seconds_left=cooldown.seconds_left,
+            preflight=True,
+        )
+    return ready
+
+
+def target_guard_path(target_name: str) -> Path:
+    return TARGET_GUARD_DIR / f'{safe_name_key(target_name)}.json'
+
+
+def acquire_target_send_guard(target_name: str) -> tuple[bool, dict[str, Any]]:
+    TARGET_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+    path = target_guard_path(target_name)
+    now = time.time()
+    payload = {
+        'target': target_name,
+        'profile_name': ACTIVE_PROFILE,
+        'pid': os.getpid(),
+        'started_at': now,
+        'ttl_seconds': TARGET_SEND_GUARD_SECONDS,
+    }
+    for attempt in range(2):
+        try:
+            with path.open('x', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            return True, {'path': str(path), **payload}
+        except FileExistsError:
+            try:
+                existing = json.loads(path.read_text(encoding='utf-8-sig'))
+            except Exception:
+                existing = {}
+            started_at = float(existing.get('started_at') or 0)
+            age = now - started_at if started_at else TARGET_SEND_GUARD_SECONDS + 1
+            if age >= TARGET_SEND_GUARD_SECONDS:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    if attempt == 1:
+                        return False, {'path': str(path), 'reason': 'stale_guard_unlink_failed', 'age_seconds': round(age, 1)}
+                continue
+            return False, {
+                'path': str(path),
+                'reason': 'recent_guard',
+                'age_seconds': round(age, 1),
+                'left_seconds': max(0, int(TARGET_SEND_GUARD_SECONDS - age)),
+                'pid': existing.get('pid'),
+            }
+    return False, {'path': str(path), 'reason': 'guard_create_failed'}
+
+
+def mark_target_guard_sent(target_name: str) -> None:
+    path = target_guard_path(target_name)
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {}
+    except Exception:
+        payload = {}
+    payload.update({'sent_at': time.time(), 'status': 'sent'})
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception as exc:
+        logger.warning('Failed to mark target send guard for %s: %s', target_name, exc)
 
 
 def stop_requested() -> bool:
@@ -307,28 +481,39 @@ def stop_or_pause_reason() -> str | None:
     return None
 
 
-def is_paused() -> bool:
-    return control_store.load_state().paused
-
-
 def process_target(page, target: Target, summary: RunSummary) -> None:
     _write_run_state(status='running', current_target=target.name)
     logger.info('Начало обработки адресата: %s | profile=%s', target.name, target.profile_url)
-    cooldown = store.get_cooldown_status(target.name)
+    with timed_phase('target_cooldown_check', target=target.name):
+        cooldown = store.get_cooldown_status(target.name)
     if not cooldown.allowed:
-        passed_text = 'неизвестно' if cooldown.hours_passed is None else format_duration(int(cooldown.hours_passed * 3600))
-        left_text = format_duration(cooldown.seconds_left)
-        logger.info('[%s] Рано. Прошло %s. Осталось %s.', target.name, passed_text, left_text)
-        summary.add_result(target=target.name, success=False, skipped=True, reason='cooldown')
-        _append_run_history('target_result', target=target.name, success=False, skipped=True, reason='cooldown', seconds_left=cooldown.seconds_left)
-        return
+        if force_send_on_boot():
+            logger.info('[%s] Cooldown bypassed by PC startup exception. Left %s.', target.name, format_duration(cooldown.seconds_left))
+            _append_run_history('target_cooldown_bypass', target=target.name, reason='pc_startup', seconds_left=cooldown.seconds_left)
+        else:
+            passed_text = 'неизвестно' if cooldown.hours_passed is None else format_duration(int(cooldown.hours_passed * 3600))
+            left_text = format_duration(cooldown.seconds_left)
+            logger.info('[%s] Рано. Прошло %s. Осталось %s.', target.name, passed_text, left_text)
+            summary.add_result(target=target.name, success=False, skipped=True, reason='cooldown')
+            _append_run_history('target_result', target=target.name, success=False, skipped=True, reason='cooldown', seconds_left=cooldown.seconds_left)
+            return
 
     logger.info('--- Обработка: %s ---', target.name)
-    open_messages(page)
-    chat_opened = open_chat_by_list(page, target.name)
+    with timed_phase('target_open_messages', target=target.name):
+        open_messages(page)
+    try:
+        with timed_phase('target_open_chat', target=target.name, method='list'):
+            chat_opened = open_chat_by_list(page, target.name)
+    except Exception as exc:
+        logger.warning('List strategy failed for %s; trying profile fallback: %s', target.name, exc)
+        chat_opened = False
+    if not chat_opened:
+        logger.info('List strategy did not open chat for %s; trying profile fallback.', target.name)
+        _append_run_history('target_open_chat_result', target=target.name, method='list', ok=False, reason='not_found')
     if not chat_opened and target.profile_url:
         try:
-            chat_opened = open_chat_by_profile(page, target.profile_url)
+            with timed_phase('target_open_chat', target=target.name, method='profile'):
+                chat_opened = open_chat_by_profile(page, target.profile_url)
         except Exception as exc:
             logger.error('Не удалось открыть чат через профиль для %s: %s', target.name, exc)
             summary.add_result(target=target.name, success=False, reason='profile_open_failed')
@@ -348,16 +533,26 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
         _append_run_history('target_result', target=target.name, success=True, dry_run=True, reason='dry_run', message=message)
         return
 
+    guard_ok, guard = acquire_target_send_guard(target.name)
+    if not guard_ok:
+        logger.warning('[%s] Send skipped by recent target guard: %s', target.name, guard)
+        summary.add_result(target=target.name, success=False, skipped=True, reason='recent_guard')
+        _append_run_history('target_result', target=target.name, success=False, skipped=True, reason='recent_guard', guard=guard)
+        return
+
     try:
-        send_message(page, message)
+        with timed_phase('target_send_message', target=target.name):
+            send_message(page, message)
     except Exception as exc:
         logger.error('Не удалось отправить сообщение для %s: %s', target.name, exc)
         summary.add_result(target=target.name, success=False, reason='send_failed')
         _append_run_history('target_result', target=target.name, success=False, reason='send_failed', error=str(exc))
         return
 
-    store.mark_sent_now(target.name)
-    streak = store.update_streak_stats(target.name)
+    with timed_phase('target_save_state', target=target.name):
+        store.mark_sent_now(target.name)
+        mark_target_guard_sent(target.name)
+        streak = store.update_streak_stats(target.name)
     logger.info('✅ Успех! Текущий огонек: %s', streak.current_count)
     tg.send_target_success(target_name=target.name, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day)
     summary.add_result(target=target.name, success=True, message=message, streak_count=streak.current_count)
@@ -367,7 +562,8 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
 
 def open_logged_in_work_browser(playwright):
     try:
-        recovered_profile = recover_browser_profile_after_reinstall(PATHS)
+        with timed_phase('recover_browser_profile'):
+            recovered_profile = recover_browser_profile_after_reinstall(PATHS)
         if recovered_profile is not None:
             logger.warning('Recovered incompatible Chrome profile after Windows reinstall. Backup: %s', recovered_profile)
             tg.send_text('Local TikTok browser profile was reset because Windows could not decrypt the old Chrome cookies. Try logging in again once the TikTok cooldown is over.')
@@ -379,12 +575,18 @@ def open_logged_in_work_browser(playwright):
     keep_work_context = False
     try:
         logger.info('Открытие TikTok для проверки авторизации...')
-        work_context = init_work_browser(playwright, PATHS.user_data_dir)
+        with timed_phase('work_browser_launch'):
+            work_context = init_work_browser(playwright, PATHS.user_data_dir)
         work_page = work_context.pages[0] if work_context.pages else work_context.new_page()
         apply_stealth_script(work_page)
-        work_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
-        handle_captcha(work_page, tg, PATHS.artifacts_dir)
-        if is_logged_in(work_page):
+        apply_work_resource_filter(work_page)
+        with timed_phase('work_browser_goto_messages'):
+            work_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
+        with timed_phase('work_browser_captcha_check'):
+            handle_captcha(work_page, tg, PATHS.artifacts_dir)
+        with timed_phase('work_browser_auth_probe'):
+            logged_in = is_logged_in(work_page)
+        if logged_in:
             clear_auth_backoff(AUTH_BACKOFF_FILE)
             logger.info('Авторизация подтверждена; используем уже открытый рабочий Chromium.')
             keep_work_context = True
@@ -404,16 +606,21 @@ def open_logged_in_work_browser(playwright):
     auth_context = None
     auth_page = None
     try:
-        auth_context = init_auth_browser(playwright, PATHS.user_data_dir)
+        with timed_phase('auth_browser_launch'):
+            auth_context = init_auth_browser(playwright, PATHS.user_data_dir)
         auth_page = auth_context.pages[0] if auth_context.pages else auth_context.new_page()
         attach_auth_debug_listeners(auth_context, auth_runtime)
         auth_page = get_latest_tiktok_page(auth_context, auth_page)
         dump_auth_state(auth_page, 'AUTH_BROWSER_STARTED')
-        auth_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
+        with timed_phase('auth_browser_goto_messages'):
+            auth_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
         auth_page = get_latest_tiktok_page(auth_context, auth_page)
         dump_auth_state(auth_page, 'AFTER_MESSAGES_GOTO')
-        handle_captcha(auth_page, tg, PATHS.artifacts_dir)
-        if not interactive_auth(auth_page, tg, auth_runtime, PATHS.artifacts_dir, AUTH_BACKOFF_FILE):
+        with timed_phase('auth_browser_captcha_check'):
+            handle_captcha(auth_page, tg, PATHS.artifacts_dir)
+        with timed_phase('interactive_auth'):
+            auth_ok = interactive_auth(auth_page, tg, auth_runtime, PATHS.artifacts_dir, AUTH_BACKOFF_FILE)
+        if not auth_ok:
             return False, None, None
         auth_page = get_latest_tiktok_page(auth_context, auth_page)
         dump_auth_state(auth_page, 'AFTER_INTERACTIVE_AUTH')
@@ -427,23 +634,96 @@ def open_logged_in_work_browser(playwright):
         _resume_control_bot_after_auth(control_bot_suspended)
 
 
-def ensure_logged_in(playwright) -> bool:
-    logged_in, work_context, work_page = open_logged_in_work_browser(playwright)
-    safe_close_context(work_context, work_page)
-    return logged_in
+def run_browser_self_test() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        'ok': False,
+        'mode': 'self_test_no_send',
+        'profile_name': ACTIVE_PROFILE,
+        'user_data_dir': str(PATHS.user_data_dir),
+        'opened_browser': False,
+        'logged_in': False,
+        'captcha': {'found': False, 'selector': ''},
+        'url': '',
+        'phases': [],
+    }
+    context = None
+    page = None
+
+    @contextmanager
+    def local_phase(name: str):
+        started = time.perf_counter()
+        item: dict[str, Any] = {'phase': name, 'ok': False}
+        try:
+            yield
+            item['ok'] = True
+        except Exception as exc:
+            item['error'] = str(exc)[:300]
+            raise
+        finally:
+            item['elapsed_ms'] = round((time.perf_counter() - started) * 1000, 1)
+            result['phases'].append(item)
+
+    try:
+        with sync_playwright() as playwright:
+            with local_phase('launch_work_browser'):
+                context = init_work_browser(playwright, PATHS.user_data_dir)
+                result['opened_browser'] = True
+            page = context.pages[0] if context.pages else context.new_page()
+            with local_phase('prepare_page'):
+                apply_stealth_script(page)
+                apply_work_resource_filter(page)
+            with local_phase('goto_messages'):
+                page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
+                result['url'] = getattr(page, 'url', '') or ''
+            with local_phase('captcha_probe'):
+                result['captcha'] = detect_captcha(page, timeout_ms=700)
+            with local_phase('auth_probe'):
+                result['logged_in'] = bool(is_logged_in(page))
+                result['url'] = getattr(page, 'url', '') or result.get('url', '')
+        result['ok'] = bool(result['opened_browser']) and bool(result['logged_in']) and not bool(result['captcha'].get('found'))
+    except Exception as exc:  # noqa: BLE001
+        result['ok'] = False
+        result['error'] = str(exc)
+    finally:
+        safe_close_context(context, page)
+    return result
+
+
+def final_run_status(summary: RunSummary, preferred: str = 'idle') -> str:
+    """Return a stable terminal status without losing an explicit failure or stop."""
+    if preferred not in {'idle', 'starting', 'running'}:
+        return preferred
+    if summary.failed_count:
+        return 'partial' if summary.success_count else 'failed'
+    if summary.success_count:
+        return 'success'
+    if summary.skipped_count:
+        return 'skipped'
+    return 'idle'
+
+
+def release_worker_run() -> None:
+    try:
+        if control_store.load_state().last_run_pid == os.getpid():
+            control_store.update_state(last_run_pid=None, stop_requested=False)
+    finally:
+        run_lock.release()
 
 
 def check_tiktok_streak() -> None:
     logger.info('=== Запуск TikTok (%s) ===', ACTIVE_PROFILE)
+    log_lifecycle('worker_start', profile=ACTIVE_PROFILE, pid=os.getpid())
     if not run_lock.acquire():
         logger.warning('Профиль %s уже запущен. Пропускаю этот старт.', ACTIVE_PROFILE)
+        log_lifecycle('worker_skip_lock_busy', profile=ACTIVE_PROFILE)
         tg.send_text(f'⚠️ Профиль {ACTIVE_PROFILE} уже запущен. Новый запуск пропущен.')
         return
-    atexit.register(run_lock.release)
+    atexit.register(release_worker_run)
 
     runtime_state = control_store.load_state()
     if runtime_state.paused:
         logger.warning('Бот на паузе. Запуск для %s пропущен.', ACTIVE_PROFILE)
+        log_lifecycle('worker_skip_paused', profile=ACTIVE_PROFILE)
         _write_run_state(status='paused')
         run_lock.release()
         return
@@ -453,47 +733,76 @@ def check_tiktok_streak() -> None:
     profiles = control_store.load_profiles()
     targets = [Target(name=item['name'], profile_url=item.get('url')) for item in profiles.get(ACTIVE_PROFILE, [])]
     summary = RunSummary(profile_name=ACTIVE_PROFILE, total_targets=len(targets))
+    notify_run_finished = True
+    terminal_status = 'idle'
+    terminal_reason = ''
     _write_run_state(status='starting', total_targets=len(targets), current_target=None)
     _append_run_history('run_started', total_targets=len(targets), dry_run=runtime_state.dry_run)
     try:
         if not targets:
+            terminal_status = 'skipped'
+            terminal_reason = 'no_targets'
             logger.warning('В активном профиле %s нет адресатов. Запуск пропущен.', ACTIVE_PROFILE)
+            log_lifecycle('worker_skip_no_targets', profile=ACTIVE_PROFILE)
             summary.add_result(target='__run__', success=False, skipped=True, reason='no_targets')
-            _write_run_state(status='idle', current_target=None, summary=summary.to_dict())
             _append_run_history('run_skipped', reason='no_targets')
             return
-        if not wait_for_internet():
-            _write_run_state(status='offline')
+        ready_targets = ready_targets_for_run(targets, summary)
+        if not ready_targets:
+            terminal_status = 'skipped'
+            terminal_reason = 'cooldown'
+            notify_run_finished = False
+            logger.info('No ready targets for %s. Browser and auth check skipped.', ACTIVE_PROFILE)
+            log_lifecycle('worker_skip_all_cooldown', profile=ACTIVE_PROFILE, target_count=len(targets))
+            _append_run_history('run_skipped', reason='cooldown', cooldown_count=len(targets))
+            return
+        with timed_phase('internet_check'):
+            online = wait_for_internet()
+        if not online:
+            terminal_status = 'failed'
+            terminal_reason = 'offline'
+            log_lifecycle('worker_failed_offline', profile=ACTIVE_PROFILE)
             _append_run_history('run_failed', reason='offline')
             return
         with sync_playwright() as playwright:
             logged_in, work_context, work_page = open_logged_in_work_browser(playwright)
             if not logged_in:
+                terminal_status = 'failed'
+                terminal_reason = 'auth_failed'
+                log_lifecycle('worker_failed_auth', profile=ACTIVE_PROFILE)
                 summary.add_result(target='__run__', success=False, reason='auth_failed')
-                _write_run_state(status='auth_failed')
                 _append_run_history('run_failed', reason='auth_failed')
                 tg.send_text('❌ Авторизация не подтверждена. Проверь окно браузера и повтори запуск.')
                 return
             try:
                 logger.info('Рабочий Chromium готов; продолжаем рассылку.')
                 if work_context is None or work_page is None:
-                    work_context = init_work_browser(playwright, PATHS.user_data_dir)
+                    with timed_phase('work_browser_launch_reopen'):
+                        work_context = init_work_browser(playwright, PATHS.user_data_dir)
                     work_page = work_context.pages[0] if work_context.pages else work_context.new_page()
                     apply_stealth_script(work_page)
-                    work_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
-                    handle_captcha(work_page, tg, PATHS.artifacts_dir)
+                    apply_work_resource_filter(work_page)
+                    with timed_phase('work_browser_goto_messages_reopen'):
+                        work_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
+                    with timed_phase('work_browser_captcha_check_reopen'):
+                        handle_captcha(work_page, tg, PATHS.artifacts_dir)
                 stop_reason = stop_or_pause_reason()
                 if stop_reason:
+                    terminal_status = 'stopped'
+                    terminal_reason = stop_reason
                     logger.warning('Получен %s перед началом рассылки. Запуск остановлен.', stop_reason)
                     summary.add_result(target='__run__', success=False, skipped=True, reason=stop_reason)
                     _append_run_history('run_stopped', reason=stop_reason)
                     return
-                send_start_message(targets, dry_run=runtime_state.dry_run)
+                send_start_message(ready_targets, dry_run=runtime_state.dry_run)
+                log_lifecycle('dispatch_start', profile=ACTIVE_PROFILE, ready_targets=len(ready_targets), dry_run=runtime_state.dry_run)
                 logger.info('Переход к циклу рассылки. targets=%s', len(targets))
-                _write_run_state(status='running', current_target=None, total_targets=len(targets))
-                for target in targets:
+                _write_run_state(status='running', current_target=None, total_targets=len(ready_targets))
+                for target in ready_targets:
                     stop_reason = stop_or_pause_reason()
                     if stop_reason:
+                        terminal_status = 'stopped'
+                        terminal_reason = stop_reason
                         logger.warning('Получен %s. Останавливаю цикл перед следующим адресатом.', stop_reason)
                         summary.add_result(target='__run__', success=False, skipped=True, reason=stop_reason)
                         _append_run_history('run_stopped', reason=stop_reason)
@@ -503,14 +812,46 @@ def check_tiktok_streak() -> None:
             finally:
                 logger.info('Закрытие браузера.')
                 safe_close_context(work_context, work_page)
+    except Exception as exc:
+        terminal_status = 'failed'
+        terminal_reason = 'unhandled_exception'
+        _append_run_history('run_failed', reason=terminal_reason, error=str(exc)[:300])
+        raise
     finally:
         summary.duration_seconds = time.time() - run_start
+        terminal_status = final_run_status(summary, terminal_status)
+        completed_at = time.time()
         save_run_summary(summary)
-        _write_run_state(status='idle', current_target=None, summary=summary.to_dict())
-        _append_run_history('run_finished', success_count=summary.success_count, skipped_count=summary.skipped_count, failed_count=summary.failed_count, duration_seconds=round(summary.duration_seconds, 2))
-        tg.send_run_finished(profile_name=summary.profile_name, success_count=summary.success_count, skipped_count=summary.skipped_count, failed_count=summary.failed_count, duration_text=format_duration(int(summary.duration_seconds)))
-        control_store.update_state(stop_requested=False)
-        run_lock.release()
+        _write_run_state(
+            status=terminal_status,
+            reason=terminal_reason or None,
+            completed_at=completed_at,
+            current_target=None,
+            total_targets=summary.total_targets,
+            summary=summary.to_dict(),
+        )
+        _append_run_history(
+            'run_finished',
+            status=terminal_status,
+            reason=terminal_reason or None,
+            success_count=summary.success_count,
+            skipped_count=summary.skipped_count,
+            failed_count=summary.failed_count,
+            duration_seconds=round(summary.duration_seconds, 2),
+        )
+        if notify_run_finished:
+            tg.send_run_finished(profile_name=summary.profile_name, success_count=summary.success_count, skipped_count=summary.skipped_count, failed_count=summary.failed_count, duration_text=format_duration(int(summary.duration_seconds)))
+        log_lifecycle(
+            'worker_finish',
+            profile=ACTIVE_PROFILE,
+            status=terminal_status,
+            reason=terminal_reason or None,
+            success=summary.success_count,
+            skipped=summary.skipped_count,
+            failed=summary.failed_count,
+            duration_seconds=round(summary.duration_seconds, 2),
+        )
+        release_worker_run()
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpStream,
+    io::{BufRead, BufReader},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
@@ -10,7 +10,22 @@ use std::{
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
-const DEFAULT_BACKEND_URL: &str = "http://127.0.0.1:5874/";
+const BACKEND_PORT: &str = "5874";
+const INSTANCE_LOCK_ADDR: &str = "127.0.0.1:5873";
+
+struct SingleInstanceGuard {
+    _listener: TcpListener,
+}
+
+impl SingleInstanceGuard {
+    fn acquire() -> Option<Self> {
+        TcpListener::bind(INSTANCE_LOCK_ADDR)
+            .ok()
+            .map(|listener| Self {
+                _listener: listener,
+            })
+    }
+}
 
 struct BackendProcess(Arc<Mutex<Option<Child>>>);
 
@@ -24,7 +39,7 @@ impl BackendProcess {
             return;
         };
         if let Some(mut child) = guard.take() {
-            let _ = child.kill();
+            kill_backend_process_tree(&mut child);
             let _ = child.wait();
         }
     }
@@ -46,6 +61,29 @@ fn hide_console(command: &mut Command) {
 #[cfg(not(windows))]
 fn hide_console(_command: &mut Command) {}
 
+#[cfg(windows)]
+fn kill_backend_process_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let mut command = Command::new("taskkill");
+    command
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    match command.status() {
+        Ok(status) if status.success() => {}
+        _ => {
+            let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_backend_process_tree(child: &mut Child) {
+    let _ = child.kill();
+}
+
 fn project_root() -> PathBuf {
     if let Ok(value) = std::env::var("YARA_PROJECT_ROOT") {
         let path = PathBuf::from(value);
@@ -59,48 +97,79 @@ fn project_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn backend_is_ready(url: &str) -> bool {
-    let Some(host_port) = url
-        .strip_prefix("http://")
-        .and_then(|value| value.split('/').next())
-    else {
-        return false;
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &host_port
-            .parse()
-            .unwrap_or_else(|_| "127.0.0.1:5874".parse().unwrap()),
-        Duration::from_millis(700),
-    ) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(900)));
-    let request =
-        format!("GET /api/diagnostics HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+fn python_executable() -> PathBuf {
+    if let Ok(value) = std::env::var("YARA_PYTHON") {
+        let path = PathBuf::from(value);
+        if path.exists() {
+            return path;
+        }
     }
-    let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok() && response.contains("200 OK")
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let local = PathBuf::from(local_app_data);
+        for candidate in [
+            local
+                .join("Python")
+                .join("pythoncore-3.14-64")
+                .join("python.exe"),
+            local.join("Python").join("bin").join("python.exe"),
+            local
+                .join("Programs")
+                .join("Python")
+                .join("Python314")
+                .join("python.exe"),
+            local
+                .join("Python")
+                .join("pythoncore-3.13-64")
+                .join("python.exe"),
+            local
+                .join("Programs")
+                .join("Python")
+                .join("Python313")
+                .join("python.exe"),
+            local
+                .join("Python")
+                .join("pythoncore-3.12-64")
+                .join("python.exe"),
+            local
+                .join("Programs")
+                .join("Python")
+                .join("Python312")
+                .join("python.exe"),
+        ] {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        let root = PathBuf::from(program_files);
+        for candidate in [
+            root.join("Python314").join("python.exe"),
+            root.join("Python313").join("python.exe"),
+            root.join("Python312").join("python.exe"),
+        ] {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("python")
 }
 
 fn start_backend() -> Result<(String, BackendProcess), String> {
-    if backend_is_ready(DEFAULT_BACKEND_URL) {
-        return Ok((DEFAULT_BACKEND_URL.to_string(), BackendProcess::new(None)));
-    }
-
     let root = project_root();
     let script = root.join("app_shell").join("server.py");
     if !script.exists() {
         return Err(format!("Backend script not found: {}", script.display()));
     }
 
-    let mut command = Command::new("python");
+    let mut command = Command::new(python_executable());
     command
         .arg(&script)
         .arg("--port")
-        .arg("5874")
+        .arg(BACKEND_PORT)
         .current_dir(&root)
+        .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -125,24 +194,36 @@ fn start_backend() -> Result<(String, BackendProcess), String> {
     if let Some(stdout) = stdout {
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
+            let mut url_sender = Some(sender);
             for line in reader.lines().map_while(Result::ok) {
                 if let Some(url) = line.strip_prefix("TikTok Heart Desktop: ") {
-                    let _ = sender.send(url.trim().to_string());
-                    break;
+                    if let Some(sender) = url_sender.take() {
+                        let _ = sender.send(url.trim().to_string());
+                    }
                 }
             }
         });
     }
 
-    let url = receiver
-        .recv_timeout(Duration::from_secs(8))
-        .unwrap_or_else(|_| DEFAULT_BACKEND_URL.to_string());
+    let url = match receiver.recv_timeout(Duration::from_secs(15)) {
+        Ok(url) => url,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("Backend did not report its URL in time: {error}"));
+        }
+    };
     Ok((url, BackendProcess::new(Some(child))))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let Some(instance_guard) = SingleInstanceGuard::acquire() else {
+        return;
+    };
+
     tauri::Builder::default()
+        .manage(instance_guard)
         .setup(|app| {
             let (backend_url, backend_process) =
                 start_backend().map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error)))?;
@@ -153,12 +234,14 @@ pub fn run() {
             })?;
 
             app.manage(backend_process);
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed_url))
+            let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(parsed_url))
                 .title("TikTok Heart")
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(980.0, 680.0)
                 .resizable(true)
+                .always_on_top(false)
                 .build()?;
+            let _ = window.set_always_on_top(false);
             Ok(())
         })
         .on_window_event(|window, event| {

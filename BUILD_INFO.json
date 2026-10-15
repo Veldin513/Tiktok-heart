@@ -1,6 +1,6 @@
 {
-  "build": "tiktok-heart-2.1-2026-05-06",
-  "version": "2.1.0",
+  "build": "tiktok-heart-2.2-2026-10-15",
+  "version": "2.2.0",
   "notes": [
     "Python runtime moved into yara_app/",
     "Legacy Windows launchers moved into scripts/windows/",
@@ -12,8 +12,18 @@
     "Pinned auto-refresh control, TikTok Heart branding, and run history panel added",
     "Desktop shell renamed to app_shell and UI dark background mode added",
     "Pytest runtime isolated from the real profile and logs",
-    "Security scan is available inside the desktop app",
     "UI performance panel added for slow local API requests",
-    "Manual refresh now queues behind in-flight auto-refresh"
+    "Manual refresh now queues behind in-flight auto-refresh",
+    "Auto-refresh uses a lightweight live status endpoint",
+    "Desktop shell owns its backend process and does not reuse stale servers",
+    "Auth backup restore added with validation and pre-restore safety backup",
+    "Worker lifecycle timeline added to the overview",
+    "Live status now has a short backend cache to reduce UI polling load",
+    "Windows launchers now use a shared robust Python discovery path",
+    "Scheduled starts validate worker command and creation time instead of trusting saved PIDs",
+    "Worker locks recover when Windows reuses an old PID after reboot",
+    "Worker exit clears its saved PID and releases its lock even if state cleanup fails",
+    "Windows startup launcher translates boot-force and self-test switches for PowerShell",
+    "Stale worker state cannot terminate an unrelated process"
   ]
 }

@@ -47,7 +47,11 @@ def test_stop_telegram_bot_terminates_all_detected_instances(tmp_path: Path, mon
     adapter.update_control_state({'telegram_bot_pid': 111, 'telegram_bot_started_at': 1.0})
     adapter._write_pid_file(adapter.telegram_lock_path, 222)
 
-    monkeypatch.setattr(ProjectAdapter, '_discover_running_script_pids', lambda self, script, fallback=None: [111, 222])
+    def fake_discover_running_script_pids(self, script, fallback=None):
+        del self, script, fallback
+        return [111, 222]
+
+    monkeypatch.setattr(ProjectAdapter, '_discover_running_script_pids', fake_discover_running_script_pids)
     monkeypatch.setattr(ProjectAdapter, '_pid_exists', lambda self, pid: pid in {111, 222})
 
     terminated: list[int] = []
@@ -85,7 +89,7 @@ def test_telegram_bot_stops_on_http_409_conflict(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(bot, '_acquire_instance_lock', lambda: True)
     monkeypatch.setattr(bot, '_restore_reply_panels', lambda: None)
     monkeypatch.setattr(bot, '_release_instance_lock', lambda: released.__setitem__("value", True))
-    monkeypatch.setattr('yara_app.telegram_control_bot.atexit.register', lambda fn: None)
+    monkeypatch.setattr('yara_app.telegram_control_bot.atexit.register', lambda fn: (fn, None)[1])
     monkeypatch.setattr('yara_app.telegram_control_bot.time.sleep', lambda seconds: None)
 
     error = urllib.error.HTTPError('https://api.telegram.org', 409, 'Conflict', {}, None)

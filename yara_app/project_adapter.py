@@ -10,13 +10,16 @@ import sqlite3
 import subprocess
 import sys
 import time
-import zipfile
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from yara_app.backups import BackupService
+from yara_app.performance import PerformanceService
 from yara_app.runtime_paths import browser_profile_needs_recovery, extend_env_with_site_packages
+from yara_app.scheduler import WorkerScheduleService
 from yara_app.ttbot.models import legacy_safe_filename, safe_name_key
 
 try:
@@ -35,13 +38,12 @@ DEFAULT_TELEGRAM_SCRIPT = "yara_app/telegram_control_bot.py"
 LEGACY_MAIN_SCRIPT = "tiktok_checker.py"
 LEGACY_TELEGRAM_SCRIPT = "telegram_control_bot.py"
 TELEGRAM_CONFIG_NAME = "telegram_bot_v2.json"
-TELEGRAM_STATE_NAME = "telegram_bot_v2_state.json"
 LAUNCHER_LOG_NAME = "launcher.log"
 TELEGRAM_LOG_NAME = "telegram_control_bot_v2.log"
 APP_SHELL_PERF_LOG_NAME = "app_shell_perf.log"
 TELEGRAM_LOCK_NAME = "telegram_bot_v2.lock"
 COMMON_LOGS_DIR_NAME = "logs"
-DESKTOP_STARTUP_LOG_NAME = "desktop_app_startup_error.log"
+RUN_HISTORY_READ_BYTES = 512 * 1024
 AUTH_DEBUG_LOG_NAME = "auth_debug.log"
 WORKER_SCHEDULE_TASK_NAME = "Yara TikTok Worker"
 TIKTOK_AUTH_COOKIE_DOMAINS = (
@@ -120,10 +122,10 @@ class WorkerStatus:
 
 
 class ProjectAdapter:
-    """Project runtime adapter for both the diagnostics UI and the tray shell.
+    """Project runtime adapter for the web shell, worker and Telegram control.
 
     The adapter intentionally owns all process-management responsibilities so the
-    GUI does not need to know how worker/Telegram processes are started,
+    UI does not need to know how worker/Telegram processes are started,
     discovered, or stopped on each platform.
     """
 
@@ -139,17 +141,17 @@ class ProjectAdapter:
         self.main_script_path = self._runtime_script_path(DEFAULT_MAIN_SCRIPT, LEGACY_MAIN_SCRIPT)
         self.telegram_script_path = self._runtime_script_path(DEFAULT_TELEGRAM_SCRIPT, LEGACY_TELEGRAM_SCRIPT)
         self.telegram_config_path = self.control_dir / TELEGRAM_CONFIG_NAME
-        self.telegram_state_path = self.control_dir / TELEGRAM_STATE_NAME
         self.telegram_lock_path = self.control_dir / TELEGRAM_LOCK_NAME
         self.common_logs_dir = self.base_dir / COMMON_LOGS_DIR_NAME
-        self.desktop_startup_error_path = self.common_logs_dir / DESKTOP_STARTUP_LOG_NAME
         self.windows_scripts_dir = self.base_dir / "scripts" / "windows"
         self.worker_schedule_register_script_path = self._helper_script_path("register_worker_schedule.ps1")
         self.worker_schedule_unregister_script_path = self._helper_script_path("unregister_worker_schedule.ps1")
-        self._worker_schedule_status_cache: tuple[float, dict[str, Any]] = (0.0, {})
         self._dir_size_cache: dict[str, tuple[int, float, int]] = {}
         self._chrome_profiles_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
         self._dependency_report_cache: tuple[float, dict[str, Any]] = (0.0, {})
+        self.backups = BackupService(self)
+        self.performance_reports = PerformanceService(self)
+        self.scheduler = WorkerScheduleService(self, task_name=WORKER_SCHEDULE_TASK_NAME)
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self.common_logs_dir.mkdir(parents=True, exist_ok=True)
         self._refresh_runtime_paths()
@@ -214,20 +216,16 @@ class ProjectAdapter:
         dst.parent.mkdir(parents=True, exist_ok=True)
         payload = src.read_text(encoding="utf-8", errors="replace")
         if not payload:
-            try:
+            with suppress(Exception):
                 src.unlink()
-            except Exception:
-                pass
             return
         prefix = ""
         if dst.exists() and dst.stat().st_size > 0:
             prefix = "\n"
         with dst.open("a", encoding="utf-8") as handle:
             handle.write(prefix + payload)
-        try:
+        with suppress(Exception):
             src.unlink()
-        except Exception:
-            pass
 
     def _migrate_legacy_log_files(self) -> None:
         mapping = {
@@ -235,7 +233,6 @@ class ProjectAdapter:
             self.base_dir / WORKER_STDOUT_NAME: self.worker_stdout_path,
             self.base_dir / LAUNCHER_LOG_NAME: self.launcher_log_path,
             self.base_dir / TELEGRAM_LOG_NAME: self.telegram_log_path,
-            self.base_dir / DESKTOP_STARTUP_LOG_NAME: self.desktop_startup_error_path,
         }
         for src, dst in mapping.items():
             if not src.exists() or src.resolve() == dst.resolve():
@@ -284,15 +281,6 @@ class ProjectAdapter:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def ensure_live_mode(self) -> dict[str, Any]:
-        """Backward-compatible helper that now only ensures runtime files exist.
-
-        Dry-run mode is controlled explicitly from the desktop UI and should not
-        be reset implicitly during startup.
-        """
-        self.ensure_runtime_files()
-        return self.get_control_state()
-
     def ensure_runtime_files(self) -> None:
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self.common_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -338,96 +326,13 @@ class ProjectAdapter:
         }
 
     def app_shell_performance_summary(self) -> dict[str, Any]:
-        raw_lines = self.tail_file(self.app_shell_perf_log_path, lines=120)
-        events: list[dict[str, Any]] = []
-        for line in raw_lines:
-            parts = line.split()
-            if len(parts) < 5:
-                continue
-            elapsed_text = parts[-1]
-            if not elapsed_text.endswith("ms"):
-                continue
-            try:
-                elapsed_ms = float(elapsed_text[:-2])
-            except ValueError:
-                continue
-            events.append({
-                "time": " ".join(parts[:2]),
-                "method": parts[2],
-                "path": parts[3],
-                "elapsed_ms": elapsed_ms,
-                "line": line,
-            })
+        return self.performance_reports.app_shell_summary()
 
-        latest = events[-1] if events else None
-        worst = max(events, key=lambda item: float(item.get("elapsed_ms") or 0), default=None)
-        warning_count = sum(1 for item in events if float(item.get("elapsed_ms") or 0) >= 1000)
-        status = "ok"
-        if warning_count:
-            status = "warning"
-        if worst and float(worst.get("elapsed_ms") or 0) >= 2500:
-            status = "critical"
-        return {
-            "exists": self.app_shell_perf_log_path.exists(),
-            "path": str(self.app_shell_perf_log_path),
-            "slow_count": len(events),
-            "warning_count": warning_count,
-            "latest": latest,
-            "worst": worst,
-            "events": list(reversed(events[-8:])),
-            "status": status,
-        }
+    def worker_phase_summary(self, profile_key: str | None = None) -> dict[str, Any]:
+        return self.performance_reports.worker_phase_summary(profile_key)
 
-    def run_security_scan(self, *, tracked_only: bool = True) -> dict[str, Any]:
-        script = self.base_dir / "scripts" / "security_scan.py"
-        if not script.exists():
-            return {
-                "ok": False,
-                "exit_code": None,
-                "error": f"Security scan script not found: {script}",
-                "stdout": "",
-                "stderr": "",
-                "lines": [],
-            }
-
-        command = [sys.executable, str(script)]
-        if tracked_only:
-            command.append("--tracked-only")
-        started = time.perf_counter()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=self.base_dir,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=90,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return {
-                "ok": False,
-                "exit_code": None,
-                "error": "Security scan timed out.",
-                "stdout": exc.stdout or "",
-                "stderr": exc.stderr or "",
-                "lines": [],
-                "duration_ms": int((time.perf_counter() - started) * 1000),
-            }
-
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        return {
-            "ok": completed.returncode == 0,
-            "exit_code": completed.returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-            "lines": [line for line in stdout.splitlines() if line.strip()],
-            "error_lines": [line for line in stderr.splitlines() if line.strip()],
-            "tracked_only": tracked_only,
-            "duration_ms": int((time.perf_counter() - started) * 1000),
-        }
+    def performance_summary(self, profile_key: str | None = None) -> dict[str, Any]:
+        return self.performance_reports.summary(profile_key)
 
     def validate_project(self) -> dict[str, Any]:
         self.ensure_runtime_files()
@@ -505,21 +410,29 @@ class ProjectAdapter:
 
     def _profiles_from_mapping(self, payload: dict[str, Any], active_name: str) -> list[ProfileEntry]:
         items: list[ProfileEntry] = []
-        for key, raw in payload.items():
+        for index, (key, raw) in enumerate(payload.items()):
             key_text = str(key)
             targets = self._extract_targets(raw)
             label = key_text
-            enabled = key_text == active_name
+            supports_enabled = isinstance(raw, dict) and "enabled" in raw
+            enabled = True
             if isinstance(raw, dict):
                 label = str(raw.get("name") or key_text)
-                enabled = bool(raw.get("enabled", enabled))
+                if supports_enabled:
+                    enabled = bool(raw.get("enabled"))
             items.append(
                 ProfileEntry(
                     key=key_text,
                     label=label,
                     enabled=enabled,
                     active=key_text == active_name,
-                    raw={"target_count": len(targets), "targets": targets, "source": raw},
+                    raw={
+                        "target_count": len(targets),
+                        "targets": targets,
+                        "index": index,
+                        "supports_enabled": supports_enabled,
+                        "source": raw,
+                    },
                 )
             )
         return items
@@ -539,7 +452,13 @@ class ProjectAdapter:
                     label=label,
                     enabled=enabled,
                     active=key == active_name,
-                    raw={"target_count": len(targets), "targets": targets, "index": index, "source": raw},
+                    raw={
+                        "target_count": len(targets),
+                        "targets": targets,
+                        "index": index,
+                        "supports_enabled": True,
+                        "source": raw,
+                    },
                 )
             )
         return items
@@ -559,9 +478,16 @@ class ProjectAdapter:
         profiles = self.get_profiles()
         if index < 0 or index >= len(profiles):
             raise IndexError("profile index out of range")
-        profile = profiles[index]
+        return self.set_active_profile_key(profiles[index].key)
+
+    def set_active_profile_key(self, profile_key: str) -> ProfileEntry:
+        key = str(profile_key or "").strip()
+        profiles = self.get_profiles()
+        profile = next((item for item in profiles if item.key == key), None)
+        if profile is None:
+            raise ValueError(f"Unknown profile: {key}")
         self.update_control_state({"active_profile": profile.key})
-        return self.get_profiles()[index]
+        return next(item for item in self.get_profiles() if item.key == profile.key)
 
     def _google_chrome_user_data_dir(self) -> Path:
         local_app_data = os.environ.get("LOCALAPPDATA")
@@ -649,10 +575,8 @@ class ProjectAdapter:
                         continue
                     parts = [part.strip().strip('"') for part in line.split(",")]
                     if len(parts) > 1:
-                        try:
+                        with suppress(ValueError):
                             pids.append(int(parts[1]))
-                        except ValueError:
-                            pass
         return sorted(set(pids))
 
     def _copy_existing_file(self, source: Path, destination: Path) -> bool:
@@ -713,26 +637,20 @@ class ProjectAdapter:
         kept = 0
         con = sqlite3.connect(cookies_path)
         try:
-            try:
+            with suppress(sqlite3.DatabaseError):
                 con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.DatabaseError:
-                pass
             before = int(con.execute("SELECT COUNT(*) FROM cookies").fetchone()[0])
             clause, params = self._cookie_keep_clause()
             kept = int(con.execute(f"SELECT COUNT(*) FROM cookies WHERE {clause}", params).fetchone()[0])
             con.execute(f"DELETE FROM cookies WHERE NOT ({clause})", params)
             con.commit()
-            try:
+            with suppress(sqlite3.DatabaseError):
                 con.execute("VACUUM")
-            except sqlite3.DatabaseError:
-                pass
         finally:
             con.close()
         for suffix in ("-wal", "-shm"):
-            try:
+            with suppress(Exception):
                 Path(str(cookies_path) + suffix).unlink(missing_ok=True)
-            except Exception:
-                pass
         return {"before": before, "kept": kept, "path": str(cookies_path)}
 
     def _copy_filtered_tiktok_cookies(self, source_profile: Path, dest_profile: Path) -> dict[str, Any]:
@@ -811,6 +729,80 @@ class ProjectAdapter:
             "cookies": cookie_result,
         }
 
+    def _validate_staged_chromium_import(
+        self,
+        user_data_dir: Path,
+        *,
+        copy_mode: str,
+        import_details: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Check a staged Chrome import before it can replace a live profile."""
+        default_dir = user_data_dir / "Default"
+        preferences_path = default_dir / "Preferences"
+        local_state_path = user_data_dir / "Local State"
+        cookie_paths = [default_dir / "Network" / "Cookies", default_dir / "Cookies"]
+        cookies_path = next((path for path in cookie_paths if path.is_file()), cookie_paths[0])
+        errors: list[str] = []
+
+        if not default_dir.is_dir():
+            errors.append("В staged-профиле отсутствует папка Default.")
+        if not preferences_path.is_file():
+            errors.append("В staged-профиле отсутствуют настройки браузера.")
+        if not local_state_path.is_file():
+            errors.append("В staged-профиле отсутствует файл Local State.")
+
+        cookies = import_details.get("cookies") if isinstance(import_details.get("cookies"), dict) else {}
+        kept_cookies = int(cookies.get("kept") or 0)
+        if copy_mode == "tiktok_session":
+            if not cookies.get("copied") or not cookies_path.is_file():
+                errors.append("В выбранном профиле Chrome не найдена база cookies TikTok.")
+            elif kept_cookies <= 0:
+                errors.append("В выбранном профиле Chrome не найдена авторизация TikTok.")
+
+        return {
+            "ok": not errors,
+            "copy_mode": copy_mode,
+            "default_profile_exists": default_dir.is_dir(),
+            "preferences_exists": preferences_path.is_file(),
+            "local_state_exists": local_state_path.is_file(),
+            "cookies_exists": cookies_path.is_file(),
+            "tiktok_cookies": kept_cookies,
+            "errors": errors,
+        }
+
+    def _commit_staged_browser_profile(
+        self,
+        *,
+        browser_dir: Path,
+        user_data_dir: Path,
+        staged_user_data_dir: Path,
+        timestamp: str,
+    ) -> tuple[Path | None, dict[str, Any]]:
+        """Atomically promote a staged profile and restore the old one on error."""
+        backup_path: Path | None = None
+        rollback = {"attempted": False, "restored": False, "error": ""}
+        try:
+            if user_data_dir.exists():
+                backup_path = browser_dir / f"user_data_before_chrome_import_{timestamp}"
+                suffix = 1
+                while backup_path.exists():
+                    suffix += 1
+                    backup_path = browser_dir / f"user_data_before_chrome_import_{timestamp}_{suffix}"
+                shutil.move(str(user_data_dir), str(backup_path))
+            shutil.move(str(staged_user_data_dir), str(user_data_dir))
+        except Exception:
+            rollback["attempted"] = True
+            try:
+                if user_data_dir.exists():
+                    self._remove_profile_path_for_compact(user_data_dir, browser_dir)
+                if backup_path and backup_path.exists():
+                    shutil.move(str(backup_path), str(user_data_dir))
+                    rollback["restored"] = True
+            except Exception as rollback_exc:  # noqa: BLE001
+                rollback["error"] = str(rollback_exc)
+            raise
+        return backup_path, rollback
+
     def import_google_chrome_profile(
         self,
         *,
@@ -852,7 +844,6 @@ class ProjectAdapter:
         auth_backoff_path = state_dir / "auth_backoff.json"
         browser_dir.mkdir(parents=True, exist_ok=True)
 
-        backup_path: Path | None = None
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         temp_user_data_dir = browser_dir / f"user_data_import_tmp_{timestamp}"
         suffix = 1
@@ -861,6 +852,7 @@ class ProjectAdapter:
             temp_user_data_dir = browser_dir / f"user_data_import_tmp_{timestamp}_{suffix}"
         temp_user_data_dir.mkdir(parents=True, exist_ok=False)
 
+        import_details: dict[str, Any]
         try:
             mode = str(copy_mode or "tiktok_session").strip().lower()
             if mode in {"full", "full_profile", "profile"}:
@@ -890,29 +882,39 @@ class ProjectAdapter:
                 except Exception:
                     pass
 
-            if user_data_dir.exists():
-                backup_path = browser_dir / f"user_data_before_chrome_import_{timestamp}"
-                suffix = 1
-                while backup_path.exists():
-                    suffix += 1
-                    backup_path = browser_dir / f"user_data_before_chrome_import_{timestamp}_{suffix}"
-                shutil.move(str(user_data_dir), str(backup_path))
-            shutil.move(str(temp_user_data_dir), str(user_data_dir))
+            validation = self._validate_staged_chromium_import(
+                temp_user_data_dir,
+                copy_mode=str(import_details["copy_mode"]),
+                import_details=import_details,
+            )
+            if not validation["ok"]:
+                raise RuntimeError("Импорт отменён: " + " ".join(validation["errors"]))
         except Exception:
             if temp_user_data_dir.exists():
                 shutil.rmtree(temp_user_data_dir, ignore_errors=True)
-            if backup_path and backup_path.exists() and not user_data_dir.exists():
-                try:
-                    shutil.move(str(backup_path), str(user_data_dir))
-                    backup_path = None
-                except Exception:
-                    pass
+            raise
+
+        pre_import_auth_backup = self.create_auth_backup(profile_root.name) if user_data_dir.exists() else None
+        try:
+            backup_path, rollback = self._commit_staged_browser_profile(
+                browser_dir=browser_dir,
+                user_data_dir=user_data_dir,
+                staged_user_data_dir=temp_user_data_dir,
+                timestamp=timestamp,
+            )
+        except Exception:
+            if temp_user_data_dir.exists():
+                shutil.rmtree(temp_user_data_dir, ignore_errors=True)
             raise
 
         auth_backoff_removed = False
+        auth_backoff_reset_error = ""
         if auth_backoff_path.exists():
-            auth_backoff_path.unlink()
-            auth_backoff_removed = True
+            try:
+                auth_backoff_path.unlink()
+                auth_backoff_removed = True
+            except OSError as exc:
+                auth_backoff_reset_error = str(exc)
 
         return {
             "chrome_profile_id": chrome_profile_id,
@@ -920,8 +922,12 @@ class ProjectAdapter:
             "bot_profile_key": profile_root.name,
             "destination": str(user_data_dir),
             "backup": str(backup_path) if backup_path else "",
+            "pre_import_auth_backup": pre_import_auth_backup,
+            "rollback": rollback,
+            "validation": validation,
             "size_bytes": self._dir_size_bytes(user_data_dir),
             "auth_backoff_removed": auth_backoff_removed,
+            "auth_backoff_reset_error": auth_backoff_reset_error,
             **import_details,
         }
 
@@ -932,8 +938,8 @@ class ProjectAdapter:
         resolved_root = allowed_root.resolve()
         try:
             resolved_path.relative_to(resolved_root)
-        except ValueError:
-            raise ValueError(f"Refusing to remove path outside browser profile: {resolved_path}")
+        except ValueError as exc:
+            raise ValueError(f"Refusing to remove path outside browser profile: {resolved_path}") from exc
         size = self._dir_size_bytes(path)
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
@@ -1017,13 +1023,58 @@ class ProjectAdapter:
         ]
 
     def _auth_backup_files(self, profile_key: str) -> list[Path]:
-        backup_dir = self.base_dir / "backups" / "auth"
-        if not backup_dir.exists():
-            return []
-        return [
-            path for path in backup_dir.iterdir()
-            if path.is_file() and path.name.startswith(f"auth_backup_{profile_key}_") and path.suffix.lower() == ".zip"
-        ]
+        return self.backups.auth_backup_files(profile_key)
+
+    def _auth_backup_by_name(self, profile_key: str, name: str) -> Path | None:
+        return self.backups.auth_backup_by_name(profile_key, name)
+
+    @staticmethod
+    def _safe_zip_name(name: str) -> bool:
+        return BackupService.safe_zip_name(name)
+
+    def _auth_restore_policy(self, profile_key: str, *, include_global: bool = False) -> dict[str, tuple[str, ...]]:
+        return self.backups.auth_restore_policy(profile_key, include_global=include_global)
+
+    def _classify_auth_backup_member(
+        self,
+        member_name: str,
+        profile_key: str,
+        *,
+        include_global: bool = False,
+    ) -> str:
+        return self.backups.classify_auth_backup_member(
+            member_name,
+            profile_key,
+            include_global=include_global,
+        )
+
+    def validate_auth_backup(
+        self,
+        profile_key: str | None,
+        backup_name: str,
+        *,
+        include_global: bool = False,
+        deep: bool = False,
+    ) -> dict[str, Any]:
+        return self.backups.validate_auth_backup(
+            profile_key,
+            backup_name,
+            include_global=include_global,
+            deep=deep,
+        )
+
+    def restore_auth_backup(
+        self,
+        profile_key: str | None,
+        backup_name: str,
+        *,
+        include_global: bool = False,
+    ) -> dict[str, Any]:
+        return self.backups.restore_auth_backup(
+            profile_key,
+            backup_name,
+            include_global=include_global,
+        )
 
     def prune_auth_backups(
         self,
@@ -1031,86 +1082,10 @@ class ProjectAdapter:
         *,
         keep_latest: int = 1,
     ) -> dict[str, Any]:
-        profile_root = self._bot_profile_root(profile_key)
-        keep_latest = max(0, int(keep_latest))
-        backups = sorted(
-            self._auth_backup_files(profile_root.name),
-            key=lambda path: path.stat().st_mtime if path.exists() else 0,
-            reverse=True,
-        )
-        kept = backups[:keep_latest]
-        removable = backups[keep_latest:]
-        removed: list[dict[str, Any]] = []
-        freed_bytes = 0
-        for backup in removable:
-            try:
-                size = backup.stat().st_size
-                backup.unlink()
-            except OSError as exc:
-                removed.append({"name": backup.name, "path": str(backup), "ok": False, "error": str(exc)})
-                continue
-            freed_bytes += size
-            removed.append({"name": backup.name, "path": str(backup), "ok": True, "bytes": size})
-        return {
-            "profile_key": profile_root.name,
-            "keep_latest": keep_latest,
-            "kept": [{"name": path.name, "path": str(path)} for path in kept if path.exists()],
-            "removed_count": sum(1 for item in removed if item.get("ok")),
-            "removed": removed,
-            "freed_bytes": freed_bytes,
-            "backup_bytes": sum(path.stat().st_size for path in self._auth_backup_files(profile_root.name) if path.exists()),
-        }
+        return self.backups.prune_auth_backups(profile_key, keep_latest=keep_latest)
 
     def delete_selected_backups(self, profile_key: str | None, selections: list[dict[str, Any]]) -> dict[str, Any]:
-        profile_root = self._bot_profile_root(profile_key)
-        browser_dir = profile_root / "browser"
-        browser_backups = {path.name: path for path in self._browser_backup_dirs(browser_dir)}
-        auth_backups = {path.name: path for path in self._auth_backup_files(profile_root.name)}
-        removed: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        freed_bytes = 0
-
-        for item in selections:
-            kind = str(item.get("kind") or "").strip().lower()
-            name = Path(str(item.get("name") or "")).name
-            if not name:
-                skipped.append({"kind": kind, "name": name, "reason": "empty_name"})
-                continue
-            if kind == "auth":
-                target = auth_backups.get(name)
-            elif kind == "browser":
-                target = browser_backups.get(name)
-            else:
-                target = None
-            if target is None:
-                skipped.append({"kind": kind, "name": name, "reason": "not_found_or_not_allowed"})
-                continue
-
-            try:
-                size = target.stat().st_size if target.is_file() else self._dir_size_bytes(target)
-                if target.is_dir():
-                    self._remove_profile_path_for_compact(target, browser_dir)
-                else:
-                    target.unlink()
-            except OSError as exc:
-                skipped.append({"kind": kind, "name": name, "reason": str(exc)})
-                continue
-
-            if not target.exists():
-                freed_bytes += size
-                removed.append({"kind": kind, "name": name, "path": str(target), "bytes": size})
-            else:
-                skipped.append({"kind": kind, "name": name, "reason": "delete_failed"})
-
-        return {
-            "profile_key": profile_root.name,
-            "removed_count": len(removed),
-            "skipped_count": len(skipped),
-            "removed": removed,
-            "skipped": skipped,
-            "freed_bytes": freed_bytes,
-            "browser_profile": self.browser_profile_summary(profile_root.name),
-        }
+        return self.backups.delete_selected_backups(profile_key, selections)
 
     def prune_browser_backups(
         self,
@@ -1118,37 +1093,7 @@ class ProjectAdapter:
         *,
         keep_latest: int = 1,
     ) -> dict[str, Any]:
-        profile_root = self._bot_profile_root(profile_key)
-        browser_dir = profile_root / "browser"
-        keep_latest = max(0, int(keep_latest))
-        backups = sorted(
-            self._browser_backup_dirs(browser_dir),
-            key=lambda path: path.stat().st_mtime if path.exists() else 0,
-            reverse=True,
-        )
-        kept = backups[:keep_latest]
-        removable = backups[keep_latest:]
-
-        removed: list[dict[str, Any]] = []
-        freed_bytes = 0
-        for backup in removable:
-            size = self._dir_size_bytes(backup)
-            self._remove_profile_path_for_compact(backup, browser_dir)
-            if not backup.exists():
-                freed_bytes += size
-                removed.append({"name": backup.name, "path": str(backup), "bytes": size})
-
-        return {
-            "profile_key": profile_root.name,
-            "browser_dir": str(browser_dir),
-            "keep_latest": keep_latest,
-            "kept": [{"name": path.name, "path": str(path)} for path in kept if path.exists()],
-            "removed_count": len(removed),
-            "removed": removed,
-            "freed_bytes": freed_bytes,
-            "backup_bytes": sum(self._dir_size_bytes(path) for path in self._browser_backup_dirs(browser_dir)),
-            "size_bytes": self._dir_size_bytes(browser_dir / "user_data"),
-        }
+        return self.backups.prune_browser_backups(profile_key, keep_latest=keep_latest)
 
     def _auth_backoff_seconds_left(self, path: Path) -> int:
         try:
@@ -1198,12 +1143,17 @@ class ProjectAdapter:
             except OSError:
                 modified_at = None
                 size_bytes = 0
+            validation = self.validate_auth_backup(profile_root.name, backup.name, deep=False)
             auth_backups.append({
                 "name": backup.name,
                 "path": str(backup),
                 "modified_at": modified_at,
                 "size_bytes": size_bytes,
                 "kind": "auth",
+                "valid": bool(validation.get("ok")),
+                "entry_count": int(validation.get("entry_count") or 0),
+                "blocked_count": int(validation.get("blocked_count") or 0),
+                "manifest_profile": str(validation.get("manifest_profile") or ""),
             })
 
         user_data_stat = None
@@ -1242,6 +1192,96 @@ class ProjectAdapter:
             "auth_backup_count": len(auth_backup_files),
             "latest_backups": backups,
             "latest_auth_backups": auth_backups,
+        }
+
+    def browser_profile_live_status(self, profile_key: str | None = None) -> dict[str, Any]:
+        profile_root = self._bot_profile_root(profile_key)
+        browser_dir = profile_root / "browser"
+        user_data_dir = browser_dir / "user_data"
+        default_dir = user_data_dir / "Default"
+        local_state_path = user_data_dir / "Local State"
+        preferences_path = default_dir / "Preferences"
+        cookies_candidates = [
+            default_dir / "Network" / "Cookies",
+            default_dir / "Cookies",
+        ]
+        cookies_path = next((path for path in cookies_candidates if path.exists()), cookies_candidates[0])
+        auth_backoff_path = profile_root / "state" / "auth_backoff.json"
+        try:
+            needs_recovery = browser_profile_needs_recovery(user_data_dir) if user_data_dir.exists() else False
+        except Exception:
+            needs_recovery = False
+        return {
+            "profile_key": profile_root.name,
+            "browser_dir": str(browser_dir),
+            "user_data_dir": str(user_data_dir),
+            "exists": user_data_dir.exists(),
+            "default_profile_exists": default_dir.exists(),
+            "local_state_exists": local_state_path.exists(),
+            "preferences_exists": preferences_path.exists(),
+            "cookies_exists": cookies_path.exists(),
+            "cookies_path": str(cookies_path),
+            "needs_recovery": needs_recovery,
+            "auth_backoff_exists": auth_backoff_path.exists(),
+            "auth_backoff_left": self._auth_backoff_seconds_left(auth_backoff_path) if auth_backoff_path.exists() else 0,
+            "backup_count": len(self._browser_backup_dirs(browser_dir)),
+            "auth_backup_count": len(self._auth_backup_files(profile_root.name)),
+        }
+
+    def queue_snapshot(self, profile_key: str | None = None) -> dict[str, Any]:
+        profiles = self.get_profiles()
+        selected_key = str(profile_key or self._active_profile_name() or "")
+        profile = next((item for item in profiles if item.key == selected_key), None)
+        if profile is None:
+            profile = next((item for item in profiles if item.active), None)
+        if profile is None and profiles:
+            profile = profiles[0]
+        if profile is None:
+            return {
+                "profile_key": selected_key or "default",
+                "target_count": 0,
+                "ready_count": 0,
+                "cooldown_count": 0,
+                "next_target": "",
+                "next_send_at": None,
+                "next_send_at_text": "",
+                "next_send_in_s": 0,
+                "next_send_in_text": "нет адресатов",
+            }
+
+        state = self.get_control_state()
+        cooldown_h = float(state.get("cooldown_hours") or self.DEFAULT_COOLDOWN_HOURS)
+        targets = list(profile.raw.get("targets") or [])
+        ready_count = 0
+        cooldown_count = 0
+        next_item: dict[str, Any] | None = None
+        for target in targets:
+            name = str(target.get("name") or target.get("url") or "")
+            target_state = self.get_target_state(name, profile.key, cooldown_hours=cooldown_h)
+            if target_state.get("ready"):
+                ready_count += 1
+                continue
+            cooldown_count += 1
+            next_send_at = target_state.get("next_send_at")
+            if next_send_at and (next_item is None or float(next_send_at) < float(next_item.get("next_send_at") or 0)):
+                next_item = {
+                    "target": name,
+                    "next_send_at": next_send_at,
+                    "next_send_at_text": target_state.get("next_send_at_text") or "",
+                    "next_send_in_s": int(target_state.get("cooldown_left_s") or 0),
+                    "next_send_in_text": target_state.get("cooldown_left_text") or "",
+                }
+
+        return {
+            "profile_key": profile.key,
+            "target_count": len(targets),
+            "ready_count": ready_count,
+            "cooldown_count": cooldown_count,
+            "next_target": str((next_item or {}).get("target") or ""),
+            "next_send_at": (next_item or {}).get("next_send_at"),
+            "next_send_at_text": str((next_item or {}).get("next_send_at_text") or ""),
+            "next_send_in_s": int((next_item or {}).get("next_send_in_s") or 0),
+            "next_send_in_text": str((next_item or {}).get("next_send_in_text") or ("сейчас" if ready_count else "нет данных")),
         }
 
     # ── Target state helpers ──────────────────────────────────────────────────
@@ -1293,7 +1333,13 @@ class ProjectAdapter:
             'stats': [state_dir / f'stats_{key}.txt' for key in keys],
         }
 
-    def get_target_state(self, target_name: str, profile_key: str | None = None) -> dict[str, Any]:
+    def get_target_state(
+        self,
+        target_name: str,
+        profile_key: str | None = None,
+        *,
+        cooldown_hours: float | None = None,
+    ) -> dict[str, Any]:
         """Read runtime state for a target using the same file rules as worker."""
         import time
 
@@ -1321,21 +1367,24 @@ class ProjectAdapter:
                 except Exception:
                     continue
 
+        cooldown_h = float(cooldown_hours or 0) if cooldown_hours is not None else 0.0
+        if cooldown_h <= 0:
+            state = self.get_control_state()
+            cooldown_h = float(state.get('cooldown_hours') or 12)
+        cooldown_total_s = max(1, int(cooldown_h * 3600))
         cooldown_left_h: float = 0.0
         cooldown_left_s: int = 0
         next_send_at: float | None = None
         if last_send_at is not None:
             passed = max(0.0, time.time() - last_send_at)
-            state = self.get_control_state()
-            cooldown_h = float(state.get('cooldown_hours') or 12)
-            cooldown_s = cooldown_h * 3600
-            left_s = max(0.0, cooldown_s - passed)
+            left_s = max(0.0, cooldown_total_s - passed)
             cooldown_left_h = left_s / 3600
             cooldown_left_s = int(left_s)
-            next_send_at = last_send_at + cooldown_s
+            next_send_at = last_send_at + cooldown_total_s
 
         existing_last_send = [str(path) for path in paths['last_send'] if path.exists()]
         existing_stats = [str(path) for path in paths['stats'] if path.exists()]
+        cooldown_progress = 100.0 if cooldown_left_s <= 0 else 100.0 - ((cooldown_left_s / cooldown_total_s) * 100.0)
 
         return {
             'last_send_at': last_send_at,
@@ -1343,6 +1392,8 @@ class ProjectAdapter:
             'streak_date': streak_date,
             'cooldown_left_h': round(cooldown_left_h, 2),
             'cooldown_left_s': cooldown_left_s,
+            'cooldown_total_s': cooldown_total_s,
+            'cooldown_progress_percent': round(max(0.0, min(100.0, cooldown_progress)), 1),
             'cooldown_left_text': self._format_seconds_short(cooldown_left_s),
             'next_send_at': next_send_at,
             'next_send_at_text': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_send_at)) if next_send_at else '',
@@ -1430,7 +1481,27 @@ class ProjectAdapter:
             payload[index]["enabled"] = not current
             self._write_json(self.profiles_path, payload)
             return self.get_profiles()[index]
-        return self.set_active_profile(index)
+        if isinstance(payload, dict):
+            profiles = self.get_profiles()
+            if index < 0 or index >= len(profiles):
+                raise IndexError("profile index out of range")
+            profile = profiles[index]
+            raw = payload.get(profile.key)
+            if not isinstance(raw, dict) or "enabled" not in raw:
+                raise ValueError("This profile format does not support enable/disable")
+            raw["enabled"] = not bool(raw.get("enabled"))
+            payload[profile.key] = raw
+            self._write_json(self.profiles_path, payload)
+            return next(item for item in self.get_profiles() if item.key == profile.key)
+        raise ValueError("Profiles configuration must be a list or object")
+
+    def toggle_profile_key(self, profile_key: str) -> ProfileEntry:
+        key = str(profile_key or "").strip()
+        profiles = self.get_profiles()
+        for index, profile in enumerate(profiles):
+            if profile.key == key:
+                return self.toggle_profile(index)
+        raise ValueError(f"Unknown profile: {key}")
 
     def _message_pool_stats_from_text(self, raw: str, *, exists: bool = True) -> dict[str, Any]:
         all_lines = str(raw or "").splitlines()
@@ -1465,9 +1536,6 @@ class ProjectAdapter:
             return self._message_pool_stats_from_text("", exists=False)
         raw = self.message_pool_path.read_text(encoding="utf-8", errors="replace")
         return self._message_pool_stats_from_text(raw, exists=True)
-
-    def get_message_pool_stats_for_text(self, text: str) -> dict[str, Any]:
-        return self._message_pool_stats_from_text(str(text or ""), exists=True)
 
     def normalize_message_pool_text(self, text: str) -> str:
         normalized = str(text or "").replace("\r\n", "\n")
@@ -1513,199 +1581,10 @@ class ProjectAdapter:
         return target
 
     def create_public_project_backup(self) -> dict[str, Any]:
-        backup_dir = self.base_dir / "backups" / "project"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        target = backup_dir / f"tiktok_heart_public_source_{stamp}.zip"
-        counter = 1
-        while target.exists():
-            target = backup_dir / f"tiktok_heart_public_source_{stamp}_{counter}.zip"
-            counter += 1
-
-        root_files = {
-            ".env.example",
-            ".gitattributes",
-            ".gitignore",
-            "BUILD_INFO.json",
-            "LICENSE",
-            "README.md",
-            "message_pool.txt",
-            "package.json",
-            "package-lock.json",
-            "pytest.ini",
-            "requirements.txt",
-            "requirements-desktop.txt",
-            "requirements-dev.txt",
-            "start_app.bat",
-            "start_app.vbs",
-        }
-        included_roots = {"app_shell", "assets", "control", "docs", "scripts", "src-tauri", "tests", "yara_app"}
-        blocked_roots = {
-            ".git",
-            ".pytest_cache",
-            ".ruff_cache",
-            ".venv",
-            "backups",
-            "logs",
-            "node_modules",
-            "profiles",
-            "release",
-            "src-tauri/target",
-            "src-tauri/gen",
-        }
-        blocked_names = {"__pycache__"}
-        blocked_suffixes = {".pyc", ".pyo", ".pyd", ".log", ".tmp", ".bak", ".zip", ".7z", ".rar", ".msi", ".exe", ".db", ".sqlite", ".ldb", ".pma"}
-
-        def is_allowed(path: Path) -> bool:
-            rel = path.relative_to(self.base_dir).as_posix()
-            parts = rel.split("/")
-            if any(name in blocked_names for name in parts):
-                return False
-            if any(rel == root or rel.startswith(f"{root}/") for root in blocked_roots):
-                return False
-            if parts[0] == "control":
-                return path.name.endswith(".example.json") or path.name == ".gitkeep"
-            if path.name in root_files:
-                return True
-            if parts[0] not in included_roots:
-                return False
-            if path.suffix.lower() in blocked_suffixes:
-                return False
-            return True
-
-        included_count = 0
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for path in sorted(self.base_dir.rglob("*")):
-                if not path.is_file():
-                    continue
-                try:
-                    path.relative_to(self.base_dir)
-                except ValueError:
-                    continue
-                if not is_allowed(path):
-                    continue
-                archive.write(path, path.relative_to(self.base_dir).as_posix())
-                included_count += 1
-
-        return {
-            "path": str(target),
-            "name": target.name,
-            "size_bytes": target.stat().st_size,
-            "included_count": included_count,
-            "excluded": sorted(blocked_roots),
-        }
+        return self.backups.create_public_project_backup()
 
     def create_auth_backup(self, profile_key: str | None = None) -> dict[str, Any]:
-        profile_root = self._bot_profile_root(profile_key)
-        backup_dir = self.base_dir / "backups" / "auth"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        target = backup_dir / f"auth_backup_{profile_root.name}_{stamp}.zip"
-        counter = 1
-        while target.exists():
-            target = backup_dir / f"auth_backup_{profile_root.name}_{stamp}_{counter}.zip"
-            counter += 1
-
-        cache_dir_names = {
-            "BrowserMetrics",
-            "Cache",
-            "Code Cache",
-            "Crashpad",
-            "DawnGraphiteCache",
-            "DawnWebGPUCache",
-            "GPUCache",
-            "GrShaderCache",
-            "Media Cache",
-            "OptimizationGuidePredictionModels",
-            "Safe Browsing",
-            "ShaderCache",
-            "component_crx_cache",
-            "pnacl",
-        }
-        skip_suffixes = {".log", ".tmp", ".bak", ".pma"}
-        roots = [
-            profile_root / "browser" / "user_data",
-            profile_root / "state",
-            profile_root / "artifacts",
-            profile_root / "logs",
-            self.control_dir,
-        ]
-        root_files = [
-            self.message_pool_path,
-            self.base_dir / ".env",
-            self.base_dir / ".env.local",
-        ]
-        errors: list[dict[str, str]] = []
-        included_count = 0
-
-        def should_include(path: Path) -> bool:
-            try:
-                parts = path.relative_to(profile_root / "browser" / "user_data").parts
-            except ValueError:
-                parts = ()
-            if any(part in cache_dir_names for part in parts):
-                return False
-            if path.suffix.lower() in skip_suffixes:
-                return False
-            return True
-
-        def add_file(archive: zipfile.ZipFile, path: Path) -> bool:
-            if not path.exists() or not path.is_file() or not should_include(path):
-                return False
-            try:
-                archive.write(path, path.relative_to(self.base_dir).as_posix())
-                return True
-            except Exception as exc:  # noqa: BLE001
-                errors.append({"path": str(path), "error": str(exc)})
-                return False
-
-        worker = self.get_worker_status()
-        telegram = self.get_telegram_bot_status()
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            manifest = {
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "profile_key": profile_root.name,
-                "sensitive": True,
-                "contains": [
-                    "Chromium authorization profile without heavy caches",
-                    "profile state/artifacts/logs",
-                    "runtime control JSON",
-                    "message pool",
-                    ".env files when present",
-                ],
-                "worker_running": bool(worker.running),
-                "telegram_running": bool(telegram.running),
-                "note": "Keep this archive private. It can contain cookies, Telegram config, and local state.",
-                "excluded_cache_dirs": sorted(cache_dir_names),
-            }
-            archive.writestr("BACKUP_MANIFEST.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            included_count += 1
-            for root in roots:
-                if not root.exists():
-                    continue
-                if root.is_file():
-                    if add_file(archive, root):
-                        included_count += 1
-                    continue
-                for path in sorted(root.rglob("*")):
-                    if add_file(archive, path):
-                        included_count += 1
-            for path in root_files:
-                if add_file(archive, path):
-                    included_count += 1
-
-        return {
-            "path": str(target),
-            "name": target.name,
-            "profile_key": profile_root.name,
-            "size_bytes": target.stat().st_size,
-            "included_count": included_count,
-            "error_count": len(errors),
-            "errors": errors[:20],
-            "worker_running": bool(worker.running),
-            "telegram_running": bool(telegram.running),
-        }
-
+        return self.backups.create_auth_backup(profile_key)
     def save_message_pool_text(self, text: str) -> dict[str, Any]:
         normalized = self.normalize_message_pool_text(text)
         self.message_pool_path.write_text(normalized, encoding="utf-8")
@@ -1730,6 +1609,18 @@ class ProjectAdapter:
         summary = dict(inline_summary)
         summary.update(run_summary)
         results = list(summary.get("results") or [])
+        success_count = int(summary.get("success_count") or 0)
+        skipped_count = int(summary.get("skipped_count") or 0)
+        failed_count = int(summary.get("failed_count") or 0)
+        status = str(run_state.get("status") or ("idle" if summary else "unknown"))
+        if status == "idle" and summary:
+            if failed_count:
+                status = "partial" if success_count else "failed"
+            elif success_count:
+                status = "success"
+            elif skipped_count:
+                status = "skipped"
+        updated_at = float(run_state.get("completed_at") or run_state.get("timestamp") or 0)
 
         return {
             "profile_name": self._active_profile_name(),
@@ -1738,12 +1629,16 @@ class ProjectAdapter:
             "run_summary_path": str(run_summary_path),
             "state_exists": run_state_path.exists(),
             "summary_exists": run_summary_path.exists(),
-            "status": str(run_state.get("status") or ("idle" if summary else "unknown")),
+            "status": status,
+            "reason": str(run_state.get("reason") or ""),
+            "updated_at": updated_at or None,
+            "completed_at": float(run_state.get("completed_at") or 0) or None,
+            "is_active": status in {"starting", "running"},
             "current_target": run_state.get("current_target"),
             "total_targets": int(run_state.get("total_targets") or summary.get("total_targets") or 0),
-            "success_count": int(summary.get("success_count") or 0),
-            "skipped_count": int(summary.get("skipped_count") or 0),
-            "failed_count": int(summary.get("failed_count") or 0),
+            "success_count": success_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
             "duration_seconds": float(summary.get("duration_seconds") or 0),
             "results_count": len(results),
             "summary": summary,
@@ -1756,16 +1651,47 @@ class ProjectAdapter:
         if not history_path.exists():
             return []
         items: list[dict[str, Any]] = []
-        with history_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in deque(handle, maxlen=limit):
-                try:
-                    payload = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(payload, dict):
-                    payload.setdefault("profile_name", profile)
-                    items.append(payload)
+        try:
+            file_size = history_path.stat().st_size
+            with history_path.open("rb") as handle:
+                start = max(0, file_size - RUN_HISTORY_READ_BYTES)
+                handle.seek(start)
+                raw = handle.read()
+        except OSError:
+            return []
+        if start:
+            separator = raw.find(b"\n")
+            raw = raw[separator + 1:] if separator >= 0 else b""
+        for line in raw.decode("utf-8", errors="replace").splitlines()[-limit:]:
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                payload.setdefault("profile_name", profile)
+                items.append(payload)
         return items
+
+    def worker_lifecycle_summary(self, profile_key: str | None = None, *, limit: int = 12) -> dict[str, Any]:
+        events = [
+            item for item in self.get_run_history(profile_key, limit=max(limit * 4, 40))
+            if item.get("event") in {"lifecycle", "phase_timing", "run_started", "run_finished", "run_failed"}
+        ]
+        recent = events[-limit:]
+        last = recent[-1] if recent else {}
+        phase_events = [item for item in recent if item.get("event") == "phase_timing"]
+        slow = [
+            item for item in phase_events
+            if float(item.get("elapsed_ms") or 0) >= 5000
+        ]
+        return {
+            "profile_key": str(profile_key or self._active_profile_name() or "default"),
+            "last": last,
+            "events": recent,
+            "event_count": len(recent),
+            "slow_count": len(slow),
+            "last_stage": str(last.get("stage") or last.get("phase") or last.get("event") or ""),
+        }
 
     def set_paused(self, value: bool) -> dict[str, Any]:
         return self.update_control_state({"paused": bool(value)})
@@ -1846,295 +1772,38 @@ class ProjectAdapter:
     def register_worker_schedule(
         self,
         *,
-        at_logon: bool = True,
+        at_startup: bool = True,
+        at_logon: bool = False,
         every_12_hours: bool = True,
         interval_hours: int = 12,
+        first_run_at: str | None = None,
     ) -> dict[str, Any]:
-        if not at_logon and not every_12_hours:
-            raise ValueError("Выбери хотя бы один триггер автозапуска worker.")
-        self._run_powershell_script(
-            self.worker_schedule_register_script_path,
-            [
-                "-TaskName",
-                WORKER_SCHEDULE_TASK_NAME,
-                "-AtLogon",
-                "true" if at_logon else "false",
-                "-Every12Hours",
-                "true" if every_12_hours else "false",
-                "-IntervalHours",
-                str(int(interval_hours)),
-            ],
+        return self.scheduler.register(
+            at_startup=at_startup,
+            at_logon=at_logon,
+            every_12_hours=every_12_hours,
+            interval_hours=interval_hours,
+            first_run_at=first_run_at,
         )
-        status = self.get_worker_schedule_status()
-        self._worker_schedule_status_cache = (time.time(), dict(status))
-        return status
 
     def unregister_worker_schedule(self) -> dict[str, Any]:
-        self._run_powershell_script(
-            self.worker_schedule_unregister_script_path,
-            ["-TaskName", WORKER_SCHEDULE_TASK_NAME],
-        )
-        status = self.get_worker_schedule_status()
-        self._worker_schedule_status_cache = (time.time(), dict(status))
-        return status
+        return self.scheduler.unregister()
 
     def get_worker_schedule_status_cached(self, *, max_age_seconds: float = 60.0) -> dict[str, Any]:
-        timestamp, cached = self._worker_schedule_status_cache
-        if cached and (time.time() - timestamp) <= max_age_seconds:
-            return dict(cached)
-        status = self.get_worker_schedule_status()
-        self._worker_schedule_status_cache = (time.time(), dict(status))
-        return status
+        return self.scheduler.status_cached(max_age_seconds=max_age_seconds)
+
+    @staticmethod
+    def _parse_schedule_timestamp(value: Any) -> float | None:
+        return WorkerScheduleService.parse_timestamp(value)
+
+    def _normalize_worker_schedule_status(self, status: dict[str, Any]) -> dict[str, Any]:
+        return self.scheduler.normalize_status(status)
 
     def _get_worker_schedule_status_schtasks(self) -> dict[str, Any] | None:
-        if os.name != "nt":
-            return None
-        try:
-            result = subprocess.run(
-                ["schtasks", "/Query", "/TN", WORKER_SCHEDULE_TASK_NAME, "/FO", "LIST", "/V"],
-                cwd=str(self.base_dir),
-                capture_output=True,
-                check=False,
-                **self._windows_subprocess_kwargs(hide_window=True),
-            )
-        except Exception:
-            return None
-        output = self._decode_process_output(result.stdout or b"").strip()
-        error = self._decode_process_output(result.stderr or b"").strip()
-        if result.returncode != 0:
-            if "cannot find" in error.lower() or "не удается найти" in error.lower() or "not exist" in error.lower():
-                return {
-                    "available": True,
-                    "installed": False,
-                    "task_name": WORKER_SCHEDULE_TASK_NAME,
-                    "state": "missing",
-                    "enabled": False,
-                    "at_logon": False,
-                    "every_12_hours": False,
-                    "interval_hours": 12,
-                    "triggers": [],
-                    "next_run_time": None,
-                    "last_run_time": None,
-                    "last_task_result": None,
-                    "action_execute": None,
-                    "action_arguments": None,
-                }
-            return None
-        if not output:
-            return None
-        rows: list[dict[str, str]] = []
-        current: dict[str, str] = {}
-        for raw_line in output.splitlines():
-            line = raw_line.rstrip()
-            if not line:
-                if current:
-                    rows.append(current)
-                    current = {}
-                continue
-            if line.startswith("Folder:"):
-                continue
-            if ":" not in line:
-                continue
-            stripped = line.lstrip()
-            if stripped.startswith("Repeat") or stripped.startswith("Повторять"):
-                key, value = line.rsplit(":", 1)
-            else:
-                key, value = line.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            current[key] = value
-        if current:
-            rows.append(current)
-        rows = [row for row in rows if row.get("TaskName") or row.get("Имя задачи")]
-        if not rows:
-            return None
-
-        def pick(row: dict[str, str], *keys: str) -> str:
-            for key in keys:
-                value = row.get(key)
-                if value and value != "N/A":
-                    return value
-            return ""
-
-        def normalize_date(value: str) -> str | None:
-            if not value:
-                return None
-            value = value.strip()
-            for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    return time.strftime("%Y-%m-%d %H:%M:%S", time.strptime(value, fmt))
-                except ValueError:
-                    continue
-            return value
-
-        first = rows[0]
-        schedule_types = [pick(row, "Schedule Type", "Тип расписания", "Schedule", "Расписание") for row in rows]
-        repeat_values = [pick(row, "Repeat: Every", "Повторять: каждые") for row in rows]
-        at_logon = any(("logon" in value.lower()) or ("вход" in value.lower()) for value in schedule_types)
-        every_12_hours = any("12" in value and (("hour" in value.lower()) or ("час" in value.lower()) or ("ч" in value.lower())) for value in repeat_values)
-        task_state = pick(first, "Scheduled Task State", "Состояние назначенной задачи")
-        enabled = task_state.lower() != "disabled"
-        if task_state.lower() in {"отключено", "disabled"}:
-            enabled = False
-        task_to_run = pick(first, "Task To Run", "Задача для выполнения")
-        action_execute = ""
-        action_arguments = ""
-        if task_to_run:
-            stripped = task_to_run.strip()
-            if stripped.startswith('"'):
-                end = stripped.find('"', 1)
-                action_execute = stripped[1:end] if end > 1 else stripped.strip('"')
-                action_arguments = stripped[end + 1:].strip() if end > 1 else ""
-            else:
-                parts = stripped.split(" ", 1)
-                action_execute = parts[0]
-                action_arguments = parts[1] if len(parts) > 1 else ""
-
-        return {
-            "available": True,
-            "installed": True,
-            "task_name": WORKER_SCHEDULE_TASK_NAME,
-            "state": pick(first, "Status", "Состояние") or task_state or "unknown",
-            "enabled": enabled,
-            "at_logon": at_logon,
-            "every_12_hours": every_12_hours,
-            "interval_hours": 12,
-            "triggers": [
-                {
-                    "class": "schtasks",
-                    "enabled": enabled,
-                    "interval": repeat_values[index] if index < len(repeat_values) else "",
-                    "text": schedule_types[index] if index < len(schedule_types) else "",
-                }
-                for index, _row in enumerate(rows)
-            ],
-            "next_run_time": normalize_date(pick(first, "Next Run Time", "Время следующего запуска")),
-            "last_run_time": normalize_date(pick(first, "Last Run Time", "Время прошлого запуска")),
-            "last_task_result": pick(first, "Last Result", "Прошлый результат") or None,
-            "action_execute": action_execute or None,
-            "action_arguments": action_arguments or None,
-        }
+        return self.scheduler._status_from_schtasks()
 
     def get_worker_schedule_status(self) -> dict[str, Any]:
-        if os.name != "nt":
-            return {
-                "available": False,
-                "installed": False,
-                "task_name": WORKER_SCHEDULE_TASK_NAME,
-                "state": "unsupported",
-                "at_logon": False,
-                "every_12_hours": False,
-                "error": "Планировщик worker поддерживается только в Windows.",
-            }
-
-        fast_status = self._get_worker_schedule_status_schtasks()
-        if fast_status is not None:
-            return fast_status
-
-        command = r"""
-$ErrorActionPreference = 'Stop'
-$taskName = '__TASK_NAME__'
-
-function Format-TaskDate($Value) {
-    if ($null -eq $Value) { return $null }
-    try {
-        $dt = [datetime]$Value
-        if ($dt -eq [datetime]::MinValue) { return $null }
-        return $dt.ToString('yyyy-MM-dd HH:mm:ss')
-    }
-    catch {
-        return $null
-    }
-}
-
-$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($null -eq $task) {
-    [pscustomobject]@{
-        available = $true
-        installed = $false
-        task_name = $taskName
-        state = 'missing'
-        enabled = $false
-        at_logon = $false
-        every_12_hours = $false
-        interval_hours = 12
-        triggers = @()
-        next_run_time = $null
-        last_run_time = $null
-        last_task_result = $null
-        action_execute = $null
-        action_arguments = $null
-    } | ConvertTo-Json -Depth 6 -Compress
-    exit 0
-}
-
-$info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-$triggers = @()
-$atLogon = $false
-$every12 = $false
-
-foreach ($trigger in @($task.Triggers)) {
-    $class = ''
-    $text = ''
-    $enabled = $true
-    $interval = ''
-    try { $class = [string]$trigger.CimClass.CimClassName } catch {}
-    try { $text = [string]$trigger } catch {}
-    try { $enabled = [bool]$trigger.Enabled } catch {}
-    try { $interval = [string]$trigger.Repetition.Interval } catch {}
-    if ($class -like '*LogonTrigger*') { $atLogon = $true }
-    if ($interval -eq 'PT12H') { $every12 = $true }
-    $triggers += [pscustomobject]@{
-        class = $class
-        enabled = $enabled
-        interval = $interval
-        text = $text
-    }
-}
-
-$action = @($task.Actions)[0]
-[pscustomobject]@{
-    available = $true
-    installed = $true
-    task_name = $taskName
-    state = [string]$task.State
-    enabled = ([string]$task.State -ne 'Disabled')
-    at_logon = $atLogon
-    every_12_hours = $every12
-    interval_hours = 12
-    triggers = $triggers
-    next_run_time = Format-TaskDate $info.NextRunTime
-    last_run_time = Format-TaskDate $info.LastRunTime
-    last_task_result = $info.LastTaskResult
-    action_execute = [string]$action.Execute
-    action_arguments = [string]$action.Arguments
-} | ConvertTo-Json -Depth 6 -Compress
-"""
-        try:
-            command = command.replace("__TASK_NAME__", WORKER_SCHEDULE_TASK_NAME.replace("'", "''"))
-            result = self._run_powershell_command(command)
-            payload = (result.stdout or "").strip()
-            data = json.loads(payload) if payload else {}
-            if isinstance(data, dict):
-                return data
-        except Exception as exc:
-            return {
-                "available": True,
-                "installed": False,
-                "task_name": WORKER_SCHEDULE_TASK_NAME,
-                "state": "error",
-                "at_logon": False,
-                "every_12_hours": False,
-                "error": str(exc),
-            }
-        return {
-            "available": True,
-            "installed": False,
-            "task_name": WORKER_SCHEDULE_TASK_NAME,
-            "state": "unknown",
-            "at_logon": False,
-            "every_12_hours": False,
-        }
+        return self.scheduler.status()
 
     def _resolve_python_executable(self, *, prefer_windowless: bool = True) -> str:
         executable = sys.executable
@@ -2295,9 +1964,7 @@ $action = @($task.Actions)[0]
                 if not proc.is_running():
                     return False
                 zombie_status = getattr(psutil, "STATUS_ZOMBIE", None)
-                if zombie_status is not None and proc.status() == zombie_status:
-                    return False
-                return True
+                return not (zombie_status is not None and proc.status() == zombie_status)
             except Exception:
                 pass
         if os.name == "nt":
@@ -2329,11 +1996,36 @@ $action = @($task.Actions)[0]
             flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         return flags
 
+    def _pid_matches_script(self, pid: int, script_path: Path, *, started_at: float | None = None) -> bool:
+        """A saved PID can belong to another process after the worker exits."""
+        if not self._pid_exists(pid) or psutil is None:
+            return False
+        try:
+            proc = psutil.Process(pid)
+            if started_at is not None and proc.create_time() > float(started_at) + 1:
+                return False
+            cmdline = proc.cmdline()
+            script_resolved = script_path.resolve()
+            proc_cwd = Path(proc.cwd()).resolve()
+            for index, argument in enumerate(cmdline[1:], start=1):
+                if argument == "-m" and index + 1 < len(cmdline):
+                    relative = script_resolved.relative_to(self.base_dir.resolve())
+                    module_name = ".".join(relative.with_suffix("").parts)
+                    return proc_cwd == self.base_dir.resolve() and cmdline[index + 1] == module_name
+                candidate = Path(argument)
+                if not candidate.is_absolute():
+                    candidate = proc_cwd / candidate
+                if candidate.resolve() == script_resolved:
+                    return True
+        except (OSError, ValueError, psutil.Error):
+            return False
+        return False
+
     def _get_process_status(self, *, pid_key: str, started_key: str, script_path: Path) -> WorkerStatus:
         state = self.get_control_state()
         pid = state.get(pid_key)
         started_at = state.get(started_key)
-        if not isinstance(pid, int) or not self._pid_exists(pid):
+        if not isinstance(pid, int) or not self._pid_matches_script(pid, script_path, started_at=started_at):
             return WorkerStatus(running=False, pid=None, started_at=started_at)
         return WorkerStatus(running=True, pid=pid, started_at=started_at, command=[sys.executable, str(script_path)])
 
@@ -2348,27 +2040,29 @@ $action = @($task.Actions)[0]
         hide_window: bool = True,
     ) -> WorkerStatus:
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        stdout_handle = open(stdout_path, "a", encoding="utf-8")
         cmd = [self._resolve_python_executable(prefer_windowless=hide_window), "-u", str(script_path), *(extra_args or [])]
 
         env = extend_env_with_site_packages(os.environ.copy())
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
+        env["TG_DISABLE_NOTIFICATIONS"] = "1"
+        env.setdefault("WORK_BROWSER_HEADLESS", "1")
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(self.base_dir) if not existing_pythonpath else f"{self.base_dir}{os.pathsep}{existing_pythonpath}"
 
-        kwargs: dict[str, Any] = {
-            "cwd": str(self.base_dir),
-            "stdout": stdout_handle,
-            "stderr": subprocess.STDOUT,
-            "env": env,
-        }
-        if os.name == "nt":
-            kwargs.update(self._windows_subprocess_kwargs(hide_window=hide_window))
-        else:
-            kwargs["start_new_session"] = True
+        with stdout_path.open("a", encoding="utf-8") as stdout_handle:
+            kwargs: dict[str, Any] = {
+                "cwd": str(self.base_dir),
+                "stdout": stdout_handle,
+                "stderr": subprocess.STDOUT,
+                "env": env,
+            }
+            if os.name == "nt":
+                kwargs.update(self._windows_subprocess_kwargs(hide_window=hide_window))
+            else:
+                kwargs["start_new_session"] = True
 
-        process = subprocess.Popen(cmd, **kwargs)
+            process = subprocess.Popen(cmd, **kwargs)
         started_at = time.time()
         self.update_control_state({state_pid_key: process.pid, state_started_key: started_at})
         return WorkerStatus(running=True, pid=process.pid, started_at=started_at, command=cmd)
@@ -2384,19 +2078,20 @@ $action = @($task.Actions)[0]
         *,
         pid_key: str,
         started_key: str,
+        script_path: Path,
         label: str,
         timeout: float = 8.0,
         extra_clear_patch: dict[str, Any] | None = None,
     ) -> WorkerStatus:
         state = self.get_control_state()
         pid = state.get(pid_key)
-        if not isinstance(pid, int) or not self._pid_exists(pid):
+        if not isinstance(pid, int) or not self._pid_matches_script(pid, script_path, started_at=state.get(started_key)):
             self._clear_process_state(pid_key=pid_key, started_key=started_key, extra_patch=extra_clear_patch)
             return WorkerStatus(running=False, pid=None)
 
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not self._pid_exists(pid):
+            if not self._pid_matches_script(pid, script_path, started_at=state.get(started_key)):
                 self._clear_process_state(pid_key=pid_key, started_key=started_key, extra_patch=extra_clear_patch)
                 return WorkerStatus(running=False, pid=None)
             time.sleep(0.4)
@@ -2458,6 +2153,7 @@ $action = @($task.Actions)[0]
 
         active_profile = self._active_profile_name()
         self._refresh_runtime_paths(active_profile)
+        self.update_control_state({"stop_requested": False})
         started = self._launch_python_process(
             script_path=self.main_script_path,
             stdout_path=self.worker_stdout_path,
@@ -2466,7 +2162,6 @@ $action = @($task.Actions)[0]
             extra_args=[active_profile] if active_profile else None,
             hide_window=True,
         )
-        self.update_control_state({"stop_requested": False})
         return started
 
     def start_telegram_bot(self) -> WorkerStatus:
@@ -2503,6 +2198,7 @@ $action = @($task.Actions)[0]
         return self._terminate_process(
             pid_key="last_run_pid",
             started_key="last_run_started_at",
+            script_path=self.main_script_path,
             label="worker",
             timeout=timeout,
             extra_clear_patch={"stop_requested": False},
@@ -2530,11 +2226,6 @@ $action = @($task.Actions)[0]
         self.stop_worker()
         time.sleep(0.8)
         return self.start_worker()
-
-    def restart_telegram_bot(self) -> WorkerStatus:
-        self.stop_telegram_bot()
-        time.sleep(0.8)
-        return self.start_telegram_bot()
 
     def start_all(self) -> dict[str, WorkerStatus | None]:
         worker = self.start_worker()
@@ -2645,8 +2336,6 @@ $action = @($task.Actions)[0]
         modules = [
             ("playwright", True, "Нужен для браузера TikTok и авторизации."),
             ("psutil", False, "Даёт тихое управление процессами без вспышек cmd."),
-            ("pystray", False, "Нужен для сворачивания в системный трей."),
-            ("PIL", False, "Нужен для иконки трея (пакет Pillow)."),
             ("requests", False, "Опционально: старый HTTP-клиент, рантайм умеет работать и без него."),
         ]
         items: list[dict[str, Any]] = []
@@ -2666,7 +2355,6 @@ $action = @($task.Actions)[0]
             },
             "modules": items,
             "commands": {
-                "desktop": "pip install -r requirements-desktop.txt",
                 "runtime": "pip install playwright && playwright install",
             },
         }
@@ -2689,8 +2377,6 @@ $action = @($task.Actions)[0]
             add_issue("warning", "Нет message_pool.txt", "Будет создан файл по умолчанию, но лучше заполнить его своими сообщениями.")
         if not (self.base_dir / "profiles").exists():
             add_issue("info", "Не найдена папка profiles", "Если профили браузера хранятся отдельно, проверь путь к ним.")
-        if not modules.get("pystray", {}).get("installed") or not modules.get("PIL", {}).get("installed"):
-            add_issue("info", "Трей недоступен", "Для сворачивания в трей нужны pystray и Pillow.", deps["commands"]["desktop"])
         return {"ok": not any(item["level"] == "critical" for item in issues), "issues": issues}
 
     def clear_telegram_lock(self) -> None:
@@ -2702,7 +2388,7 @@ $action = @($task.Actions)[0]
     def app_metadata(self) -> dict[str, Any]:
         build_info = self._read_json(self.base_dir / "BUILD_INFO.json", {})
         package_info = self._read_json(self.base_dir / "package.json", {})
-        version = "2.1.0"
+        version = "2.2.0"
         if isinstance(package_info, dict):
             version = str(package_info.get("version") or version)
         return {
@@ -2710,6 +2396,48 @@ $action = @($task.Actions)[0]
             "version": version,
             "build": build_info.get("build") if isinstance(build_info, dict) else "",
             "notes": build_info.get("notes", []) if isinstance(build_info, dict) else [],
+        }
+
+    def live_status(self) -> dict[str, Any]:
+        state = self.get_control_state()
+        active_profile = str(state.get("active_profile") or "") or None
+        worker = self.get_worker_status()
+        telegram_status = self.get_telegram_bot_status()
+        telegram_ready, telegram_reason = self.telegram_bot_ready()
+        profiles = self.get_profiles()
+        message_pool = self.get_message_pool_stats()
+        run = self.get_current_run_snapshot()
+        return {
+            "app": self.app_metadata(),
+            "mode": "live",
+            "updated_at": time.time(),
+            "base_dir": str(self.base_dir),
+            "telegram_ready": telegram_ready,
+            "telegram_ready_reason": telegram_reason,
+            "worker": {
+                "running": worker.running,
+                "pid": worker.pid,
+                "started_at": worker.started_at,
+                "command": worker.command,
+            },
+            "telegram_bot": {
+                "running": telegram_status.running,
+                "pid": telegram_status.pid,
+                "started_at": telegram_status.started_at,
+                "command": telegram_status.command,
+            },
+            "state": state,
+            "profiles": {
+                "total": len(profiles),
+                "enabled": sum(1 for profile in profiles if profile.enabled),
+                "active": sum(1 for profile in profiles if profile.active),
+            },
+            "message_pool": message_pool,
+            "message_pool_details": message_pool,
+            "browser_profile": self.browser_profile_live_status(active_profile),
+            "worker_schedule": self.get_worker_schedule_status_cached(max_age_seconds=180.0),
+            "run": run,
+            "queue": self.queue_snapshot(active_profile),
         }
 
     def _remove_dir_inside_project(self, path: Path) -> int:
@@ -2789,7 +2517,7 @@ $action = @($task.Actions)[0]
             "browser_profile": self.browser_profile_summary(profile_root.name),
         }
 
-    def worker_starter_self_test(self) -> dict[str, Any]:
+    def worker_starter_self_test(self, *, no_browser: bool = True) -> dict[str, Any]:
         starter = self.base_dir / "scripts" / "start_worker_once.py"
         if not starter.exists():
             return {"ok": False, "error": f"Starter not found: {starter}", "starter": str(starter)}
@@ -2799,15 +2527,18 @@ $action = @($task.Actions)[0]
         env.setdefault("PYTHONUTF8", "1")
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(self.base_dir) if not existing_pythonpath else f"{self.base_dir}{os.pathsep}{existing_pythonpath}"
+        args = [python, str(starter), "--self-test"]
+        if no_browser:
+            args.append("--no-browser")
         try:
             result = subprocess.run(
-                [python, str(starter), "--self-test"],
+                args,
                 cwd=str(self.base_dir),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=25,
+                timeout=90,
                 check=False,
                 env=env,
                 **self._windows_subprocess_kwargs(hide_window=True),
@@ -3061,9 +2792,9 @@ $action = @($task.Actions)[0]
         if worker_schedule and worker_schedule.get("available", True) and not worker_schedule.get("installed"):
             control_score -= 15
             add_signal("schedule", "Автозапуск", "Выключен", "info",
-                       "Worker не стартует сам при входе в Windows или по расписанию.")
+                       "Worker не стартует сам через Windows-автозапуск или по расписанию.")
             add_issue("info", "Автозапуск worker выключен",
-                      "Worker не стартует сам при входе в Windows или по расписанию.",
+                      "Worker не стартует сам через Windows-автозапуск или по расписанию.",
                       "Включи автозапуск worker с нужными триггерами.")
         elif worker_schedule and worker_schedule.get("error"):
             control_score -= 15
@@ -3071,6 +2802,22 @@ $action = @($task.Actions)[0]
                        str(worker_schedule.get("error")))
             add_issue("warning", "Не удалось проверить автозапуск worker",
                       str(worker_schedule.get("error")))
+        elif worker_schedule and worker_schedule.get("installed") and worker_schedule.get("next_run_stale"):
+            control_score -= 20
+            next_run = worker_schedule.get("next_run_time") or "unknown"
+            add_signal(
+                "schedule",
+                "Автозапуск",
+                "Просрочен",
+                "warning",
+                f"Windows вернул дату запуска в прошлом: {next_run}.",
+            )
+            add_issue(
+                "warning",
+                "Расписание worker просрочено",
+                f"Windows Task Scheduler вернул NextRunTime в прошлом: {next_run}. Нужно пересохранить автозапуск.",
+                "Открой «Сервисы» и нажми «Сохранить» в блоке автозапуска.",
+            )
         elif worker_schedule and worker_schedule.get("installed"):
             next_run = worker_schedule.get("next_run_time") or "по расписанию"
             add_signal("schedule", "Автозапуск", "Включён", "ok",
@@ -3202,6 +2949,8 @@ $action = @($task.Actions)[0]
         telegram_ready, telegram_reason = self.telegram_bot_ready()
         run = self.get_current_run_snapshot()
         run_history = self.get_run_history(str(state.get("active_profile") or "") or None)
+        worker_lifecycle = self.worker_lifecycle_summary(str(state.get("active_profile") or "") or None, limit=12)
+        queue = self.queue_snapshot(str(state.get("active_profile") or "") or None)
         dependencies = self.dependency_report()
         preflight = self.runtime_preflight(dependencies)
         browser_profile = self.browser_profile_summary(str(state.get("active_profile") or "") or None)
@@ -3279,6 +3028,7 @@ $action = @($task.Actions)[0]
                         "label": profile.label,
                         "enabled": profile.enabled,
                         "active": profile.active,
+                        "supports_enabled": bool(profile.raw.get("supports_enabled")),
                         "target_count": profile.raw.get("target_count", 0),
                         "targets": [
                             {
@@ -3300,7 +3050,9 @@ $action = @($task.Actions)[0]
             "state": state,
             "run": run,
             "run_history": run_history,
-            "performance": self.app_shell_performance_summary(),
+            "worker_lifecycle": worker_lifecycle,
+            "queue": queue,
+            "performance": self.performance_summary(str(state.get("active_profile") or "") or None),
             "file_details": self._build_file_details(),
             "health": health,
             "health_score": health.get("score", 0),

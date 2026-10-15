@@ -37,8 +37,8 @@ jobs:
       - name: Python tests
         run: python -m pytest
 
-      - name: Critical lint
-        run: python -m ruff check yara_app app_shell scripts tests --select F401,F841,F821 --exclude __pycache__
+      - name: Python lint
+        run: python -m ruff check .
 
       - name: JavaScript syntax
         run: node --check app_shell/web/app.js

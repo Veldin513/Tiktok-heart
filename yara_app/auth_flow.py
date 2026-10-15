@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -56,9 +57,7 @@ def block_heavy_content(route, block_media: bool):
     request_url = route.request.url
     resource_type = route.request.resource_type
     try:
-        if block_media and resource_type in ['image', 'media', 'font']:
-            route.abort()
-        elif block_media and any(x in request_url for x in ['/log/', '/analytics/', 'sentry', 'mon.tiktok.com']):
+        if block_media and resource_type in ['image', 'media', 'font'] or block_media and any(x in request_url for x in ['/log/', '/analytics/', 'sentry', 'mon.tiktok.com']):
             route.abort()
         else:
             route.continue_()
@@ -450,10 +449,8 @@ def wait_for_login_or_back(
                         "Выбери вход по логину/паролю или ручной вход."
                     )
                     auth_runtime["qr_error_notified"] = True
-                try:
+                with suppress(Exception):
                     page.goto("about:blank", wait_until="load", timeout=5000)
-                except Exception:
-                    pass
                 break
 
             time.sleep(1)
@@ -556,10 +553,8 @@ def _handle_qr_login(
     dump_auth_state(page, "QR_SCREEN_OPENED")
     page.wait_for_timeout(3000)
 
-    try:
+    with suppress(Exception):
         page.locator("canvas").last.wait_for(state="visible", timeout=10000)
-    except Exception:
-        pass
 
     qr_path = _artifact_path(artifacts_dir, "auth_qr.png")
     try:
@@ -597,21 +592,17 @@ def _handle_qr_login(
         qr_open_age = time.time() - qr_opened_ts if qr_opened_ts is not None else 0
         if qr_open_age >= 120:
             auth_logger.warning("QR действительно долго висит в ошибке. Возвращаю к выбору способа входа.")
-            try:
+            with suppress(Exception):
                 page.goto(
                     "https://www.tiktok.com/login?lang=ru-RU&redirect_url=https%3A%2F%2Fwww.tiktok.com%2Fmessages",
                     wait_until="domcontentloaded",
                     timeout=15000,
                 )
-            except Exception:
-                pass
             page.wait_for_timeout(1500)
 
     if is_logged_in(page) and "tiktok.com/messages" not in page.url:
-        try:
+        with suppress(Exception):
             page.goto("https://www.tiktok.com/messages", wait_until="domcontentloaded", timeout=15000)
-        except Exception:
-            pass
 
     return offset
 

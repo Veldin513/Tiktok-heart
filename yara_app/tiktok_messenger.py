@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Messaging helpers for the TikTok inbox.
 
 This module deliberately keeps the historically working selectors and click
@@ -7,27 +5,35 @@ mechanics intact. The refactor focuses on structure, compatibility, and clearer
 fall-back handling rather than altering browser behaviour.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 import unicodedata
-from typing import Iterable
-
-from yara_app.ttbot.models import ChatOpenMethod, ChatOpenResult
+from collections.abc import Iterable
+from contextlib import suppress
 
 logger = logging.getLogger(__name__)
 MESSAGES_URL = 'https://www.tiktok.com/messages'
 INBOX_ITEM_SELECTOR = '[data-e2e="inbox-list-item"]'
 EDITOR_SELECTOR = '.public-DraftEditor-content'
 MESSAGE_BUTTON_PATTERN = re.compile(r'Сообщение|Message', re.IGNORECASE)
+MESSAGE_BUTTON_TEXTS = (
+    'Message',
+    'Messages',
+    'Send message',
+    'Сообщение',
+    'Сообщения',
+    'Написать',
+    'Написать сообщение',
+)
 
 
 def _soft_wait(page, timeout_ms: int) -> None:
     waiter = getattr(page, 'wait_for_timeout', None)
     if callable(waiter):
-        try:
+        with suppress(Exception):
             waiter(timeout_ms)
-        except Exception:
-            pass
 
 
 def _dom_click(locator) -> None:
@@ -297,6 +303,23 @@ def _try_open_locator(locator, page, *, wait_timeout_ms: int, editor_timeout_ms:
     return _wait_for_editor(page, editor_timeout_ms)
 
 
+def _wait_for_chat_after_profile_click(page) -> bool:
+    _soft_wait(page, 700)
+    if _wait_for_editor(page, 3000):
+        return True
+    with suppress(Exception):
+        page.wait_for_url('**/messages**', timeout=8000, wait_until='domcontentloaded')
+    return _wait_for_editor(page, 7000)
+
+
+def _inbox_items_attached(page, timeout_ms: int = 1200) -> bool:
+    try:
+        page.locator(INBOX_ITEM_SELECTOR).first.wait_for(state='attached', timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+
 def open_chat_by_list(page, target_name: str) -> bool:
     """Try the original Plan A first, then repair it with DOM-row matching.
 
@@ -313,7 +336,6 @@ def open_chat_by_list(page, target_name: str) -> bool:
     import unicodedata as _ud
     name_nfkc = _ud.normalize('NFKC', target_name)
 
-    page.locator(INBOX_ITEM_SELECTOR).first.wait_for(state='attached', timeout=15000)
     _soft_wait(page, 350)
     logger.info('Ищу %s в списке слева...', target_name)
 
@@ -337,17 +359,23 @@ def open_chat_by_list(page, target_name: str) -> bool:
         except Exception:
             pass
 
-    # Step 3+4: DOM row scan — unicode-normalised matching, visible then hidden
-    if _open_chat_from_inbox_items(page, target_name, visible=True):
-        logger.info('✅ Чат найден в списке (DOM visible)!')
-        return True
-    if _open_chat_from_inbox_items(page, target_name, visible=False):
-        logger.info('✅ Чат найден в списке (DOM hidden)!')
-        return True
+    # Step 3+4: DOM row scan — unicode-normalised matching, visible then hidden.
+    # Do not make this selector mandatory: TikTok sometimes renders the inbox
+    # without the old data-e2e attribute, while the visible-name lookup above
+    # still works.
+    if _inbox_items_attached(page):
+        if _open_chat_from_inbox_items(page, target_name, visible=True):
+            logger.info('✅ Чат найден в списке (DOM visible)!')
+            return True
+        if _open_chat_from_inbox_items(page, target_name, visible=False):
+            logger.info('✅ Чат найден в списке (DOM hidden)!')
+            return True
 
-    # Step 5: strict normalised fallback (with ASCII slug matching)
-    if _open_chat_by_strict_list(page, target_name):
-        return True
+        # Step 5: strict normalised fallback (with ASCII slug matching)
+        if _open_chat_by_strict_list(page, target_name):
+            return True
+    else:
+        logger.info('Inbox data-e2e rows are not attached; profile fallback is allowed only after name lookup failed.')
 
     logger.info('План А не сработал. Использую план Б: прямой переход...')
     return False
@@ -357,10 +385,32 @@ def open_chat_by_profile(page, profile_url: str) -> bool:
     final_url = profile_url if profile_url.startswith('http') else f'https://www.tiktok.com/{profile_url}'
     page.goto(final_url, wait_until='domcontentloaded')
     logger.info("Ищу кнопку 'Сообщение' в профиле...")
-    msg_button = page.locator('button').filter(has_text=MESSAGE_BUTTON_PATTERN).first
-    msg_button.wait_for(state='attached', timeout=15000)
-    _dom_click(msg_button)
-    page.wait_for_url('**/messages**', timeout=15000)
+    opened = False
+    for selector in ('[data-e2e="message-button"]', 'button[data-e2e*="message"]', 'a[href*="/messages"]'):
+        try:
+            candidate = page.locator(selector).first
+            candidate.wait_for(state='attached', timeout=2500)
+            _dom_click(candidate)
+            opened = True
+            break
+        except Exception:
+            continue
+    if not opened:
+        for label in MESSAGE_BUTTON_TEXTS:
+            try:
+                candidate = page.get_by_text(label, exact=False).first
+                candidate.wait_for(state='attached', timeout=1500)
+                _dom_click(candidate)
+                opened = True
+                break
+            except Exception:
+                continue
+    if not opened:
+        msg_button = page.locator('button').filter(has_text=MESSAGE_BUTTON_PATTERN).first
+        msg_button.wait_for(state='attached', timeout=5000)
+        _dom_click(msg_button)
+    if not _wait_for_chat_after_profile_click(page):
+        raise RuntimeError('Profile message button was clicked, but chat editor did not become ready.')
     logger.info('✅ Успешно вошли в чат через профиль!')
     return True
 
@@ -376,49 +426,10 @@ def send_message(page, text: str) -> None:
     page.keyboard.press('Enter')
 
 
-def send_heart(page, symbol: str) -> None:
-    """Backward-compatible alias kept for the refactored service layer."""
-
-    send_message(page, symbol)
-
-
-class ChatOpener:
-    """Open a TikTok chat using the first project's original strategy order.
-
-    The first version of the project did only two things here:
-    1. try Plan A in the inbox list;
-    2. if that fails, open the profile and press the message button.
-
-    The stricter unicode-normalized list scan is kept in this module as an
-    internal helper for future diagnostics, but it is *not* part of the default
-    runtime path because the user requested the original behaviour to be
-    restored.
-    """
-
-    def open_chat(self, page, target_name: str, profile_url: str | None = None) -> ChatOpenResult:
-        try:
-            if open_chat_by_list(page, target_name):
-                return ChatOpenResult(ok=True, method=ChatOpenMethod.LEGACY_LIST)
-        except Exception as exc:
-            logger.info('Legacy list strategy failed for %s: %s', target_name, exc)
-
-        if profile_url:
-            try:
-                if open_chat_by_profile(page, profile_url):
-                    return ChatOpenResult(ok=True, method=ChatOpenMethod.PROFILE)
-            except Exception as exc:
-                logger.info('Profile strategy failed for %s: %s', target_name, exc)
-                return ChatOpenResult(ok=False, reason='profile_open_failed')
-
-        return ChatOpenResult(ok=False, reason='chat_open_failed')
-
-
 __all__ = [
-    'ChatOpener',
     'MESSAGES_URL',
     'open_messages',
     'open_chat_by_list',
     'open_chat_by_profile',
     'send_message',
-    'send_heart',
 ]

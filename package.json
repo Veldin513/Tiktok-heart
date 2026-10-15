@@ -1,9 +1,14 @@
 {
   "name": "tiktok-heart",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
   "scripts": {
+    "check": "scripts\\windows\\check_project.bat",
+    "check:js": "scripts\\windows\\check_project.bat js",
+    "lint:py": "scripts\\windows\\check_project.bat lint",
+    "test": "npm run test:py",
+    "test:py": "scripts\\windows\\check_project.bat test",
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build"

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
+
+import pytest
+
 import yara_app.tiktok_checker as checker
 
 
@@ -43,9 +48,139 @@ def test_open_logged_in_work_browser_reuses_authorized_context(monkeypatch) -> N
     assert context.page.goto_calls == ["https://www.tiktok.com/messages"]
 
 
-def test_ensure_logged_in_closes_reused_context(monkeypatch) -> None:
-    context = FakeContext()
-    monkeypatch.setattr(checker, "open_logged_in_work_browser", lambda _playwright: (True, context, context.page))
+def test_ready_targets_for_run_skips_cooldown_before_browser(monkeypatch) -> None:
+    monkeypatch.delenv("WORKER_FORCE_SEND_ON_BOOT", raising=False)
 
-    assert checker.ensure_logged_in(object()) is True
-    assert context.closed is True
+    class FakeStore:
+        def get_cooldown_status(self, name: str):
+            return SimpleNamespace(
+                allowed=name == "ready",
+                hours_passed=0.25,
+                seconds_left=42300,
+            )
+
+    history: list[tuple[str, dict]] = []
+    monkeypatch.setattr(checker, "store", FakeStore())
+    monkeypatch.setattr(checker, "_append_run_history", lambda event, **data: history.append((event, data)))
+
+    summary = checker.RunSummary(profile_name="test", total_targets=2)
+    targets = [checker.Target(name="cooldown"), checker.Target(name="ready")]
+
+    ready = checker.ready_targets_for_run(targets, summary)
+
+    assert [target.name for target in ready] == ["ready"]
+    assert summary.skipped_count == 1
+    assert summary.failed_count == 0
+    assert history == [
+        (
+            "target_result",
+            {
+                "target": "cooldown",
+                "success": False,
+                "skipped": True,
+                "reason": "cooldown",
+                "seconds_left": 42300,
+                "preflight": True,
+            },
+        )
+    ]
+
+
+def test_ready_targets_for_run_bypasses_cooldown_on_boot(monkeypatch) -> None:
+    class FakeStore:
+        def get_cooldown_status(self, _name: str):
+            return SimpleNamespace(
+                allowed=False,
+                hours_passed=0.25,
+                seconds_left=42300,
+            )
+
+    history: list[tuple[str, dict]] = []
+    monkeypatch.setenv("WORKER_FORCE_SEND_ON_BOOT", "1")
+    monkeypatch.setattr(checker, "store", FakeStore())
+    monkeypatch.setattr(checker, "_append_run_history", lambda event, **data: history.append((event, data)))
+
+    summary = checker.RunSummary(profile_name="test", total_targets=1)
+    targets = [checker.Target(name="cooldown")]
+
+    ready = checker.ready_targets_for_run(targets, summary)
+
+    assert [target.name for target in ready] == ["cooldown"]
+    assert summary.skipped_count == 0
+    assert history == [
+        (
+            "target_cooldown_bypass",
+            {
+                "target": "cooldown",
+                "reason": "pc_startup",
+                "seconds_left": 42300,
+                "preflight": True,
+            },
+        )
+    ]
+
+
+def test_run_summary_counts_non_cooldown_skip_as_skipped() -> None:
+    summary = checker.RunSummary(profile_name="test", total_targets=1)
+
+    summary.add_result(
+        target="__run__",
+        success=False,
+        skipped=True,
+        reason="stop_requested",
+    )
+
+    assert summary.skipped_count == 1
+    assert summary.failed_count == 0
+    assert summary.to_dict()["results"][0]["skipped"] is True
+
+
+def test_final_run_status_preserves_explicit_failure_and_derives_success() -> None:
+    summary = checker.RunSummary(profile_name="test", total_targets=1)
+    summary.add_result(target="target", success=True)
+
+    assert checker.final_run_status(summary) == "success"
+    assert checker.final_run_status(summary, "failed") == "failed"
+
+
+def test_target_send_guard_blocks_recent_duplicate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(checker, "TARGET_GUARD_DIR", tmp_path)
+    monkeypatch.setattr(checker, "TARGET_SEND_GUARD_SECONDS", 300)
+
+    first_ok, first = checker.acquire_target_send_guard("target")
+    second_ok, second = checker.acquire_target_send_guard("target")
+
+    assert first_ok is True
+    assert first["target"] == "target"
+    assert second_ok is False
+    assert second["reason"] == "recent_guard"
+
+
+@pytest.mark.parametrize('saved_pid', [None, -1, os.getpid()])
+def test_worker_exit_clears_only_its_own_pid(monkeypatch, saved_pid) -> None:
+    changes = []
+    released = []
+    monkeypatch.setattr(checker, 'control_store', SimpleNamespace(
+        load_state=lambda: SimpleNamespace(last_run_pid=saved_pid),
+        update_state=lambda **patch: changes.append(patch),
+    ))
+    monkeypatch.setattr(checker, 'run_lock', SimpleNamespace(release=lambda: released.append(True)))
+
+    checker.release_worker_run()
+
+    assert released == [True]
+    assert changes == ([{'last_run_pid': None, 'stop_requested': False}] if saved_pid == os.getpid() else [])
+
+
+def test_worker_exit_releases_lock_even_if_state_cleanup_fails(monkeypatch) -> None:
+    def fail_load():
+        raise OSError('state is unavailable')
+
+    released = []
+    monkeypatch.setattr(checker, 'control_store', SimpleNamespace(load_state=fail_load))
+    monkeypatch.setattr(checker, 'run_lock', SimpleNamespace(release=lambda: released.append(True)))
+
+    with pytest.raises(OSError):
+        checker.release_worker_run()
+
+    assert released == [True]

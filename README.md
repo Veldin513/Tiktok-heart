@@ -19,12 +19,15 @@ TikTok Heart is a Windows desktop control app for a local TikTok worker. It keep
 - Public-safe source backups that exclude private runtime data.
 - Diagnostics, logs, health checks, and maintenance tools.
 
-### 2.1 Highlights
+### 2.2 Highlights
 
-- Security scan can be started from the Services tab.
-- Overview includes a performance panel for slow local API requests.
-- Manual Refresh is queued behind active auto-refresh instead of being dropped.
-- Build metadata and release artifacts are aligned to version 2.1.0.
+- Scheduled runs verify the worker script and process creation time; reused Windows PIDs no longer block a run.
+- Worker locks recover after reboot, and completed workers clear their saved PID.
+- The silent Windows launcher correctly passes startup and self-test switches to PowerShell.
+- Authorization backup restore, worker lifecycle history, and lightweight live status are included.
+- Existing local profiles, authorization, and schedule settings are preserved during an update.
+
+See [CHANGELOG.md](CHANGELOG.md) for release details.
 
 ### Project Layout
 
@@ -91,7 +94,6 @@ Important variables:
 
 - `TG_TOKEN` - Telegram bot token.
 - `TG_CHAT_IDS` - chat IDs for notifications.
-- `TG_ALLOWED_CHAT_IDS` - chat IDs allowed to control the bot.
 - `TIKTOK_DEFAULT_PROFILE` - default local profile name.
 - `TIKTOK_BOT_PROFILE` - profile used by helper scripts.
 
@@ -118,13 +120,15 @@ scripts\windows\register_worker_schedule.bat
 scripts\windows\unregister_worker_schedule.bat
 ```
 
-The intended schedule is Windows startup plus every 12 hours.
+The intended schedule is Windows sign-in plus every 12 hours. The sign-in task waits two minutes for the desktop session to become available.
+
+After updating an existing installation, the scheduled tasks continue using the scripts in this project folder. Replace the source files in place; keep your local `control/` and `profiles/` folders. If you move the project, register the schedule again so its paths are updated.
 
 ### Tests
 
 ```powershell
 python -m pytest
-python -m ruff check yara_app app_shell scripts tests --select F401,F841,F821 --exclude __pycache__
+python -m ruff check .
 node --check app_shell\web\app.js
 ```
 
@@ -190,12 +194,15 @@ TikTok Heart - Windows-приложение для локального TikTok w
 - Backup исходников без приватных runtime-данных.
 - Диагностика, логи, здоровье проекта и обслуживание.
 
-### Что нового в 2.1
+### Что нового в 2.2
 
-- Security scan запускается прямо из вкладки "Сервисы".
-- В обзоре появилась панель производительности для медленных локальных API-запросов.
-- Ручное обновление теперь ставится в очередь, если автообновление уже выполняется.
-- Метаданные сборки и релизные артефакты приведены к версии 2.1.0.
+- Запуск по расписанию проверяет скрипт и время создания процесса: повторно выданный Windows номер процесса больше не блокирует работу.
+- Блокировки worker восстанавливаются после перезагрузки, а завершённый worker очищает свой сохранённый PID.
+- Тихий Windows-запуск правильно передаёт параметры автозапуска и самопроверки в PowerShell.
+- Добавлены восстановление backup авторизации, история этапов worker и облегчённое обновление статуса.
+- При обновлении сохраняются локальные профили, авторизация и параметры расписания.
+
+Подробности версии: [CHANGELOG.md](CHANGELOG.md).
 
 ### Структура проекта
 
@@ -256,7 +263,6 @@ Copy-Item .env.example .env
 
 - `TG_TOKEN` - токен Telegram-бота.
 - `TG_CHAT_IDS` - chat ID для уведомлений.
-- `TG_ALLOWED_CHAT_IDS` - chat ID, которым разрешено управлять ботом.
 - `TIKTOK_DEFAULT_PROFILE` - профиль по умолчанию.
 - `TIKTOK_BOT_PROFILE` - профиль для helper-скриптов.
 
@@ -283,13 +289,15 @@ scripts\windows\register_worker_schedule.bat
 scripts\windows\unregister_worker_schedule.bat
 ```
 
-Основной режим: запуск при старте Windows и далее каждые 12 часов.
+Основной режим: запуск после входа в Windows и далее каждые 12 часов. Задача входа ждёт две минуты, чтобы рабочий стол успел загрузиться.
+
+При обновлении на месте задачи продолжают использовать скрипты из этой папки. Замени исходники, сохранив локальные папки `control/` и `profiles/`. Если переносишь проект в другую папку, зарегистрируй расписание заново для обновления путей.
 
 ### Проверки
 
 ```powershell
 python -m pytest
-python -m ruff check yara_app app_shell scripts tests --select F401,F841,F821 --exclude __pycache__
+python -m ruff check .
 node --check app_shell\web\app.js
 ```
 
