@@ -555,6 +555,7 @@ function renderProfiles(diag) {
     state.selectedProfileKey = activeProfile.key;
   }
   const selectedProfile = profiles.find((profile) => profile.key === state.selectedProfileKey) || activeProfile;
+  $("#target-profile-caption").textContent = `Адресаты профиля: ${selectedProfile.label || selectedProfile.key}. Для работы нажмите «Использовать» у нужного профиля.`;
 
   profilesBox.innerHTML = profiles.map((profile) => {
     const selected = profile.key === selectedProfile.key;
@@ -968,7 +969,7 @@ function renderBrowser(browser) {
     ["Размер", formatBytes(browser.size_bytes)],
     ["Основной профиль", browser.default_profile_exists ? "готов" : "не найден"],
     ["Настройки браузера", browser.local_state_exists ? "готовы" : "не найдены"],
-    ["Авторизация", browser.cookies_exists ? "есть" : "не найдена"],
+    ["Авторизация", browser.session_import_required ? "нужен свежий перенос из Chrome" : (browser.cookies_exists ? "cookies сохранены; вход проверяется при запуске" : "не найдена")],
     ["Пауза авторизации", browser.auth_backoff_left ? `${Math.ceil(browser.auth_backoff_left / 60)} мин` : "нет"],
     ["Резервные копии", backupSummary(browser.backup_count, browser.backup_bytes)],
     ["Копии авторизации", backupSummary(browser.auth_backup_count, browser.auth_backup_bytes)],
@@ -1133,10 +1134,10 @@ function renderLogs(diag) {
   if (state.activeView === "logs") return;
   const lines = [
     "Worker stdout",
-    ...((diag.recent_worker_stdout || []).slice(-28)),
+    ...((diag.recent_worker_stdout || []).slice(-28).reverse()),
     "",
     "Launcher",
-    ...((diag.recent_launcher_log || []).slice(-12)),
+    ...((diag.recent_launcher_log || []).slice(-12).reverse()),
   ];
   $("#logs").textContent = lines.join("\n");
 }
@@ -1152,14 +1153,14 @@ function renderLogsPayload(data) {
   if (source) source.value = data.name || "worker_stdout";
   $("#log-filter").value = data.filter || "all";
   $("#log-lines").value = data.line_limit || 160;
-  $("#logs-meta").textContent = `${data.label || data.name} · показано ${data.shown}/${data.total} · ${data.path || ""}`;
+  $("#logs-meta").textContent = `${data.label || data.name} · новые записи сверху · показано ${data.shown}/${data.total} · ${data.path || ""}`;
 
   const header = [
     `===== ${data.label || data.name} =====`,
     `Фильтр: ${data.filter || "all"} · поиск: ${data.search || "—"} · строк: ${data.shown}/${data.total}`,
     "",
   ];
-  const lines = (data.lines || []).map((item) => (
+  const lines = [...(data.lines || [])].reverse().map((item) => (
     `<span class="log-line ${escapeHtml(item.kind || "")}">${escapeHtml(item.text || "")}</span>`
   )).join("");
   $("#logs").innerHTML = `${escapeHtml(header.join("\n"))}${lines || '<span class="log-line muted">(пусто)</span>'}`;
@@ -1422,6 +1423,46 @@ function bindNavigation() {
 }
 
 function bindActions() {
+  $("#create-profile-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = form.querySelector("button");
+    const status = $("#profile-create-status");
+    button.disabled = true;
+    try {
+      const result = await api("/api/profile-action", { method: "POST", body: JSON.stringify({ action: "create", profile_key: $("#new-profile-key").value.trim() }) });
+      state.selectedProfileKey = result.key;
+      form.reset();
+      await refresh({ full: true });
+      status.textContent = `Профиль ${result.key} создан. Добавьте адресата справа, затем перенесите вход.`;
+    } catch (error) { status.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+
+  $("#add-target-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = form.querySelector("button");
+    const status = $("#target-create-status");
+    const profileKey = state.selectedProfileKey;
+    if (!profileKey) { status.textContent = "Сначала создайте или откройте профиль слева."; return; }
+    button.disabled = true;
+    try {
+      await api("/api/target-action", { method: "POST", body: JSON.stringify({ action: "add", profile_key: profileKey, target_name: $("#new-target-name").value.trim(), profile_url: $("#new-target-url").value.trim() }) });
+      form.reset();
+      await refresh({ full: true });
+      status.textContent = `Адресат добавлен в профиль ${profileKey}.`;
+    } catch (error) { status.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+
+  $("#profile-import-shortcut").addEventListener("click", () => {
+    if (!state.selectedProfileKey) { toast("Сначала выберите профиль"); return; }
+    $("#bot-profile").value = state.selectedProfileKey;
+    activateView("browser");
+    loadSelectedBrowserProfile().catch((error) => toast(error.message));
+  });
+
   document.addEventListener("click", async (event) => {
     const button = event.target.closest("[data-action]");
     if (!button) return;

@@ -203,10 +203,28 @@
           <div class="content-grid">
             <article class="panel">
               <div class="panel-title">Профили</div>
+              <p class="hint">1. Создайте профиль для аккаунта TikTok. 2. Добавьте адресатов. 3. Перенесите вход из Chrome.</p>
+              <form id="create-profile-form" class="profile-form">
+                <label class="field-label" for="new-profile-key">Название нового профиля</label>
+                <input id="new-profile-key" class="input" placeholder="Например: main" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}">
+                <p class="hint">Латинские буквы, цифры, дефис или подчёркивание. У каждого профиля отдельная авторизация.</p>
+                <button class="btn primary" type="submit">Создать профиль</button>
+                <p id="profile-create-status" class="hint" role="status" aria-live="polite"></p>
+              </form>
               <div id="profiles-list" class="profile-list"></div>
             </article>
             <article class="panel">
               <div class="panel-title">Адресаты</div>
+              <p id="target-profile-caption" class="hint"></p>
+              <form id="add-target-form" class="profile-form">
+                <label class="field-label" for="new-target-name">Имя в списке чатов TikTok</label>
+                <input id="new-target-name" class="input" placeholder="Имя собеседника, как в сообщениях" required maxlength="80">
+                <label class="field-label" for="new-target-url">Ссылка на аккаунт или @username</label>
+                <input id="new-target-url" class="input" placeholder="https://www.tiktok.com/@username" required maxlength="256">
+                <button class="btn primary" type="submit">Добавить адресата</button>
+                <p id="target-create-status" class="hint" role="status" aria-live="polite"></p>
+              </form>
+              <button id="profile-import-shortcut" class="btn secondary full">Перенести вход для этого профиля</button>
               <div id="targets-list" class="target-list"></div>
             </article>
           </div>
@@ -234,6 +252,7 @@
             </article>
             <article class="panel">
               <div class="panel-title">Импорт из Chrome</div>
+              <button class="btn secondary full" data-go-view="profiles">Создать профиль и добавить адресатов</button>
               <label class="field-label" for="bot-profile">Куда сохранить авторизацию</label>
               <select id="bot-profile" class="select"></select>
               <p class="hint">Один раз перенесите текущий вход из Chrome. После этого приложение будет использовать сохранённую сессию автоматически.</p>

@@ -16,28 +16,21 @@ from typing import Any
 from playwright.sync_api import sync_playwright
 
 from yara_app.auth_flow import (
-    attach_auth_debug_listeners,
     auth_backoff_seconds_left,
-    block_heavy_content,
     clear_auth_backoff,
-    dump_auth_state,
-    get_latest_tiktok_page,
-    handle_captcha,
-    init_auth_browser,
     init_work_browser,
-    interactive_auth,
     is_logged_in,
     safe_close_context,
+    wait_for_authenticated_page,
 )
 from yara_app.config import BOT_NAME, TG_CHAT_IDS, TG_DISABLE_NOTIFICATIONS, TG_TOKEN, MessageSelector, get_cli_profile
 from yara_app.project_adapter import ProjectAdapter
 from yara_app.runtime_paths import (
     RunLock,
+    browser_profile_needs_recovery,
     build_profile_paths,
     configure_logging,
     format_duration,
-    init_auth_runtime,
-    recover_browser_profile_after_reinstall,
 )
 from yara_app.tiktok_messenger import open_chat_by_list, open_chat_by_profile, open_messages, send_message
 from yara_app.ttbot.models import ControlStore, RunSummary, StateStore, Target, safe_name_key
@@ -189,7 +182,6 @@ logger = configure_logging(PATHS)
 
 tg = TelegramClient(TG_TOKEN, TG_CHAT_IDS, enabled=not TG_DISABLE_NOTIFICATIONS)
 store = StateStore(PATHS.state_dir, state.cooldown_hours)
-auth_runtime = init_auth_runtime()
 run_lock = RunLock(PATHS.run_lock_file)
 message_selector = MessageSelector(control_store.load_messages())
 auth_coord_adapter = ProjectAdapter()
@@ -344,23 +336,6 @@ def wait_for_internet() -> bool:
     return False
 
 
-def apply_stealth_script(page) -> None:
-    stealth_script = """
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    """
-    page.add_init_script(stealth_script)
-
-
-def apply_work_resource_filter(page) -> None:
-    try:
-        page.route('**/*', lambda route: block_heavy_content(route, True))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning('Не удалось включить фильтр тяжёлых ресурсов: %s', exc)
-
-
 def save_run_summary(summary: RunSummary) -> None:
     (PATHS.artifacts_dir / 'run_summary.json').write_text(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
 
@@ -501,6 +476,7 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
     logger.info('--- Обработка: %s ---', target.name)
     with timed_phase('target_open_messages', target=target.name):
         open_messages(page)
+    require_work_session(page)
     try:
         with timed_phase('target_open_chat', target=target.name, method='list'):
             chat_opened = open_chat_by_list(page, target.name)
@@ -525,6 +501,7 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
         _append_run_history('target_result', target=target.name, success=False, reason='profile_url_missing')
         return
 
+    require_work_session(page)
     runtime_state = control_store.load_state()
     message = message_selector.next()
     if runtime_state.dry_run:
@@ -560,78 +537,58 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
     time.sleep(1.5)
 
 
+class AuthSessionUnavailable(RuntimeError):
+    pass
+
+
+def mark_session_import_required(reason: str) -> None:
+    marker = PATHS.state_dir / 'session_import_required.json'
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({'reason': reason, 'at': time.time()}), encoding='utf-8')
+    logger.warning('Работа остановлена: нужен новый перенос входа из Chrome. Причина: %s', reason)
+
+
+def require_work_session(page) -> None:
+    if not is_logged_in(page) or detect_captcha(page, timeout_ms=700).get('found'):
+        mark_session_import_required('session_lost_during_run')
+        raise AuthSessionUnavailable('Сессия потеряна. Повторите перенос входа из Chrome.')
+
+
 def open_logged_in_work_browser(playwright):
-    try:
-        with timed_phase('recover_browser_profile'):
-            recovered_profile = recover_browser_profile_after_reinstall(PATHS)
-        if recovered_profile is not None:
-            logger.warning('Recovered incompatible Chrome profile after Windows reinstall. Backup: %s', recovered_profile)
-            tg.send_text('Local TikTok browser profile was reset because Windows could not decrypt the old Chrome cookies. Try logging in again once the TikTok cooldown is over.')
-    except Exception as exc:
-        logger.error('Failed to recover browser profile before auth: %s', exc)
-
-    work_context = None
-    work_page = None
-    keep_work_context = False
-    try:
-        logger.info('Открытие TikTok для проверки авторизации...')
-        with timed_phase('work_browser_launch'):
-            work_context = init_work_browser(playwright, PATHS.user_data_dir)
-        work_page = work_context.pages[0] if work_context.pages else work_context.new_page()
-        apply_stealth_script(work_page)
-        apply_work_resource_filter(work_page)
-        with timed_phase('work_browser_goto_messages'):
-            work_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
-        with timed_phase('work_browser_captcha_check'):
-            handle_captcha(work_page, tg, PATHS.artifacts_dir)
-        with timed_phase('work_browser_auth_probe'):
-            logged_in = is_logged_in(work_page)
-        if logged_in:
-            clear_auth_backoff(AUTH_BACKOFF_FILE)
-            logger.info('Авторизация подтверждена; используем уже открытый рабочий Chromium.')
-            keep_work_context = True
-            return True, work_context, work_page
-    finally:
-        if work_context is not None and not keep_work_context:
-            safe_close_context(work_context, work_page)
-
-    auth_backoff_left = auth_backoff_seconds_left(AUTH_BACKOFF_FILE)
-    if auth_backoff_left > 0:
-        logger.warning('TikTok auth is temporarily rate-limited. Wait left: %s.', format_duration(auth_backoff_left))
-        tg.send_text(f'TikTok still reports too many login attempts. Wait about {format_duration(auth_backoff_left)} before trying again.')
+    # Unattended runs never reset profiles or open a password/QR login flow.
+    if (PATHS.state_dir / 'session_import_required.json').exists():
+        logger.warning('Нужен перенос входа из Chrome; повторная проверка браузером пропущена.')
         return False, None, None
-
-    logger.warning('🛑 НУЖЕН ВХОД! Открываю оконный режим...')
-    control_bot_suspended = _suspend_control_bot_for_auth()
-    auth_context = None
-    auth_page = None
+    if auth_backoff_seconds_left(AUTH_BACKOFF_FILE) > 0:
+        logger.warning('Пауза авторизации активна; браузер не открывается.')
+        return False, None, None
+    if browser_profile_needs_recovery(PATHS.user_data_dir):
+        mark_session_import_required('profile_key_unreadable')
+        return False, None, None
+    context = None
+    page = None
+    keep = False
     try:
-        with timed_phase('auth_browser_launch'):
-            auth_context = init_auth_browser(playwright, PATHS.user_data_dir)
-        auth_page = auth_context.pages[0] if auth_context.pages else auth_context.new_page()
-        attach_auth_debug_listeners(auth_context, auth_runtime)
-        auth_page = get_latest_tiktok_page(auth_context, auth_page)
-        dump_auth_state(auth_page, 'AUTH_BROWSER_STARTED')
-        with timed_phase('auth_browser_goto_messages'):
-            auth_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
-        auth_page = get_latest_tiktok_page(auth_context, auth_page)
-        dump_auth_state(auth_page, 'AFTER_MESSAGES_GOTO')
-        with timed_phase('auth_browser_captcha_check'):
-            handle_captcha(auth_page, tg, PATHS.artifacts_dir)
-        with timed_phase('interactive_auth'):
-            auth_ok = interactive_auth(auth_page, tg, auth_runtime, PATHS.artifacts_dir, AUTH_BACKOFF_FILE)
-        if not auth_ok:
+        with timed_phase('work_browser_launch'):
+            context = init_work_browser(playwright, PATHS.user_data_dir)
+        page = context.pages[0] if context.pages else context.new_page()
+        with timed_phase('work_browser_goto_messages'):
+            response = page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
+        if response is not None and response.status >= 400:
+            logger.warning('TikTok недоступен (HTTP %s); повторный вход не выполняется.', response.status)
             return False, None, None
-        auth_page = get_latest_tiktok_page(auth_context, auth_page)
-        dump_auth_state(auth_page, 'AFTER_INTERACTIVE_AUTH')
-        logger.info('После interactive_auth: url=%s, logged_in=%s', auth_page.url, is_logged_in(auth_page))
-        logged_in = is_logged_in(auth_page)
-        if logged_in:
-            clear_auth_backoff(AUTH_BACKOFF_FILE)
-        return logged_in, None, None
+        if detect_captcha(page, timeout_ms=700).get('found'):
+            mark_session_import_required('verification_required')
+            return False, None, None
+        if not wait_for_authenticated_page(page):
+            mark_session_import_required('session_not_confirmed')
+            return False, None, None
+        clear_auth_backoff(AUTH_BACKOFF_FILE)
+        keep = True
+        return True, context, page
     finally:
-        safe_close_context(auth_context, auth_page)
-        _resume_control_bot_after_auth(control_bot_suspended)
+        if context is not None and not keep:
+            safe_close_context(context, page)
 
 
 def run_browser_self_test() -> dict[str, Any]:
@@ -648,6 +605,10 @@ def run_browser_self_test() -> dict[str, Any]:
     }
     context = None
     page = None
+
+    if (PATHS.state_dir / 'session_import_required.json').exists():
+        result['error'] = 'Нужен свежий перенос входа из Chrome. Повторные обращения к TikTok остановлены.'
+        return result
 
     @contextmanager
     def local_phase(name: str):
@@ -670,16 +631,13 @@ def run_browser_self_test() -> dict[str, Any]:
                     context = init_work_browser(playwright, PATHS.user_data_dir)
                     result['opened_browser'] = True
                 page = context.pages[0] if context.pages else context.new_page()
-                with local_phase('prepare_page'):
-                    apply_stealth_script(page)
-                    apply_work_resource_filter(page)
                 with local_phase('goto_messages'):
                     page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
                     result['url'] = getattr(page, 'url', '') or ''
                 with local_phase('captcha_probe'):
                     result['captcha'] = detect_captcha(page, timeout_ms=700)
                 with local_phase('auth_probe'):
-                    result['logged_in'] = bool(is_logged_in(page))
+                    result['logged_in'] = wait_for_authenticated_page(page)
                     result['url'] = getattr(page, 'url', '') or result.get('url', '')
             finally:
                 safe_close_context(context, page)
@@ -773,7 +731,7 @@ def check_tiktok_streak() -> None:
                 log_lifecycle('worker_failed_auth', profile=ACTIVE_PROFILE)
                 summary.add_result(target='__run__', success=False, reason='auth_failed')
                 _append_run_history('run_failed', reason='auth_failed')
-                tg.send_text('❌ Авторизация не подтверждена. Проверь окно браузера и повтори запуск.')
+                tg.send_text('Авторизация не подтверждена. Остановите worker и повторите перенос входа из Chrome в приложении.')
                 return
             try:
                 logger.info('Рабочий Chromium готов; продолжаем рассылку.')
@@ -781,12 +739,10 @@ def check_tiktok_streak() -> None:
                     with timed_phase('work_browser_launch_reopen'):
                         work_context = init_work_browser(playwright, PATHS.user_data_dir)
                     work_page = work_context.pages[0] if work_context.pages else work_context.new_page()
-                    apply_stealth_script(work_page)
-                    apply_work_resource_filter(work_page)
                     with timed_phase('work_browser_goto_messages_reopen'):
                         work_page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
                     with timed_phase('work_browser_captcha_check_reopen'):
-                        handle_captcha(work_page, tg, PATHS.artifacts_dir)
+                        require_work_session(work_page)
                 stop_reason = stop_or_pause_reason()
                 if stop_reason:
                     terminal_status = 'stopped'
@@ -813,6 +769,10 @@ def check_tiktok_streak() -> None:
             finally:
                 logger.info('Закрытие браузера.')
                 safe_close_context(work_context, work_page)
+    except AuthSessionUnavailable:
+        terminal_status = 'failed'
+        terminal_reason = 'session_import_required'
+        _append_run_history('run_failed', reason=terminal_reason)
     except Exception as exc:
         terminal_status = 'failed'
         terminal_reason = 'unhandled_exception'

@@ -1459,6 +1459,12 @@ h1 {
   color: var(--ink);
 }
 
+.profile-form {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
 .input {
   border: 1px solid var(--line);
   border-radius: var(--radius);

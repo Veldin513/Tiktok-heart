@@ -29,7 +29,7 @@ def init_work_browser(playwright, user_data_dir):
         playwright,
         user_data_dir,
         headless=WORK_BROWSER_HEADLESS,
-        args=['--disable-blink-features=AutomationControlled', '--mute-audio', '--disable-infobars', '--disable-dev-shm-usage', '--no-sandbox'],
+        args=['--mute-audio'],
     )
 
 
@@ -307,13 +307,18 @@ def notify_auth_rate_limit(tg, auth_runtime: dict, seconds_left: int) -> None:
 def is_logged_in(page) -> bool:
     url = urlparse(page.url)
     host = url.hostname or ''
-    if (host == 'tiktok.com' or host.endswith('.tiktok.com')) and (url.path == '/messages' or url.path.startswith('/messages/')):
-        return True
+    if url.scheme != 'https' or host not in ('tiktok.com', 'www.tiktok.com') or url.path.startswith('/login'):
+        return False
+    try:
+        if page.locator('[data-e2e="top-login-button"]:visible').count():
+            return False
+    except Exception:
+        return False
 
     logged_in_elements = [
-        '[data-e2e="inbox-icon"]',
-        '[data-e2e="profile-icon"]',
-        '.css-19p0p2f-DivInboxContainer',
+        '#main-content-messages:visible',
+        '[data-e2e="inbox-icon"]:visible',
+        '.css-19p0p2f-DivInboxContainer:visible',
     ]
     for selector in logged_in_elements:
         try:
@@ -322,6 +327,16 @@ def is_logged_in(page) -> bool:
         except Exception:
             continue
     return False
+
+
+def wait_for_authenticated_page(page, timeout_ms: int = 20000) -> bool:
+    try:
+        page.locator('#main-content-messages:visible, [data-e2e="inbox-icon"]:visible, .css-19p0p2f-DivInboxContainer:visible').first.wait_for(
+            state='visible', timeout=timeout_ms,
+        )
+    except Exception:
+        return False
+    return is_logged_in(page)
 
 
 def get_tiktok_auth_fingerprint(page) -> dict:

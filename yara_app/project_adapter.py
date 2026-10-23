@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import sqlite3
@@ -15,13 +16,17 @@ from collections import deque
 from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 from typing import Any
+from urllib.parse import urlparse
 
 from yara_app.backups import BackupService
 from yara_app.performance import PerformanceService
 from yara_app.runtime_paths import browser_profile_needs_recovery, extend_env_with_site_packages
 from yara_app.scheduler import WorkerScheduleService
 from yara_app.ttbot.models import legacy_safe_filename, safe_name_key
+
+_PROFILE_EDIT_LOCK = RLock()
 
 try:
     import psutil
@@ -480,6 +485,54 @@ class ProjectAdapter:
         if index < 0 or index >= len(profiles):
             raise IndexError("profile index out of range")
         return self.set_active_profile_key(profiles[index].key)
+
+    def create_profile(self, profile_key: str) -> ProfileEntry:
+        key = str(profile_key or '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,47}', key) or key.upper() in {
+            'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(10)), *(f'LPT{i}' for i in range(10)),
+        }:
+            raise ValueError('Название профиля: 1–48 латинских букв, цифр, дефисов или подчёркиваний. Например: main.')
+        with _PROFILE_EDIT_LOCK:
+            if self.get_worker_status().running:
+                raise RuntimeError('Остановите worker перед изменением профилей.')
+            if any(item.key.casefold() == key.casefold() for item in self.get_profiles()):
+                raise ValueError('Профиль с таким названием уже существует.')
+            payload = self._read_json(self.profiles_path, {})
+            if not isinstance(payload, dict):
+                raise ValueError('Создание профиля требует стандартного формата profiles.json: объект профилей.')
+            payload[key] = []
+            self._write_json(self.profiles_path, payload)
+        return next(item for item in self.get_profiles() if item.key == key)
+
+    def add_target(self, profile_key: str, target_name: str, profile_url: str) -> dict[str, str]:
+        name = str(target_name or '').strip()
+        value = str(profile_url or '').strip()
+        if not name or len(name) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in name):
+            raise ValueError('Укажите имя адресата из списка чатов TikTok (до 80 символов).')
+        if value.startswith('@'):
+            value = 'https://www.tiktok.com/' + value
+        url = urlparse(value)
+        if url.scheme != 'https' or url.netloc not in ('www.tiktok.com', 'tiktok.com') or not re.fullmatch(r'/@[A-Za-z0-9._]{1,64}/?', url.path):
+            raise ValueError('Укажите @username или ссылку вида https://www.tiktok.com/@username.')
+        target = {'name': name, 'url': 'https://www.tiktok.com/' + url.path.strip('/')}
+        with _PROFILE_EDIT_LOCK:
+            if self.get_worker_status().running:
+                raise RuntimeError('Остановите worker перед добавлением адресата.')
+            payload = self._read_json(self.profiles_path, {})
+            if not isinstance(payload, dict) or profile_key not in payload:
+                raise ValueError('Сначала выберите существующий профиль.')
+            raw = payload[profile_key]
+            targets = self._extract_targets(raw)
+            if any(str(t.get('name', '')).casefold() == name.casefold() or str(t.get('url', '')).rstrip('/').casefold() == target['url'].casefold() for t in targets):
+                raise ValueError('Этот адресат уже добавлен в выбранный профиль.')
+            if isinstance(raw, list):
+                raw.append(target)
+            elif isinstance(raw, dict) and isinstance(raw.get('targets'), list):
+                raw['targets'].append(target)
+            else:
+                raise ValueError('Неподдерживаемый формат списка адресатов.')
+            self._write_json(self.profiles_path, payload)
+        return target
 
     def set_active_profile_key(self, profile_key: str) -> ProfileEntry:
         key = str(profile_key or "").strip()
@@ -968,6 +1021,7 @@ class ProjectAdapter:
                     timestamp=time.strftime('%Y%m%d_%H%M%S'),
                 )
                 clear_auth_backoff(profile_root / 'state' / 'auth_backoff.json')
+                (profile_root / 'state' / 'session_import_required.json').unlink(missing_ok=True)
                 return {
                     'bot_profile_key': profile_root.name, 'verified': True, 'cookies_count': len(cookies),
                     'backup': str(previous) if previous else '', 'pre_import_auth_backup': backup,
@@ -1230,6 +1284,7 @@ class ProjectAdapter:
             "cookies_path": str(cookies_path),
             "modified_at": user_data_stat.st_mtime if user_data_stat else None,
             "needs_recovery": needs_recovery,
+            "session_import_required": (profile_root / 'state' / 'session_import_required.json').exists(),
             "auth_backoff_exists": auth_backoff_path.exists(),
             "auth_backoff_left": auth_backoff_left,
             "auth_backoff_path": str(auth_backoff_path),

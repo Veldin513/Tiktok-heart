@@ -61,6 +61,7 @@ def adapter_fixture(tmp_path, monkeypatch):
     pause = tmp_path / 'profiles/main/state/auth_backoff.json'
     pause.parent.mkdir()
     pause.write_text('{}')
+    (pause.parent / 'session_import_required.json').write_text('{}')
     return adapter, old, pause
 
 
@@ -76,6 +77,7 @@ def test_unverified_session_preserves_profile_and_pause(tmp_path, monkeypatch):
         adapter.import_chrome_request(request_text=REQUEST, bot_profile_key='main')
     assert (old / 'old-session').read_text() == 'keep'
     assert pause.exists()
+    assert (pause.parent / 'session_import_required.json').exists()
     assert not list(old.parent.glob('session_import_*'))
     assert not (old.parent / '.session_import.lock').exists()
 
@@ -94,6 +96,7 @@ def test_verified_session_promotes_with_backup_and_clears_pause(tmp_path, monkey
     assert (old / 'new-session').read_text() == 'verified'
     assert (Path(result['backup']) / 'old-session').read_text() == 'keep'
     assert not pause.exists()
+    assert not (pause.parent / 'session_import_required.json').exists()
     assert not list(old.parent.glob('session_import_*'))
 
 

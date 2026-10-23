@@ -581,7 +581,9 @@ class AppShellHandler(BaseHTTPRequestHandler):
         action = str(payload.get("action") or "").strip()
         index = int(payload.get("index") or 0)
         profile_key = str(payload.get("profile_key") or "").strip()
-        if action == "set_active":
+        if action == "create":
+            result = self.adapter.create_profile(profile_key)
+        elif action == "set_active":
             result = self.adapter.set_active_profile_key(profile_key) if profile_key else self.adapter.set_active_profile(index)
         elif action == "toggle":
             result = self.adapter.toggle_profile_key(profile_key) if profile_key else self.adapter.toggle_profile(index)
@@ -595,7 +597,9 @@ class AppShellHandler(BaseHTTPRequestHandler):
         target_name = str(payload.get("target_name") or "").strip()
         if not target_name:
             raise ValueError("target_name is required")
-        if action == "reset_cooldown":
+        if action == "add":
+            result = self.adapter.add_target(profile_key or '', target_name, str(payload.get('profile_url') or ''))
+        elif action == "reset_cooldown":
             removed, path = self.adapter.reset_target_cooldown(target_name, profile_key)
             result = {"removed": removed, "path": path}
         elif action == "set_streak":

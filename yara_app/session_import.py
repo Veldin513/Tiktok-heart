@@ -74,11 +74,11 @@ def prepare_session(user_data_dir: Path, cookies: list[dict]) -> None:
     """Validate in an isolated profile using the project's existing Chromium."""
     from playwright.sync_api import sync_playwright
 
-    from yara_app.auth_flow import _launch_persistent_chromium
+    from yara_app.auth_flow import init_work_browser, wait_for_authenticated_page
 
     try:
         with sync_playwright() as playwright:
-            context = _launch_persistent_chromium(playwright, str(user_data_dir), headless=True)
+            context = init_work_browser(playwright, str(user_data_dir))
             try:
                 context.add_cookies(cookies)
                 page = context.pages[0] if context.pages else context.new_page()
@@ -86,10 +86,7 @@ def prepare_session(user_data_dir: Path, cookies: list[dict]) -> None:
                 if response is None or response.status >= 400:
                     raise RuntimeError('session unavailable')
                 # A /messages URL alone is insufficient: a logged-out page may keep it.
-                page.locator('#main-content-messages:visible, [data-e2e="inbox-icon"]:visible, .css-19p0p2f-DivInboxContainer:visible').first.wait_for(
-                    state='visible', timeout=20000,
-                )
-                if page.locator('[data-e2e="top-login-button"]:visible').count():
+                if not wait_for_authenticated_page(page):
                     raise RuntimeError('session unavailable')
                 host = (urlparse(page.url).hostname or '').lower()
                 if host not in ('www.tiktok.com', 'tiktok.com') or '/login' in urlparse(page.url).path:
