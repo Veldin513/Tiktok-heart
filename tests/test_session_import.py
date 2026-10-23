@@ -23,6 +23,20 @@ def test_chrome_curl_formats(text):
     assert all(item['domain'] == '.tiktok.com' and item['secure'] for item in cookies)
 
 
+def test_large_copy_all_imports_only_first_request():
+    text = REQUEST + ";\ncurl 'https://foreign.example' --data-raw '" + 'unused' * 100000
+    cookies = cookies_from_curl(text)
+    assert {item['name']: item['value'] for item in cookies} == {
+        'sessionid': 'fake-test-session', 'tt_csrf_token': 'fake-csrf',
+    }
+
+
+def test_oversized_first_request_is_still_rejected():
+    text = REQUEST + " -H 'large: " + 'unused' * 100000 + "';"
+    with pytest.raises(ValueError, match='Первый запрос слишком большой'):
+        cookies_from_curl(text)
+
+
 @pytest.mark.parametrize('text', [
     "curl 'https://www.tiktok.com.evil.example/messages' -b 'sessionid=secret'",
     "curl 'https://evil.example/?next=https://www.tiktok.com/messages' -b 'sessionid=secret'",

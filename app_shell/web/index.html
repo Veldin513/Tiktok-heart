@@ -245,6 +245,7 @@
               </ol>
               <label class="field-label" for="session-request">Запрос из Chrome</label>
               <textarea id="session-request" class="text-editor session-request" spellcheck="false" autocomplete="off" placeholder="Вставьте сюда скопированный запрос (Ctrl+V)"></textarea>
+              <p class="hint">Точки скрывают данные входа — это нормально. Если скопирован список запросов, будет прочитан только первый. В Chrome выбирайте строку messages → Copy as cURL.</p>
               <button id="session-import-button" class="btn primary full">Проверить и сохранить вход</button>
               <p id="session-import-result" class="hint backup-status" role="status" aria-live="polite"></p>
               <p class="hint">Проверка занимает до 90 секунд. При успехе создаётся резервная копия текущего входа. Содержимое запроса не сохраняется в логах; поле очищается после отправки.</p>

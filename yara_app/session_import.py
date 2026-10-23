@@ -11,22 +11,32 @@ AUTH_COOKIE_NAMES = {'sessionid', 'sessionid_ss', 'sid_tt'}
 
 
 def cookies_from_curl(text: str) -> list[dict]:
-    if not isinstance(text, str) or len(text.encode('utf-8')) > 256 * 1024:
-        raise ValueError('Запрос слишком большой: скопируйте один запрос TikTok.')
+    if not isinstance(text, str):
+        raise ValueError('Нужен текст запроса из Chrome.')
     # Chrome offers bash and Windows cmd formats. Only tokenize; never run a shell.
     text = text.strip().replace('^\r\n', '').replace('^\n', '')
     if text.startswith(('curl "', 'curl.exe "')):
         text = text.replace('^"', '"')
+    # Copy all as cURL can include megabytes of unrelated requests. Bound only
+    # the first command; never tokenize or validate the remaining commands.
+    request_limit = 256 * 1024
+    truncated = len(text) > request_limit
+    ended = False
     try:
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=';')
+        lexer = shlex.shlex(text[:request_limit], posix=True, punctuation_chars=';')
         lexer.whitespace_split = True
         tokens = []
         for token in lexer:
             if token == ';':
+                ended = True
                 break
             tokens.append(token)
     except ValueError:
+        if truncated:
+            raise ValueError('Первый запрос слишком большой. Скопируйте только строку messages: Copy as cURL.') from None
         raise ValueError('Не удалось прочитать запрос. Используйте Copy as cURL (bash).') from None
+    if truncated and not ended:
+        raise ValueError('Первый запрос слишком большой. Скопируйте только строку messages: Copy as cURL.')
     if not tokens or tokens[0] not in ('curl', 'curl.exe'):
         raise ValueError('Нужен запрос из Chrome: Network → Copy → Copy as cURL (bash).')
     urls = [token for token in tokens if token.startswith(('https://', 'http://'))]
