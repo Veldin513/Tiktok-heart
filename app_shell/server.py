@@ -388,6 +388,13 @@ class AppShellHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/import-chrome":
                     self._handle_import_chrome(payload)
                     return
+                if parsed.path == "/api/import-chrome-request":
+                    result = self.adapter.import_chrome_request(
+                        request_text=payload.get("request_text", ""),
+                        bot_profile_key=str(payload.get("bot_profile_key") or "") or None,
+                    )
+                    self._send_json({"ok": True, "data": result})
+                    return
                 if parsed.path == "/api/compact-browser":
                     self._handle_compact_browser(payload)
                     return

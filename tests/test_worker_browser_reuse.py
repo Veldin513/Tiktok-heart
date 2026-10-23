@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,38 @@ class FakeContext:
 
     def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.parametrize('navigation_fails', [False, True])
+def test_browser_self_test_closes_context_before_playwright_stops(monkeypatch, navigation_fails):
+    events = []
+    context = FakeContext()
+    context.page.url = 'https://www.tiktok.com/messages'
+
+    @contextmanager
+    def fake_playwright():
+        events.append('start')
+        try:
+            yield object()
+        finally:
+            events.append('stop')
+
+    if navigation_fails:
+        def fail_navigation(*_args, **_kwargs):
+            raise RuntimeError('navigation failed')
+        context.page.goto = fail_navigation
+    monkeypatch.setattr(checker, 'sync_playwright', fake_playwright)
+    monkeypatch.setattr(checker, 'init_work_browser', lambda *_args: context)
+    monkeypatch.setattr(checker, 'apply_stealth_script', lambda _page: None)
+    monkeypatch.setattr(checker, 'apply_work_resource_filter', lambda _page: None)
+    monkeypatch.setattr(checker, 'detect_captcha', lambda *_args, **_kwargs: {'found': False})
+    monkeypatch.setattr(checker, 'is_logged_in', lambda _page: True)
+    monkeypatch.setattr(checker, 'safe_close_context', lambda *_args: events.append('close'))
+
+    result = checker.run_browser_self_test()
+
+    assert events == ['start', 'close', 'stop']
+    assert result['ok'] is not navigation_fails
 
 
 def test_open_logged_in_work_browser_reuses_authorized_context(monkeypatch) -> None:

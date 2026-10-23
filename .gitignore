@@ -17,6 +17,7 @@ venv/
 node_modules/
 dist/
 playwright-report/
+.playwright-browsers/
 
 # Rust / Tauri
 target/

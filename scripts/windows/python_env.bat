@@ -4,6 +4,7 @@ set "PY="
 set "PYW="
 
 if defined YARA_PYTHON if exist "%YARA_PYTHON%" set "PY=%YARA_PYTHON%"
+for %%I in ("%~dp0..\..") do if not defined PY if exist "%%~fI\.venv\Scripts\python.exe" set "PY=%%~fI\.venv\Scripts\python.exe"
 
 for %%P in (
   "%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe"

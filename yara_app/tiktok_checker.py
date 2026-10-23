@@ -665,27 +665,28 @@ def run_browser_self_test() -> dict[str, Any]:
 
     try:
         with sync_playwright() as playwright:
-            with local_phase('launch_work_browser'):
-                context = init_work_browser(playwright, PATHS.user_data_dir)
-                result['opened_browser'] = True
-            page = context.pages[0] if context.pages else context.new_page()
-            with local_phase('prepare_page'):
-                apply_stealth_script(page)
-                apply_work_resource_filter(page)
-            with local_phase('goto_messages'):
-                page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
-                result['url'] = getattr(page, 'url', '') or ''
-            with local_phase('captcha_probe'):
-                result['captcha'] = detect_captcha(page, timeout_ms=700)
-            with local_phase('auth_probe'):
-                result['logged_in'] = bool(is_logged_in(page))
-                result['url'] = getattr(page, 'url', '') or result.get('url', '')
+            try:
+                with local_phase('launch_work_browser'):
+                    context = init_work_browser(playwright, PATHS.user_data_dir)
+                    result['opened_browser'] = True
+                page = context.pages[0] if context.pages else context.new_page()
+                with local_phase('prepare_page'):
+                    apply_stealth_script(page)
+                    apply_work_resource_filter(page)
+                with local_phase('goto_messages'):
+                    page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
+                    result['url'] = getattr(page, 'url', '') or ''
+                with local_phase('captcha_probe'):
+                    result['captcha'] = detect_captcha(page, timeout_ms=700)
+                with local_phase('auth_probe'):
+                    result['logged_in'] = bool(is_logged_in(page))
+                    result['url'] = getattr(page, 'url', '') or result.get('url', '')
+            finally:
+                safe_close_context(context, page)
         result['ok'] = bool(result['opened_browser']) and bool(result['logged_in']) and not bool(result['captcha'].get('found'))
     except Exception as exc:  # noqa: BLE001
         result['ok'] = False
         result['error'] = str(exc)
-    finally:
-        safe_close_context(context, page)
     return result
 
 

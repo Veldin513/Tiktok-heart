@@ -9,9 +9,10 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -750,6 +751,19 @@ class ProjectAdapter:
             errors.append("В staged-профиле отсутствуют настройки браузера.")
         if not local_state_path.is_file():
             errors.append("В staged-профиле отсутствует файл Local State.")
+        elif browser_profile_needs_recovery(user_data_dir):
+            errors.append('Windows не может расшифровать ключ cookies этого профиля. Текущий профиль сохранён без изменений.')
+
+        if cookies_path.is_file():
+            with closing(sqlite3.connect(cookies_path)) as database:
+                columns = {row[1] for row in database.execute('PRAGMA table_info(cookies)')}
+                if 'encrypted_value' in columns:
+                    protected = database.execute(
+                        "SELECT COUNT(*) FROM cookies WHERE (host_key = 'tiktok.com' OR host_key LIKE '%.tiktok.com') "
+                        'AND substr(encrypted_value, 1, 3) = ?', (b'v20',),
+                    ).fetchone()[0]
+                    if protected:
+                        errors.append('Cookies TikTok защищены ключом приложения Chrome (v20). Простое копирование не переносит эту авторизацию. Текущий профиль сохранён без изменений.')
 
         cookies = import_details.get("cookies") if isinstance(import_details.get("cookies"), dict) else {}
         kept_cookies = int(cookies.get("kept") or 0)
@@ -780,6 +794,8 @@ class ProjectAdapter:
     ) -> tuple[Path | None, dict[str, Any]]:
         """Atomically promote a staged profile and restore the old one on error."""
         backup_path: Path | None = None
+        old_profile_moved = False
+        had_profile = user_data_dir.exists()
         rollback = {"attempted": False, "restored": False, "error": ""}
         try:
             if user_data_dir.exists():
@@ -789,13 +805,14 @@ class ProjectAdapter:
                     suffix += 1
                     backup_path = browser_dir / f"user_data_before_chrome_import_{timestamp}_{suffix}"
                 shutil.move(str(user_data_dir), str(backup_path))
+                old_profile_moved = True
             shutil.move(str(staged_user_data_dir), str(user_data_dir))
         except Exception:
             rollback["attempted"] = True
             try:
-                if user_data_dir.exists():
+                if user_data_dir.exists() and (old_profile_moved or not had_profile):
                     self._remove_profile_path_for_compact(user_data_dir, browser_dir)
-                if backup_path and backup_path.exists():
+                if old_profile_moved and backup_path and backup_path.exists():
                     shutil.move(str(backup_path), str(user_data_dir))
                     rollback["restored"] = True
             except Exception as rollback_exc:  # noqa: BLE001
@@ -907,15 +924,6 @@ class ProjectAdapter:
                 shutil.rmtree(temp_user_data_dir, ignore_errors=True)
             raise
 
-        auth_backoff_removed = False
-        auth_backoff_reset_error = ""
-        if auth_backoff_path.exists():
-            try:
-                auth_backoff_path.unlink()
-                auth_backoff_removed = True
-            except OSError as exc:
-                auth_backoff_reset_error = str(exc)
-
         return {
             "chrome_profile_id": chrome_profile_id,
             "source_profile": str(source_profile),
@@ -926,10 +934,47 @@ class ProjectAdapter:
             "rollback": rollback,
             "validation": validation,
             "size_bytes": self._dir_size_bytes(user_data_dir),
-            "auth_backoff_removed": auth_backoff_removed,
-            "auth_backoff_reset_error": auth_backoff_reset_error,
+            "auth_backoff_removed": False,
+            "auth_backoff_reset_error": "",
+            "auth_backoff_preserved": auth_backoff_path.exists(),
             **import_details,
         }
+
+    def import_chrome_request(self, *, request_text: str, bot_profile_key: str | None = None) -> dict[str, Any]:
+        from yara_app.auth_flow import clear_auth_backoff
+        from yara_app.session_import import cookies_from_curl, prepare_session
+
+        cookies = cookies_from_curl(request_text)
+        profile_root = self._bot_profile_root(bot_profile_key)
+        if self.get_worker_status().running:
+            raise RuntimeError('Остановите worker перед переносом авторизации, затем нажмите кнопку ещё раз.')
+        browser_dir = profile_root / 'browser'
+        browser_dir.mkdir(parents=True, exist_ok=True)
+        lock = browser_dir / '.session_import.lock'
+        try:
+            lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise RuntimeError('Импорт уже выполняется. Дождитесь результата.') from None
+        try:
+            with tempfile.TemporaryDirectory(prefix='session_import_', dir=browser_dir) as temp_dir:
+                staged = Path(temp_dir) / 'user_data'
+                prepare_session(staged, cookies)
+                if self.get_worker_status().running:
+                    raise RuntimeError('Worker был запущен во время проверки. Остановите его и повторите импорт.')
+                destination = browser_dir / 'user_data'
+                backup = self.create_auth_backup(profile_root.name) if destination.exists() else None
+                previous, _rollback = self._commit_staged_browser_profile(
+                    browser_dir=browser_dir, user_data_dir=destination, staged_user_data_dir=staged,
+                    timestamp=time.strftime('%Y%m%d_%H%M%S'),
+                )
+                clear_auth_backoff(profile_root / 'state' / 'auth_backoff.json')
+                return {
+                    'bot_profile_key': profile_root.name, 'verified': True, 'cookies_count': len(cookies),
+                    'backup': str(previous) if previous else '', 'pre_import_auth_backup': backup,
+                }
+        finally:
+            os.close(lock_fd)
+            lock.unlink(missing_ok=True)
 
     def _remove_profile_path_for_compact(self, path: Path, allowed_root: Path) -> int:
         if not path.exists():
@@ -2753,7 +2798,7 @@ class ProjectAdapter:
                 add_signal("auth_backoff", "Auth backoff", "Активен", "warning",
                            f"Осталось примерно {int(browser_profile.get('auth_backoff_left') or 0) // 60} мин.")
                 add_issue("warning", "TikTok auth временно заблокирован",
-                          f"Осталось примерно {int(browser_profile.get('auth_backoff_left') or 0) // 60} мин. Импорт из Chrome сбрасывает этот локальный флаг.",
+                          f"Осталось примерно {int(browser_profile.get('auth_backoff_left') or 0) // 60} мин. Пауза снимается после подтверждения действующей сессии.",
                           "Если в обычном Chrome вход есть, импортируй TikTok session.")
             elif (
                 browser_profile.get("exists")

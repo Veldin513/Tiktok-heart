@@ -1582,6 +1582,13 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.session-request {
+  min-height: 110px;
+  max-height: 180px;
+  resize: vertical;
+  -webkit-text-security: disc;
+}
+
 .backup-item {
   display: grid;
   grid-template-columns: auto 1fr;

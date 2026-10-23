@@ -54,6 +54,7 @@ function Resolve-Python {
         $candidates += $env:YARA_PYTHON
     }
     $candidates += @(
+        (Join-Path $repoRoot ".venv\Scripts\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.14-64\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python314\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.13-64\python.exe"),

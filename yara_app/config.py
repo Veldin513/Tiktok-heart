@@ -12,6 +12,11 @@ APP_DIR = Path(__file__).resolve().parent
 BASE_DIR = Path(os.getenv("YARA_BASE_DIR", str(APP_DIR.parent))).resolve()
 BOT_NAME = 'tiktok_heart_bot'
 
+# Keep a project-local browser installation usable outside packaged app sandboxes.
+_LOCAL_BROWSERS_DIR = BASE_DIR / '.playwright-browsers'
+if _LOCAL_BROWSERS_DIR.is_dir():
+    os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(_LOCAL_BROWSERS_DIR))
+
 # Browser/runtime defaults
 DEFAULT_COOLDOWN_HOURS = 12
 TIKTOK_BROWSER_CHANNEL = os.getenv('TIKTOK_BROWSER_CHANNEL', '').strip()

@@ -234,10 +234,26 @@
             </article>
             <article class="panel">
               <div class="panel-title">Импорт из Chrome</div>
+              <label class="field-label" for="bot-profile">Куда сохранить авторизацию</label>
+              <select id="bot-profile" class="select"></select>
+              <p class="hint">Один раз перенесите текущий вход из Chrome. После этого приложение будет использовать сохранённую сессию автоматически.</p>
+              <ol class="hint">
+                <li>В Chrome с выполненным входом откройте tiktok.com/messages.</li>
+                <li>Нажмите F12 → Network (Сеть), затем Ctrl+R.</li>
+                <li>Найдите первую строку messages (тип document). Правая кнопка → Copy → Copy as cURL (bash). Если видите только Copy as cURL — выберите его.</li>
+                <li>Вставьте скопированное ниже и нажмите «Проверить и сохранить вход».</li>
+              </ol>
+              <label class="field-label" for="session-request">Запрос из Chrome</label>
+              <textarea id="session-request" class="text-editor session-request" spellcheck="false" autocomplete="off" placeholder="Вставьте сюда скопированный запрос (Ctrl+V)"></textarea>
+              <button id="session-import-button" class="btn primary full">Проверить и сохранить вход</button>
+              <p id="session-import-result" class="hint backup-status" role="status" aria-live="polite"></p>
+              <p class="hint">Проверка занимает до 90 секунд. При успехе создаётся резервная копия текущего входа. Содержимое запроса не сохраняется в логах; поле очищается после отправки.</p>
+              <details class="disclosure browser-disclosure">
+                <summary>Старый способ: копирование профиля Chrome</summary>
+                <div class="disclosure-content">
+              <p class="hint">Для старых профилей Chrome. Современные защищённые cookies этим способом не переносятся.</p>
               <label class="field-label" for="chrome-profile">Профиль Chrome</label>
               <select id="chrome-profile" class="select"></select>
-              <label class="field-label" for="bot-profile">Профиль бота</label>
-              <select id="bot-profile" class="select"></select>
               <label class="field-label" for="import-mode">Режим импорта</label>
               <select id="import-mode" class="select">
                   <option value="tiktok_session">Только авторизация TikTok</option>
@@ -245,7 +261,9 @@
               </select>
               <button id="import-button" class="btn primary full">Импортировать профиль</button>
               <button id="compact-browser-button" class="btn secondary full">Очистить кэш профиля</button>
-              <p class="hint">Рекомендуемый режим переносит авторизацию TikTok и небольшие рабочие данные. Кэш, расширения, историю и фоновые данные браузера он не копирует. Перед импортом закройте Chrome и остановите worker.</p>
+              <p class="hint">Перед копированием профиля закройте Chrome и остановите worker.</p>
+                </div>
+              </details>
             </article>
           </div>
         </section>

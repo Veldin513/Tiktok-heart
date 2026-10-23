@@ -1801,6 +1801,31 @@ function bindActions() {
     }
   });
 
+  $("#session-import-button").addEventListener("click", async () => {
+    const button = $("#session-import-button");
+    const input = $("#session-request");
+    const status = $("#session-import-result");
+    if (!input.value.trim()) {
+      status.textContent = "Сначала скопируйте запрос в Chrome по инструкции выше и вставьте его в поле.";
+      input.focus();
+      return;
+    }
+    button.disabled = true;
+    status.textContent = "Проверяем вход в отдельном профиле браузера… Дождитесь результата.";
+    try {
+      const body = JSON.stringify({ request_text: input.value, bot_profile_key: $("#bot-profile").value });
+      input.value = "";
+      const result = await api("/api/import-chrome-request", { method: "POST", body });
+      status.textContent = `Вход подтверждён и сохранён в профиле «${result.bot_profile_key}». Можно запускать worker.${result.backup ? " Предыдущая авторизация сохранена в резервной копии." : ""}`;
+      toast("Авторизация TikTok сохранена");
+      await refresh();
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   $("#import-button").addEventListener("click", async () => {
     const button = $("#import-button");
     const confirmed = await confirmAction({
@@ -1824,7 +1849,7 @@ function bindActions() {
       const cookieText = cookies.copied ? ` · записей авторизации: ${cookies.kept}/${cookies.before}` : "";
       const modeText = result.copy_mode === "tiktok_session" ? "авторизация TikTok" : "полный профиль";
       const recoveryText = result.pre_import_auth_backup ? " · создана резервная копия" : "";
-      const backoffText = result.auth_backoff_reset_error ? " · проверьте паузу авторизации" : "";
+      const backoffText = result.auth_backoff_preserved ? " · пауза входа сохранена до подтверждения сессии" : "";
       toast(`Импортирована ${modeText} · ${formatBytes(result.size_bytes)}${cookieText}${recoveryText}${backoffText}`);
       await refresh();
     } catch (error) {

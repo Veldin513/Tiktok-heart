@@ -7,6 +7,7 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from yara_app.config import AUTH_BROWSER_HEADLESS, TIKTOK_BROWSER_CHANNEL, WORK_BROWSER_HEADLESS
 
@@ -304,7 +305,9 @@ def notify_auth_rate_limit(tg, auth_runtime: dict, seconds_left: int) -> None:
 
 
 def is_logged_in(page) -> bool:
-    if "tiktok.com/messages" in page.url:
+    url = urlparse(page.url)
+    host = url.hostname or ''
+    if (host == 'tiktok.com' or host.endswith('.tiktok.com')) and (url.path == '/messages' or url.path.startswith('/messages/')):
         return True
 
     logged_in_elements = [

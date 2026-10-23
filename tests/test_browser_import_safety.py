@@ -66,12 +66,13 @@ def test_session_import_validates_staging_and_creates_recovery_backups(
 
     assert result["validation"]["ok"] is True
     assert result["validation"]["tiktok_cookies"] == 1
-    assert result["auth_backoff_removed"] is True
+    assert result["auth_backoff_removed"] is False
+    assert result["auth_backoff_preserved"] is True
     assert result["auth_backoff_reset_error"] == ""
     assert Path(result["backup"]).is_dir()
     assert (Path(result["backup"]) / "Local State").read_text(encoding="utf-8") == "old-profile"
     assert Path(result["pre_import_auth_backup"]["path"]).is_file()
-    assert not (tmp_path / "profiles" / "main" / "state" / "auth_backoff.json").exists()
+    assert (tmp_path / "profiles" / "main" / "state" / "auth_backoff.json").exists()
 
 
 def test_staged_browser_commit_restores_old_profile_when_promotion_fails(
@@ -105,3 +106,37 @@ def test_staged_browser_commit_restores_old_profile_when_promotion_fails(
     assert (active / "Local State").read_text(encoding="utf-8") == "old-profile"
     assert not (active / "partial").exists()
     assert not list(browser_dir.glob("user_data_before_chrome_import_*"))
+
+
+def test_protected_chrome_import_preserves_current_profile_and_pause(tmp_path, monkeypatch):
+    adapter, chrome_root = _prepare_adapter(tmp_path, monkeypatch)
+    cookies_path = chrome_root / 'Default/Network/Cookies'
+    cookies_path.parent.mkdir(parents=True)
+    with sqlite3.connect(cookies_path) as database:
+        database.execute('CREATE TABLE cookies (host_key TEXT, encrypted_value BLOB)')
+        database.execute('INSERT INTO cookies VALUES (?, ?)', ('.tiktok.com', b'v20protected'))
+    old_profile = tmp_path / 'profiles/main/browser/user_data'
+    _write(old_profile / 'Local State', 'old-profile')
+    pause = tmp_path / 'profiles/main/state/auth_backoff.json'
+    _write(pause, '{"until": 9999999999}')
+
+    with pytest.raises(RuntimeError, match='v20'):
+        adapter.import_google_chrome_profile(bot_profile_key='main')
+
+    assert (old_profile / 'Local State').read_text() == 'old-profile'
+    assert pause.exists()
+    assert not list(old_profile.parent.glob('user_data_import_tmp_*'))
+
+
+def test_unreadable_windows_cookie_key_rejects_import_without_replacing_profile(tmp_path, monkeypatch):
+    adapter, chrome_root = _prepare_adapter(tmp_path, monkeypatch)
+    _write_cookies(chrome_root / 'Default/Network/Cookies', ['.tiktok.com'])
+    old_profile = tmp_path / 'profiles/main/browser/user_data'
+    _write(old_profile / 'Local State', 'old-profile')
+    monkeypatch.setattr('yara_app.project_adapter.browser_profile_needs_recovery', lambda _path: True)
+
+    with pytest.raises(RuntimeError, match='Windows'):
+        adapter.import_google_chrome_profile(bot_profile_key='main')
+
+    assert (old_profile / 'Local State').read_text() == 'old-profile'
+    assert not list(old_profile.parent.glob('user_data_import_tmp_*'))
