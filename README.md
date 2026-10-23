@@ -21,7 +21,7 @@ TikTok Heart is a Windows desktop control app for a local TikTok worker. It keep
 - Optional Telegram control bot.
 - Authorization backups for the selected profile.
 - Public-safe source backups that exclude private runtime data.
-- Diagnostics, logs, health checks, and maintenance tools.
+- Diagnostics, logs, launch readiness checks, and maintenance tools.
 
 ### 2.2 Highlights
 
@@ -189,7 +189,7 @@ TikTok Heart - Windows-приложение для локального TikTok w
 - Опциональный Telegram-бот для управления.
 - Backup авторизации выбранного профиля.
 - Backup исходников без приватных runtime-данных.
-- Диагностика, логи, здоровье проекта и обслуживание.
+- Диагностика, логи, готовность к запуску и обслуживание.
 
 ### Что нового в 2.2
 

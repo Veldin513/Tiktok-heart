@@ -109,6 +109,24 @@ def test_mid_run_session_loss_stops_dispatch(tmp_path, monkeypatch):
     assert (tmp_path / 'session_import_required.json').exists()
 
 
+def test_missing_metadata_does_not_block_authenticated_browser(tmp_path, monkeypatch):
+    root = tmp_path / 'browser'
+    cookies = root / 'Default' / 'Network' / 'Cookies'
+    cookies.parent.mkdir(parents=True)
+    cookies.write_bytes(b'existing-encrypted-cookies')
+    monkeypatch.setattr(checker, 'PATHS', SimpleNamespace(state_dir=tmp_path / 'state', user_data_dir=root))
+    monkeypatch.setattr(checker, 'AUTH_BACKOFF_FILE', tmp_path / 'state' / 'auth_backoff.json')
+    context = FakeContext()
+    monkeypatch.setattr(checker, 'browser_profile_needs_recovery', lambda _path: False)
+    monkeypatch.setattr(checker, 'init_work_browser', lambda *_args: context)
+    monkeypatch.setattr(checker, 'detect_captcha', lambda *_a, **_kw: {'found': False})
+    monkeypatch.setattr(checker, 'wait_for_authenticated_page', lambda _page: True)
+    assert checker.open_logged_in_work_browser(object()) == (True, context, context.page)
+    assert cookies.read_bytes() == b'existing-encrypted-cookies'
+    assert not (root / 'Local State').exists()
+    assert not (tmp_path / 'state' / 'session_import_required.json').exists()
+
+
 def test_ready_targets_for_run_skips_cooldown_before_browser(monkeypatch) -> None:
     monkeypatch.delenv("WORKER_FORCE_SEND_ON_BOOT", raising=False)
 

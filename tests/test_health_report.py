@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from yara_app.project_adapter import ProjectAdapter
 
 
@@ -13,7 +15,68 @@ def _healthy_browser() -> dict[str, object]:
         "cookies_exists": True,
         "needs_recovery": False,
         "auth_backoff_left": 0,
+        "local_state_exists": True,
+        "session_validation": {"valid": True},
     }
+
+
+@pytest.mark.parametrize('change', [
+    {'session_import_required': True},
+    {'session_validation': {'valid': False}},
+])
+def test_health_does_not_mark_cookie_file_as_valid_login(tmp_path, change):
+    browser = {**_healthy_browser(), **change}
+    health = ProjectAdapter(tmp_path)._build_health(
+        False, False, True, {'unique_count': 12}, [object()], {}, {'issues': []}, browser, {'installed': True},
+    )
+    assert health['status'] == 'critical'
+    assert health['score'] <= 64
+    assert not any(item['key'] == 'browser' and item['severity'] == 'ok' for item in health['signals'])
+
+
+def test_existing_cookies_without_validation_are_unknown(tmp_path):
+    browser = {**_healthy_browser(), 'session_validation': {'valid': None}}
+    health = ProjectAdapter(tmp_path)._build_health(
+        False, False, True, {'unique_count': 12}, [object()], {}, {'issues': []}, browser, {'installed': True},
+    )
+    assert health['status'] == 'ok'
+    assert any(item['key'] == 'browser' and item['state'] == 'Не проверена' for item in health['signals'])
+
+
+@pytest.mark.parametrize('valid', [True, None])
+def test_missing_metadata_alone_does_not_block_working_profile(tmp_path, valid):
+    browser = {**_healthy_browser(), 'local_state_exists': False, 'preferences_exists': False,
+               'session_validation': {'valid': valid}}
+    health = ProjectAdapter(tmp_path)._build_health(
+        False, False, True, {'unique_count': 12}, [object()], {}, {'issues': []}, browser, {'installed': True},
+    )
+    assert health['status'] == 'ok'
+    assert health['score'] == 100
+    assert not any(item['severity'] in ('warning', 'critical') for item in health['issues'])
+    assert any(item['key'] == 'profile_metadata' and item['severity'] == 'info' for item in health['signals'])
+    assert any(item['key'] == 'browser' and item['severity'] == ('ok' if valid else 'info') for item in health['signals'])
+
+
+def test_live_and_full_browser_status_preserve_validation_marker(tmp_path):
+    import json
+    import time
+
+    adapter = ProjectAdapter(tmp_path)
+    state_dir = tmp_path / 'profiles' / 'alpha' / 'state'
+    state_dir.mkdir(parents=True)
+    (state_dir / 'session_import_required.json').write_text('{}')
+    (state_dir / 'session_validation.json').write_text(json.dumps({'valid': False, 'checked_at': time.time()}))
+    for data in [adapter.browser_profile_summary('alpha'), adapter.browser_profile_live_status('alpha')]:
+        assert data['session_import_required'] is True
+        assert data['session_validation']['valid'] is False
+
+
+def test_log_zero_success_count_cannot_hide_a_later_error(tmp_path):
+    path = tmp_path / 'worker.log'
+    path.write_text('INFO success_count=1\nERROR auth failed\nINFO success_count=0\n', encoding='utf-8')
+    summary = ProjectAdapter(tmp_path)._log_summary(path)
+    assert summary['successes'] == 1
+    assert summary['latest_result'] == 'error'
 
 
 def _flatten_text(value: object) -> list[str]:

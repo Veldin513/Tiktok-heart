@@ -259,14 +259,21 @@ function applyUiMode(mode) {
   }
 }
 
+function browserAuthStatus(browser = {}) {
+  if (browser.session_import_required || browser.session_validation?.valid === false) return { label: "Нужен вход", kind: "critical", details: "Последняя проверка не подтвердила вход; нужен свежий перенос из Chrome." };
+  if (browser.needs_recovery) return { label: "Профиль не читается", kind: "critical", details: "Windows не может расшифровать данные профиля." };
+  if (!browser.default_profile_exists || !browser.cookies_exists) return { label: "Профиль не готов", kind: "warning", details: "Проверьте профиль и перенос входа в разделе «Браузер»." };
+  if (browser.session_validation?.valid === true) return { label: "Проверена ранее", kind: "ok", details: `Последняя успешная проверка: ${formatDate(browser.session_validation.checked_at)}. Текущий вход удалённо не проверялся.` };
+  return { label: "Вход не проверен", kind: "info", details: "Cookies сохранены; результат проверки входа ещё не записан. Это не означает потерю авторизации." };
+}
+
 function liveHealth(diag = {}) {
   const browser = diag.browser_profile || {};
   const schedule = diag.worker_schedule || {};
   const telegramReady = Boolean(diag.telegram_ready);
   const issues = [];
-  if (!browser.default_profile_exists) {
-    issues.push({ severity: "warning", title: "Профиль браузера не готов", details: "Откройте раздел «Браузер» и проверьте авторизацию." });
-  }
+  const auth = browserAuthStatus(browser);
+  if (auth.kind !== "ok") issues.push({ severity: auth.kind, title: auth.label, details: auth.details });
   if (!schedule.installed) {
     issues.push({ severity: "info", title: "Автозапуск выключен", details: "Worker запускается только вручную." });
   }
@@ -274,15 +281,16 @@ function liveHealth(diag = {}) {
     issues.push({ severity: "info", title: "Telegram не настроен", details: "Это не мешает работе worker." });
   }
   const warningCount = issues.filter((item) => item.severity === "warning").length;
-  const score = Math.max(0, 100 - warningCount * 25);
-  const status = warningCount ? "warning" : "ok";
+  const critical = issues.some((item) => item.severity === "critical");
+  const score = Math.min(critical ? 64 : 100, Math.max(0, 100 - warningCount * 25));
+  const status = critical ? "critical" : (warningCount ? "warning" : "ok");
   return {
     score,
     status,
-    label: status === "ok" ? "Всё готово" : "Нужна проверка",
+    label: status === "ok" ? "Локальные проверки пройдены" : "Нужна проверка",
     summary: status === "ok" ? "Основные компоненты доступны." : "Есть один или несколько пунктов для проверки.",
     issues,
-    recommendations: issues.filter((item) => item.severity === "warning").map((item) => item.details),
+    recommendations: issues.filter((item) => ["critical", "warning"].includes(item.severity)).map((item) => item.details),
   };
 }
 
@@ -839,8 +847,8 @@ function renderOverviewSummary(diag) {
   const scheduleStale = scheduleIsStale(schedule);
 
   const cards = [
-    ["Здоровье", `${health.score || 0}/100`, health.status || "info"],
-    ["Авторизация", browser.cookies_exists && !browser.needs_recovery ? "готова" : "проверить", browser.cookies_exists ? "ok" : "warn"],
+    ["Готовность", `${health.score || 0}/100`, health.status || "info"],
+    ["Авторизация", browserAuthStatus(browser).label, browserAuthStatus(browser).kind],
     ["Автозапуск", schedule.installed ? (scheduleStale ? "проверить" : "включён") : "выключен", scheduleKind(schedule)],
     ["Профиль", stateData.active_profile || "—", "info"],
   ];
@@ -879,7 +887,7 @@ function renderOverviewSummary(diag) {
   ].filter(Boolean).join(" + ") || "выключен";
   const recommendations = (health.recommendations || []).slice(0, 5);
   report.textContent = [
-    `Здоровье           : ${health.score || 0}/100 · ${health.summary || "—"}`,
+    `Готовность         : ${health.score || 0}/100 · ${health.summary || "—"}`,
     `Активный профиль  : ${stateData.active_profile || "—"}`,
     `Cookies Chromium   : ${browser.cookies_exists ? "есть" : "нет"}`,
     `Размер профиля     : ${formatBytes(browser.size_bytes)}`,
@@ -969,7 +977,8 @@ function renderBrowser(browser) {
     ["Размер", formatBytes(browser.size_bytes)],
     ["Основной профиль", browser.default_profile_exists ? "готов" : "не найден"],
     ["Настройки браузера", browser.local_state_exists ? "готовы" : "не найдены"],
-    ["Авторизация", browser.session_import_required ? "нужен свежий перенос из Chrome" : (browser.cookies_exists ? "cookies сохранены; вход проверяется при запуске" : "не найдена")],
+    ["Авторизация", browserAuthStatus(browser).label],
+    ["Проверка входа", browserAuthStatus(browser).details],
     ["Пауза авторизации", browser.auth_backoff_left ? `${Math.ceil(browser.auth_backoff_left / 60)} мин` : "нет"],
     ["Резервные копии", backupSummary(browser.backup_count, browser.backup_bytes)],
     ["Копии авторизации", backupSummary(browser.auth_backup_count, browser.auth_backup_bytes)],
@@ -1221,6 +1230,13 @@ async function refresh(options = {}) {
     status?.classList.remove("error");
     if (useLive) {
       state.lastLiveAt = Date.now();
+      const authKeys = ["profile_key", "exists", "local_state_exists", "preferences_exists", "cookies_exists", "needs_recovery", "session_import_required", "session_validation"];
+      const oldBrowser = state.diagnostics?.browser_profile || {};
+      const newBrowser = diag.browser_profile || {};
+      if (state.fullDiagnosticsLoaded && authKeys.some((key) => JSON.stringify(oldBrowser[key]) !== JSON.stringify(newBrowser[key]))) {
+        state.refreshQueued = true;
+        state.refreshQueuedFull = true;
+      }
       const merged = {
         ...(state.diagnostics || {}),
         ...diag,

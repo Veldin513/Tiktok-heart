@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tempfile
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -46,12 +47,29 @@ def _launch_persistent_chromium(playwright, user_data_dir, *, headless: bool, ar
         'user_data_dir': user_data_dir,
         'headless': headless,
         'viewport': {'width': 1280, 'height': 720},
+        'ignore_default_args': ['--enable-automation'],
     }
-    if args is not None:
-        kwargs['args'] = args
+    kwargs['args'] = [*(args or []), '--disable-blink-features=AutomationControlled']
     if TIKTOK_BROWSER_CHANNEL:
         kwargs['channel'] = TIKTOK_BROWSER_CHANNEL
     return playwright.chromium.launch_persistent_context(**kwargs)
+
+
+def record_session_validation(state_dir: Path, *, valid: bool, source: str, reason: str = '') -> None:
+    """Store only validation metadata, never cookies or page contents."""
+    temporary = None
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=state_dir, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump({'valid': valid, 'checked_at': time.time(), 'source': source, 'reason': reason}, handle)
+        temporary.replace(state_dir / 'session_validation.json')
+    except OSError:
+        logger.warning('Не удалось сохранить время проверки авторизации.')
+    finally:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
 
 
 def block_heavy_content(route, block_media: bool):

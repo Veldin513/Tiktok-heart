@@ -20,6 +20,7 @@ from yara_app.auth_flow import (
     clear_auth_backoff,
     init_work_browser,
     is_logged_in,
+    record_session_validation,
     safe_close_context,
     wait_for_authenticated_page,
 )
@@ -545,6 +546,7 @@ def mark_session_import_required(reason: str) -> None:
     marker = PATHS.state_dir / 'session_import_required.json'
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({'reason': reason, 'at': time.time()}), encoding='utf-8')
+    record_session_validation(PATHS.state_dir, valid=False, source='worker', reason=reason)
     logger.warning('Работа остановлена: нужен новый перенос входа из Chrome. Причина: %s', reason)
 
 
@@ -584,6 +586,7 @@ def open_logged_in_work_browser(playwright):
             mark_session_import_required('session_not_confirmed')
             return False, None, None
         clear_auth_backoff(AUTH_BACKOFF_FILE)
+        record_session_validation(PATHS.state_dir, valid=True, source='worker')
         keep = True
         return True, context, page
     finally:
@@ -642,6 +645,9 @@ def run_browser_self_test() -> dict[str, Any]:
             finally:
                 safe_close_context(context, page)
         result['ok'] = bool(result['opened_browser']) and bool(result['logged_in']) and not bool(result['captcha'].get('found'))
+        record_session_validation(PATHS.state_dir, valid=result['ok'], source='self_test', reason='' if result['ok'] else 'session_not_confirmed')
+        if not result['ok']:
+            mark_session_import_required('self_test_not_confirmed')
     except Exception as exc:  # noqa: BLE001
         result['ok'] = False
         result['error'] = str(exc)

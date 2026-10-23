@@ -501,7 +501,7 @@ class AppShellHandler(BaseHTTPRequestHandler):
             "TikTok Heart diagnostics",
             "",
             "Summary",
-            f"Health: {health.get('score', 0)}/100 · {health.get('summary') or '—'}",
+            f"Готовность: {health.get('score', 0)}/100 · {health.get('summary') or '—'}",
             f"Worker: {'running' if dict(diag.get('worker') or {}).get('running') else 'stopped'}",
             f"Telegram: {'running' if dict(diag.get('telegram_bot') or {}).get('running') else 'stopped'}",
             f"Active profile: {dict(diag.get('state') or {}).get('active_profile') or '—'}",

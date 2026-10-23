@@ -994,7 +994,7 @@ class ProjectAdapter:
         }
 
     def import_chrome_request(self, *, request_text: str, bot_profile_key: str | None = None) -> dict[str, Any]:
-        from yara_app.auth_flow import clear_auth_backoff
+        from yara_app.auth_flow import clear_auth_backoff, record_session_validation
         from yara_app.session_import import cookies_from_curl, prepare_session
 
         cookies = cookies_from_curl(request_text)
@@ -1022,6 +1022,7 @@ class ProjectAdapter:
                 )
                 clear_auth_backoff(profile_root / 'state' / 'auth_backoff.json')
                 (profile_root / 'state' / 'session_import_required.json').unlink(missing_ok=True)
+                record_session_validation(profile_root / 'state', valid=True, source='import')
                 return {
                     'bot_profile_key': profile_root.name, 'verified': True, 'cookies_count': len(cookies),
                     'backup': str(previous) if previous else '', 'pre_import_auth_backup': backup,
@@ -1202,6 +1203,15 @@ class ProjectAdapter:
             return 0
         return max(0, int(until_ts - time.time()))
 
+    def _session_validation_summary(self, profile_root: Path) -> dict[str, Any]:
+        payload = self._read_json(profile_root / 'state' / 'session_validation.json', {})
+        if not isinstance(payload, dict) or type(payload.get('valid')) is not bool:
+            return {'valid': None, 'checked_at': None}
+        checked_at = payload.get('checked_at')
+        if not isinstance(checked_at, (int, float)) or not 0 < checked_at <= time.time() + 60:
+            return {'valid': None, 'checked_at': None}
+        return {'valid': payload['valid'], 'checked_at': checked_at}
+
     def browser_profile_summary(self, profile_key: str | None = None) -> dict[str, Any]:
         profile_root = self._bot_profile_root(profile_key)
         browser_dir = profile_root / "browser"
@@ -1285,6 +1295,7 @@ class ProjectAdapter:
             "modified_at": user_data_stat.st_mtime if user_data_stat else None,
             "needs_recovery": needs_recovery,
             "session_import_required": (profile_root / 'state' / 'session_import_required.json').exists(),
+            "session_validation": self._session_validation_summary(profile_root),
             "auth_backoff_exists": auth_backoff_path.exists(),
             "auth_backoff_left": auth_backoff_left,
             "auth_backoff_path": str(auth_backoff_path),
@@ -1322,6 +1333,8 @@ class ProjectAdapter:
             "cookies_exists": cookies_path.exists(),
             "cookies_path": str(cookies_path),
             "needs_recovery": needs_recovery,
+            "session_import_required": (profile_root / 'state' / 'session_import_required.json').exists(),
+            "session_validation": self._session_validation_summary(profile_root),
             "auth_backoff_exists": auth_backoff_path.exists(),
             "auth_backoff_left": self._auth_backoff_seconds_left(auth_backoff_path) if auth_backoff_path.exists() else 0,
             "backup_count": len(self._browser_backup_dirs(browser_dir)),
@@ -2698,19 +2711,25 @@ class ProjectAdapter:
         lines = self.tail_file(path, lines=n)
         errors = warnings = successes = 0
         last_error = last_success = None
+        latest_result = None
         for line in lines:
             low = line.lower()
             if "error" in low or "[error]" in low:
                 errors += 1
                 last_error = line[:120]
+                latest_result = 'error'
             elif "warning" in low or "[warning]" in low:
                 warnings += 1
-            if "\u2705" in line or "success" in low or "\u0443\u0441\u043f\u0435\u0445" in low:
+            positive_count = re.search(r'\bsuccess(?:_count)?\s*[=:]\s*[1-9]\d*\b', low)
+            positive_word = re.search(r'\bsuccess(?:ful(?:ly)?)?\b(?!\s*[=:])|\bуспех\b', low)
+            if "\u2705" in line or positive_count or positive_word:
                 successes += 1
                 last_success = line[:120]
+                latest_result = 'success'
         return {
             "errors": errors, "warnings": warnings, "successes": successes,
             "last_error": last_error, "last_success": last_success,
+            "latest_result": latest_result,
         }
 
     def _build_health(
@@ -2754,7 +2773,10 @@ class ProjectAdapter:
         content_score = 100
         control_score = 100
 
-        if worker_running:
+        session_invalid = bool(browser_profile.get('session_import_required')) or (browser_profile.get('session_validation') or {}).get('valid') is False
+        if session_invalid and not worker_running:
+            add_signal("worker", "Worker", "Нужен вход", "warning", "Запуски остановлены до подтверждения новой сессии.")
+        elif worker_running:
             add_signal("worker", "Worker", "Запущен", "ok", "Worker сейчас выполняется.")
         elif worker_schedule.get("installed"):
             add_signal("worker", "Worker", "Ожидает", "ok", "Worker остановлен сейчас, но запустится по расписанию.")
@@ -2821,7 +2843,13 @@ class ProjectAdapter:
                       "Создай или импортируй профиль бота.")
 
         if browser_profile:
-            if browser_profile.get("needs_recovery"):
+            if session_invalid:
+                content_score -= 60
+                add_signal("browser", "Авторизация", "Нужен вход", "critical", "Последняя проверка не подтвердила сессию TikTok.")
+                add_issue("critical", "Авторизация TikTok не подтверждена",
+                          "Файл cookies не доказывает действующий вход. Повторные попытки worker остановлены.",
+                          "Войдите в обычном Chrome и выполните свежий перенос через раздел «Браузер».")
+            elif browser_profile.get("needs_recovery"):
                 content_score -= 60
                 add_signal("browser", "Авторизация", "Сломана", "critical",
                            "Старый профиль Chromium не читается после переустановки Windows.")
@@ -2835,12 +2863,6 @@ class ProjectAdapter:
                 add_issue("warning", "Chromium-профиль бота пуст",
                           "У worker нет готового browser/user_data. Импортируй профиль из Chrome или пройди авторизацию.",
                           "Импортируй TikTok session из Google Chrome или войди в TikTok вручную.")
-            elif not browser_profile.get("preferences_exists"):
-                content_score -= 15
-                add_signal("browser", "Авторизация", "Неполно", "warning",
-                           "В профиле нет Default/Preferences.")
-                add_issue("warning", "Chromium-профиль выглядит неполным",
-                          "В профиле нет Default/Preferences; авторизация может не сохраниться.")
             elif not browser_profile.get("cookies_exists"):
                 content_score -= 20
                 add_signal("browser", "Авторизация", "Cookies нет", "warning",
@@ -2858,12 +2880,21 @@ class ProjectAdapter:
             elif (
                 browser_profile.get("exists")
                 and browser_profile.get("default_profile_exists")
-                and browser_profile.get("preferences_exists")
                 and browser_profile.get("cookies_exists")
                 and not browser_profile.get("needs_recovery")
+                and not session_invalid
             ):
-                add_signal("browser", "Авторизация", "Готово", "ok",
-                           "Chromium-профиль и cookies найдены.")
+                validation = browser_profile.get('session_validation') or {}
+                if validation.get('valid') is True:
+                    add_signal("browser", "Авторизация", "Проверена ранее", "ok", "Последняя проверка входа успешна. Это не гарантирует, что TikTok не завершил сессию позже.")
+                else:
+                    add_signal("browser", "Авторизация", "Не проверена", "info", "Cookies сохранены; результат проверки входа ещё не записан. Это не означает потерю авторизации.")
+            if browser_profile.get("exists") and (
+                not browser_profile.get("local_state_exists", True)
+                or not browser_profile.get("preferences_exists")
+            ):
+                add_signal("profile_metadata", "Файлы профиля", "Не все найдены", "info",
+                           "Диагностика не нашла часть служебных файлов. Это не подтверждает отказ входа; работающий профиль переносить заново не нужно.")
         if chrome_profiles is not None and not chrome_profiles:
             add_signal("chrome", "Chrome import", "Недоступен", "info",
                        "Профили Google Chrome не найдены.")
@@ -2937,10 +2968,12 @@ class ProjectAdapter:
                        f"{log_summary_worker['errors']} ошибок за последние 200 строк.")
             add_issue("warning", "Много ошибок в worker-логе",
                       f"{log_summary_worker['errors']} ошибок за последние 200 строк.")
+        elif recent_error and log_summary_worker.get('latest_result') == 'error':
+            add_signal("logs", "Логи", "Последняя запись ошибка", "warning", recent_error[-160:])
         elif recent_success:
             add_signal("logs", "Логи", "Есть успех", "ok", recent_success[-160:])
         elif recent_error:
-            add_signal("logs", "Логи", "Последняя запись ошибка", "warning", recent_error[-160:])
+            add_signal("logs", "Логи", "Есть ошибка", "warning", recent_error[-160:])
         else:
             add_signal("logs", "Логи", "Нет данных", "info", "Свежих успешных событий пока нет.")
 
@@ -2952,6 +2985,8 @@ class ProjectAdapter:
 
         has_critical = any(item.get("severity") == "critical" for item in issues)
         has_warning = any(item.get("severity") == "warning" for item in issues)
+        if has_critical:
+            total = min(total, 64)
         if has_critical or total < 65:
             status = "critical"
             label = "Есть блокер"
@@ -2965,7 +3000,7 @@ class ProjectAdapter:
         else:
             status = "ok"
             label = "Готово к работе"
-            summary = "Авторизация, профиль, расписание и окружение выглядят готовыми."
+            summary = "Локальные проверки пройдены. Статус входа основан на последней проверке, без обращения к TikTok."
 
         return {
             "score": total,
