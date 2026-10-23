@@ -1,7 +1,7 @@
 # Setup
 
 For numbered Windows installation, build, update and login recovery steps,
-see [README.md](../README.md). For modern Chrome use
+see [INSTALL.md](../INSTALL.md). For modern Chrome use
 [Copy as cURL session import](CHROME_SESSION_IMPORT.md).
 The file-copy importer below is a legacy option.
 

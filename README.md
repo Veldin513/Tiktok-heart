@@ -1,210 +1,335 @@
 # TikTok Heart
 
-Windows-приложение на Tauri для локального TikTok worker: профили Chromium, адресаты и сообщения, расписание, диагностика, резервные копии авторизации и опциональное управление через Telegram.
+**Установка с нуля, с пояснениями для новичка: [INSTALL.md](INSTALL.md).**
 
-**English:** Windows desktop control app for a local TikTok worker. Follow the numbered PowerShell setup below. For login recovery, see [Chrome session import](docs/CHROME_SESSION_IMPORT.md).
+**Setup guide: [INSTALL.md](INSTALL.md).**
 
-## Исправления запуска и входа
+TikTok Heart is a Windows desktop control app for a local TikTok worker. It keeps a Chromium session, runs scheduled message checks, shows diagnostics, manages profiles/messages, and can be controlled through an optional Telegram bot.
 
-- Импорт из Chrome через Copy as cURL. Команда не выполняется: читаются только cookies первого запроса.
-- Проверка новой сессии в отдельном профиле рабочего Chromium, резервная копия прежнего входа и сохранение старого профиля при ошибке.
-- Проверка видимых элементов авторизованного интерфейса вместо одного адреса `/messages`.
-- Отклонение копирования Chrome-профилей с недоступным ключом шифрования или cookies `v20`.
-- Поддержка Chromium в `.playwright-browsers`: в этой установке это устранило `spawn UNKNOWN` / SideBySide при запуске браузера из AppData.
-- Скрипты Windows выбирают проектную `.venv` после явно заданного `YARA_PYTHON`.
+> This repository contains application code only. Real cookies, browser sessions, Telegram tokens, local state, logs, backups, and release binaries are intentionally ignored by Git.
 
-Подробности: [CHANGELOG.md](CHANGELOG.md).
+## English
 
-## Установка с нуля: Windows 10/11
+### Features
 
-Все команды выполняйте в **PowerShell из корня проекта**, где находятся `README.md` и `start_app.bat`. Активация виртуального окружения не требуется.
+- Local Tauri desktop shell with a clean web UI.
+- Chromium profile management for the worker session.
+- Import TikTok authorization from an existing Google Chrome profile.
+- Per-profile targets, message pool, cooldowns, and streak state.
+- Worker controls: start, stop, restart, pause, reset flags, self-test.
+- Windows Task Scheduler integration for startup and 12-hour runs.
+- Optional Telegram control bot.
+- Authorization backups for the selected profile.
+- Public-safe source backups that exclude private runtime data.
+- Diagnostics, logs, health checks, and maintenance tools.
 
-### 1. Установите программы
+### 2.2 Highlights
 
-- [Python](https://www.python.org/downloads/windows/) 3.12+, 64 bit — настоящую установку, а не только псевдоним Microsoft Store.
-- [Node.js](https://nodejs.org/) LTS с npm.
-- [Rust через rustup](https://rustup.rs/), стандартный Windows MSVC toolchain.
-- Microsoft C++ Build Tools: **Desktop development with C++** и Windows SDK.
-- Microsoft Edge WebView2 Runtime для окна Tauri.
-- Google Chrome с действующим входом в TikTok.
-- [Git for Windows](https://git-scm.com/downloads/win) для клонирования и обновления через Git.
+- Scheduled runs verify the worker script and process creation time; reused Windows PIDs no longer block a run.
+- Worker locks recover after reboot, and completed workers clear their saved PID.
+- The silent Windows launcher correctly passes startup and self-test switches to PowerShell.
+- Authorization backup restore, worker lifecycle history, and lightweight live status are included.
+- Existing local profiles, authorization, and schedule settings are preserved during an update.
 
-Зависимости сборки Windows: [официальная инструкция Tauri](https://v2.tauri.app/start/prerequisites/#windows). Rust и C++ нужны для сборки; Python и Chromium — для работы worker. После установки откройте новый PowerShell.
+See [CHANGELOG.md](CHANGELOG.md) for release details.
 
-```powershell
-py --version
-node --version
-npm.cmd --version
-rustc --version
-cargo --version
+### Project Layout
+
+```text
+app_shell/          Local web UI and HTTP API used by the desktop shell
+yara_app/           Python runtime, worker adapter, diagnostics, Telegram control
+scripts/windows/    Windows helper scripts for startup, scheduling, Chrome import
+src-tauri/          Tauri desktop wrapper
+tests/              Python test suite
+control/            Local runtime config, ignored except example files
+profiles/           Local browser/session data, ignored
+backups/            Local private backups, ignored
+logs/               Runtime logs, ignored
+release/            Local build output, ignored
 ```
 
-Если команды `py` нет, используйте `python` на шаге 3, предварительно проверив `python --version`.
+### Requirements
 
-### 2. Скачайте исходники
+Windows 10/11, Python 3.12+, Playwright Chromium, and Google Chrome for session transfer. Building the Tauri shell also requires Node.js LTS, Rust MSVC, C++ Build Tools, Windows SDK, and WebView2.
 
-```powershell
-git clone https://github.com/Veldin513/Tiktok-heart.git
-Set-Location .\Tiktok-heart
-```
+Follow [INSTALL.md](INSTALL.md) for downloads, installation, build commands, and checks after each step. A ready-made executable is not included in Git; build the desktop shell before first use.
 
-Альтернатива: GitHub → Code → Download ZIP. Распакуйте архив в постоянную папку. Не запускайте проект из архива и не перемещайте папку после настройки расписания без повторной регистрации задач.
+### First Run
 
-### 3. Создайте Python-окружение
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r requirements-desktop.txt
-.\.venv\Scripts\python.exe -c "import playwright, requests, psutil; print('Python dependencies OK')"
-```
-
-Скрипты запуска автоматически используют `.venv\Scripts\python.exe`. Переменная `YARA_PYTHON`, если задана, имеет приоритет.
-
-### 4. Установите рабочий Chromium в папку проекта
-
-```powershell
-$env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD '.playwright-browsers'
-.\.venv\Scripts\python.exe -m playwright install chromium
-```
-
-Это Chromium от Playwright. Google Chrome его не заменяет. Приложение автоматически использует папку `.playwright-browsers`, если она существует; явно заданная переменная `PLAYWRIGHT_BROWSERS_PATH` имеет приоритет.
-
-После обновления Playwright повторите установку браузера: новая версия может требовать другую ревизию Chromium.
-
-### 5. Установите Node-зависимости и соберите Tauri
-
-```powershell
-npm.cmd ci
-$env:YARA_PYTHON = (Resolve-Path '.\.venv\Scripts\python.exe').Path
-npm.cmd run build -- --no-bundle
-```
-
-Результат: `src-tauri\target\release\yara-control.exe`. Для разработки вместо сборки можно выполнить `npm.cmd run dev` с тем же `YARA_PYTHON`.
-
-Готовый exe в Git не хранится. Текущая оболочка использует Python и исходники из папки проекта: перенос одного exe на другой компьютер не является полной установкой.
-
-### 6. Запустите приложение
+Start the desktop app:
 
 ```powershell
 .\start_app.bat
 ```
 
-После сборки откроется Tauri. В дальнейшем запускайте этот файл двойным щелчком. Для запуска без консоли:
+Silent launcher:
 
 ```powershell
 wscript.exe .\start_app.vbs
 ```
 
-Тихий launcher запускает готовый Tauri exe напрямую с видимым окном приложения.
-Консоль отключена и в debug-сборке. Если используете сборку до этого исправления
-и рядом с приложением остаётся cmd, один раз пересоберите Tauri по шагу 5.
-Сам `start_app.vbs` не нужно менять или вставлять в него команду запуска.
-
-Для диагностики отдельно откройте тот же локальный интерфейс в браузере:
+Fallback web shell:
 
 ```powershell
-.\scripts\windows\start_app_shell.bat
+scripts\windows\start_app_shell.bat
 ```
 
-Обычный локальный адрес — `http://127.0.0.1:5874/`. Основной способ запуска приложения — Tauri.
+The Tauri window uses a local backend, usually `http://127.0.0.1:5874/`. For daily use, double-click `start_app.vbs` to open the app without a console.
 
-### 7. Перенесите авторизацию из обычного Chrome
+### Configuration
 
-Остановите worker. В приложении откройте **«Браузер» → «Импорт из Chrome»** и выберите профиль приложения.
+`.env.example` lists supported environment variables. Set them in the process environment; the app does not automatically load a `.env` file.
 
-1. В обычном Chrome войдите в TikTok и откройте `https://www.tiktok.com/messages`.
-2. Нажмите F12 → Network (Сеть) → Ctrl+R.
-3. Найдите первую строку `messages` с типом `document`.
-4. Правая кнопка → Copy → Copy as cURL (bash). Обычный Copy as cURL также поддерживается.
-5. Вставьте запрос в поле **«Запрос из Chrome»** приложения → **«Проверить и сохранить вход»**.
-6. Дождитесь успешного результата. Worker автоматически не запускается.
+Important variables:
 
-Chrome закрывать не требуется. Пароль приложению не нужен. Запрос содержит действующую сессию: вставляйте его только в приложение, не отправляйте в чат, issues или GitHub.
+- `TG_TOKEN` - Telegram bot token.
+- `TG_CHAT_IDS` - chat IDs for notifications.
+- `TIKTOK_DEFAULT_PROFILE` - default local profile name.
+- `TIKTOK_BOT_PROFILE` - profile used by helper scripts.
 
-Если TikTok блокирует вход непосредственно в Chromium, используйте этот перенос из Chrome. Старое копирование каталога Chrome не переносит современные cookies `v20`.
+The app can also read Telegram settings from `control/telegram_bot_v2.json`. That file is local-only and must never be committed.
 
-**Если авторизация слетит**, повторите пункты 1–6 со свежим запросом. Перенос при каждом запуске не нужен. Автоматическое восстановление истёкшей сессии без участия пользователя не реализовано. Локальный срок cookies после импорта — до 30 дней; TikTok может отозвать сессию раньше.
+### Browser Authorization
 
-Подробная инструкция: [перенос и восстановление входа](docs/CHROME_SESSION_IMPORT.md).
+Use the Browser tab to:
 
-### 8. Настройте и проверьте worker
+- choose the active worker profile;
+- import a TikTok session from Google Chrome;
+- open the Chromium profile folder;
+- compact profile storage;
+- create or delete authorization backups for the selected profile.
 
-- Укажите своих адресатов и сообщения.
-- Включите **dry_run** для первоначальной проверки и выполните self-test. Self-test не доказывает успешную отправку сообщения.
-- Проверьте активный профиль и журнал worker.
-- Для реальной отправки отключите dry_run и запустите worker.
+For modern Chrome, use **Browser → Import from Chrome → Request from Chrome**, then **Verify and save login**. Copy the main `messages` document request using Chrome DevTools → Network → Copy as cURL. If login expires, repeat the transfer with a fresh request. File copying cannot transfer Chrome `v20` cookies. See [the session import guide](docs/CHROME_SESSION_IMPORT.md).
 
-Локальные настройки создаются приложением. Примеры: `control/*.example.json`. Не заменяйте ими свои существующие настройки при обновлении.
+Authorization backup archives may contain cookies, browser session files, Telegram config, targets, and local state. Keep them private.
 
-### 9. Включите расписание, если оно нужно
+### Scheduler
 
-Используйте управление расписанием в приложении либо:
+Use the app scheduler controls or the scripts in `scripts/windows/`:
 
 ```powershell
-.\scripts\windows\register_worker_schedule.bat
+scripts\windows\register_worker_schedule.bat
+scripts\windows\unregister_worker_schedule.bat
 ```
 
-Предусмотрены запуск при входе в Windows с задержкой две минуты и каждые 12 часов. Если регистрация задач требует дополнительных прав, используйте терминал с нужными правами. Проверьте статус задач в приложении.
+The intended schedule is Windows sign-in plus every 12 hours. The sign-in task waits two minutes for the desktop session to become available.
 
-Удаление расписания:
+After updating an existing installation, the scheduled tasks continue using the scripts in this project folder. Replace the source files in place; keep your local `control/` and `profiles/` folders. If you move the project, register the schedule again so its paths are updated.
 
-```powershell
-.\scripts\windows\unregister_worker_schedule.bat
-```
-
-После перемещения проекта зарегистрируйте расписание заново: задачи содержат пути к скриптам.
-
-## Telegram — необязательно
-
-Настройте локальный `control/telegram_bot_v2.json` по `control/telegram_bot_v2.example.json` либо задайте переменные окружения `TG_TOKEN` и `TG_CHAT_IDS`. Файл `.env.example` перечисляет переменные; автоматическая загрузка `.env` приложением не предусмотрена. Токены не публикуйте.
-
-## Обновление существующей установки
-
-1. Остановите worker и закройте приложение.
-2. Создайте резервную копию авторизации и локальных настроек.
-3. В Git-клоне выполните `git pull --ff-only`. Собственные изменения сначала сохраните отдельно. При использовании ZIP обновите исходники в той же папке.
-4. Сохраните свои `control/`, `profiles/`, `logs/`, `backups/` и локальные секреты.
-5. Повторите установку Python-зависимостей и `npm.cmd ci`. Если обновился Playwright, повторите шаг 4 установки.
-6. Если менялась Rust/Tauri-оболочка, повторите сборку. Для изменений Python и локального интерфейса существующий exe обычно подходит.
-7. Запустите `start_app.bat`, проверьте вход и при необходимости повторите импорт из Chrome.
-
-## Известные проблемы
-
-| Проблема | Решение |
-| --- | --- |
-| Python открывает Microsoft Store | Установить Python; проверить `py --version`; использовать явный путь к Python из `.venv`. |
-| `ModuleNotFoundError` | Установить зависимости в `.venv`; проверить, что `YARA_PYTHON` не указывает на другой Python. |
-| `npm.ps1 cannot be loaded` | Использовать `npm.cmd`. |
-| Не найдены `link.exe` / Windows SDK | Установить C++ Build Tools и SDK, открыть новый терминал. |
-| Пустое окно Tauri | Проверить WebView2 и запуск backend через `start_app_shell.bat`. |
-| Chromium: `spawn UNKNOWN` / SideBySide | Установить браузер в `.playwright-browsers` по шагу 4. Это решило проблему здесь; возможны и другие причины. |
-| `Executable doesn't exist` | Установить Chromium той же версией Playwright и в ту же папку, которую использует приложение. |
-| TikTok блокирует вход в Chromium | Войти в Chrome и выполнить перенос по шагу 7. |
-| Импорт каталога сообщает про `v20` или ключ | Использовать импорт запроса вместо копирования каталога. |
-| Импорт запроса не подтвердил вход | Проверить сообщения в Chrome и подключение; скопировать свежий `messages`. При ошибке старый профиль сохраняется. |
-| Worker не запускается или запускается часто | Проверить активный профиль, паузы, расписание и журналы в приложении. |
-
-## Проверка кода
+### Tests
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe -m ruff check .
-node --check app_shell/web/app.js
-.\.venv\Scripts\python.exe scripts/security_scan.py
+node --check app_shell\web\app.js
 ```
 
-Последняя команда проверяет файлы Git, поэтому запускается в Git-клоне.
+### Build
 
-## Структура и приватные данные
+```powershell
+$env:YARA_PYTHON = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+npm.cmd ci
+npm.cmd run build -- --no-bundle
+```
 
-- `app_shell/` — интерфейс и локальный API.
-- `yara_app/` — Python, worker, импорт сессий и диагностика.
-- `scripts/windows/` — запуск, расписание и обслуживание.
-- `src-tauri/` — Tauri.
-- `tests/` — тесты.
-- `control/`, `profiles/`, `logs/`, `backups/` — локальные данные.
-- `.venv/`, `.playwright-browsers/`, `node_modules/`, `src-tauri/target/` — локальные зависимости и сборки.
+Build output is created under `src-tauri/target/release/`. Local release copies can be stored under `release/`; that folder is ignored by Git.
 
-В GitHub публикуется только код. Cookies, токены, runtime JSON, базы браузера, логи и архивы авторизации должны оставаться приватными.
+### Privacy And Security
+
+Never commit:
+
+- `control/*.json`
+- `.env` or `.env.*`
+- `profiles/`
+- `logs/`
+- `backups/`
+- `release/`
+- `node_modules/`
+- `src-tauri/target/`
+- browser files such as `Cookies`, `Login Data`, `Local Storage`, `IndexedDB`
+
+Before publishing:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\security_scan.py
+git status --ignored
+```
+
+If a token was ever pushed to GitHub, rotate it and rewrite Git history or recreate the repository.
+
+### Troubleshooting
+
+- App does not open: check [INSTALL.md](INSTALL.md#13-если-что-то-не-получилось), then try `.\start_app.bat` and the fallback web shell.
+- Browser authorization is missing: open Browser tab and import from Chrome again.
+- Telegram control is not ready: verify local `control/telegram_bot_v2.json`.
+- Worker opens too often: check scheduler status and worker logs.
+- UI data looks stale: use Refresh or check whether auto-refresh is enabled.
+- Profile folder is too large: compact the browser profile and prune old backups.
+- Short freezes in the UI: check `logs/app_shell_perf.log` for slow local API calls.
+
+## Русский
+
+### Что это
+
+TikTok Heart - Windows-приложение для локального TikTok worker. Оно хранит Chromium-сессию, запускает проверки по расписанию, показывает диагностику, управляет профилями, сообщениями, логами и может дополнительно управляться через Telegram-бота.
+
+В репозитории должен храниться только код. Реальные cookies, авторизации браузера, Telegram-токены, локальное состояние, логи, backup и сборки не должны попадать в Git.
+
+### Возможности
+
+- Локальное desktop-приложение на Tauri.
+- Управление Chromium-профилем worker.
+- Импорт авторизации TikTok из Google Chrome.
+- Профили, адресаты, пул сообщений, cooldown и streak-состояние.
+- Управление worker: запуск, остановка, перезапуск, пауза, сброс флагов, self-test.
+- Автозапуск Windows и запуск каждые 12 часов через Task Scheduler.
+- Опциональный Telegram-бот для управления.
+- Backup авторизации выбранного профиля.
+- Backup исходников без приватных runtime-данных.
+- Диагностика, логи, здоровье проекта и обслуживание.
+
+### Что нового в 2.2
+
+- Запуск по расписанию проверяет скрипт и время создания процесса: повторно выданный Windows номер процесса больше не блокирует работу.
+- Блокировки worker восстанавливаются после перезагрузки, а завершённый worker очищает свой сохранённый PID.
+- Тихий Windows-запуск правильно передаёт параметры автозапуска и самопроверки в PowerShell.
+- Добавлены восстановление backup авторизации, история этапов worker и облегчённое обновление статуса.
+- При обновлении сохраняются локальные профили, авторизация и параметры расписания.
+
+Подробности версии: [CHANGELOG.md](CHANGELOG.md).
+
+### Структура проекта
+
+```text
+app_shell/          Локальный web UI и HTTP API
+yara_app/           Python runtime, worker, диагностика, Telegram control
+scripts/windows/    Windows-скрипты запуска, расписания и импорта Chrome
+src-tauri/          Desktop-обертка Tauri
+tests/              Тесты
+control/            Локальные настройки, в Git только example-файлы
+profiles/           Локальные browser/session данные, игнорируются
+backups/            Приватные backup, игнорируются
+logs/               Логи, игнорируются
+release/            Локальные сборки, игнорируются
+```
+
+### Установка зависимостей
+
+Для работы нужны Windows 10/11, Python 3.12+ и отдельный Chromium от Playwright. Google Chrome используется для переноса входа. Для сборки окна Tauri нужны Node.js LTS, Rust MSVC, C++ Build Tools, Windows SDK и WebView2.
+
+**Пошаговая установка с нуля вынесена в [INSTALL.md](INSTALL.md): ссылки на загрузку, действия в установщиках, команды и ожидаемые результаты.** Готового exe в Git нет — перед первым запуском нужно собрать оболочку по инструкции.
+
+### Запуск
+
+Обычный запуск:
+
+```powershell
+.\start_app.bat
+```
+
+Запуск без окна консоли:
+
+```powershell
+wscript.exe .\start_app.vbs
+```
+
+Fallback web-оболочка:
+
+```powershell
+scripts\windows\start_app_shell.bat
+```
+
+Окно Tauri работает через локальный backend, обычно `http://127.0.0.1:5874/`. Для ежедневного запуска без cmd дважды щёлкните `start_app.vbs`. Команды в содержимое этого файла вставлять не нужно.
+
+### Настройка
+
+Файл `.env.example` перечисляет поддерживаемые переменные окружения. Автоматической загрузки `.env` нет: задайте переменные в окружении процесса или используйте локальные настройки приложения.
+
+Основные переменные:
+
+- `TG_TOKEN` - токен Telegram-бота.
+- `TG_CHAT_IDS` - chat ID для уведомлений.
+- `TIKTOK_DEFAULT_PROFILE` - профиль по умолчанию.
+- `TIKTOK_BOT_PROFILE` - профиль для helper-скриптов.
+
+Telegram можно также настроить через `control/telegram_bot_v2.json`. Это локальный файл, его нельзя коммитить.
+
+### Авторизация браузера
+
+Во вкладке "Браузер" можно:
+
+- выбрать профиль worker;
+- импортировать TikTok-авторизацию из Google Chrome;
+- открыть папку Chromium-профиля;
+- сжать профиль;
+- создать или удалить backup авторизации выбранного профиля.
+
+Для современного Chrome используйте **«Браузер» → «Импорт из Chrome» → «Запрос из Chrome» → «Проверить и сохранить вход»**. В Chrome скопируйте основной запрос `messages` через F12 → Network → Copy as cURL. Если вход слетит, повторите перенос свежего запроса. Простое копирование папки не переносит cookies Chrome `v20`. Подробности: [инструкция переноса](docs/CHROME_SESSION_IMPORT.md).
+
+Backup авторизации может содержать cookies, browser session, Telegram config, адресатов и локальное состояние. Его нельзя публиковать.
+
+### Расписание
+
+Расписание можно включать из приложения или через скрипты:
+
+```powershell
+scripts\windows\register_worker_schedule.bat
+scripts\windows\unregister_worker_schedule.bat
+```
+
+Основной режим: запуск после входа в Windows и далее каждые 12 часов. Задача входа ждёт две минуты, чтобы рабочий стол успел загрузиться.
+
+При обновлении на месте задачи продолжают использовать скрипты из этой папки. Замени исходники, сохранив локальные папки `control/` и `profiles/`. Если переносишь проект в другую папку, зарегистрируй расписание заново для обновления путей.
+
+### Проверки
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m ruff check .
+node --check app_shell\web\app.js
+```
+
+### Сборка
+
+```powershell
+$env:YARA_PYTHON = (Resolve-Path ".\.venv\Scripts\python.exe").Path
+npm.cmd ci
+npm.cmd run build -- --no-bundle
+```
+
+Результат сборки появляется в `src-tauri/target/release/`. Локальную папку `release/` можно использовать для копий артефактов, она игнорируется Git.
+
+### Приватность и безопасность
+
+Нельзя коммитить:
+
+- `control/*.json`
+- `.env` и `.env.*`
+- `profiles/`
+- `logs/`
+- `backups/`
+- `release/`
+- `node_modules/`
+- `src-tauri/target/`
+- browser-файлы `Cookies`, `Login Data`, `Local Storage`, `IndexedDB`
+
+Перед публикацией:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\security_scan.py
+git status --ignored
+```
+
+Если токен уже попадал в GitHub, его нужно перевыпустить и переписать историю Git или пересоздать репозиторий.
+
+### Частые проблемы
+
+- Приложение не открывается: проверь [раздел решения проблем](INSTALL.md#13-если-что-то-не-получилось), затем попробуй `.\start_app.bat` и диагностическую web-оболочку.
+- Слетела авторизация: заново импортируй авторизацию во вкладке "Браузер".
+- Telegram не готов: проверь локальный `control/telegram_bot_v2.json`.
+- Worker запускается лишний раз: проверь расписание и worker logs.
+- Информация в UI не обновляется: нажми Refresh или проверь автообновление.
+- Профиль слишком большой: сожми Chromium-профиль и удали старые backup.
+- Короткие фризы в интерфейсе: проверь `logs/app_shell_perf.log`, там пишутся медленные локальные API-запросы.
