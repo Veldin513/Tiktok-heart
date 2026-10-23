@@ -212,13 +212,39 @@ def main() -> int:
         print_lifecycle("skip_worker_running", pid=status.pid)
         return 0
 
-    boot_force = configure_boot_force_environment(adapter, force=args.boot_force)
+    state = adapter.get_control_state()
+    if state.get('paused') or state.get('stop_requested'):
+        print_lifecycle('skip_control_flag', paused=bool(state.get('paused')), stop_requested=bool(state.get('stop_requested')))
+        return 0
+    profile_root = adapter._bot_profile_root()
+    if (profile_root / 'state' / 'session_import_required.json').exists():
+        print_lifecycle('skip_session_import_required')
+        return 0
+    if (profile_root / 'browser' / '.session_import.lock').exists():
+        print_lifecycle('skip_session_import_running')
+        return 0
+    backoff_left = adapter._auth_backoff_seconds_left(profile_root / 'state' / 'auth_backoff.json')
+    if backoff_left > 0:
+        print_lifecycle('skip_auth_backoff', seconds_left=backoff_left)
+        return 0
     queue = adapter.queue_snapshot()
+    if int(queue.get('target_count') or 0) == 0:
+        print_lifecycle('skip_no_targets')
+        return 0
+    # Only the explicit sign-in task may bypass cooldown. A recovery tick after
+    # a recent reboot must still honour the user's disabled startup setting.
+    boot_force = configure_boot_force_environment(adapter, force=True) if args.boot_force else False
     if not boot_force:
         queue, _waited_for_cooldown = wait_for_near_cooldown(adapter, queue)
     if not boot_force and int(queue.get("target_count") or 0) > 0 and int(queue.get("ready_count") or 0) == 0:
         wait_seconds = int(queue.get("next_send_in_s") or 0)
         print_lifecycle("skip_all_cooldown", target_count=queue.get("target_count"), next_ready_in_s=wait_seconds)
+        try:
+            adjustment = adapter.scheduler.reanchor_from_queue()
+            print_lifecycle('schedule_aligned', **adjustment)
+        except Exception:
+            print_lifecycle('schedule_update_failed', reason='check_task_permissions_and_save_schedule')
+            return 3
         return 0
 
     started = adapter.start_worker()

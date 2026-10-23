@@ -819,6 +819,14 @@ def check_tiktok_streak() -> None:
             duration_seconds=round(summary.duration_seconds, 2),
         )
         release_worker_run()
+        # Anchor to completed sends, including manual launches. No resident
+        # timer or extra queue checks are created by this adjustment.
+        try:
+            adjustment = auth_coord_adapter.scheduler.reanchor_from_queue()
+            if adjustment.get('updated'):
+                logger.info('Следующий запуск по паузе адресата: %s', adjustment.get('first_run_at'))
+        except Exception:
+            logger.warning('Не удалось обновить время расписания. Пересохраните задачи Windows с правами администратора.')
 
 
 if __name__ == '__main__':

@@ -111,6 +111,33 @@ function Remove-WorkerTaskIfExists {
     }
 }
 
+function Grant-WorkerTaskAccess {
+    param([string]$Name)
+
+    # Tasks registered once from an elevated window must remain editable by
+    # this same user when the app/worker runs with normal privileges.
+    if (-not (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue)) { return }
+    $service = New-Object -ComObject "Schedule.Service"
+    $service.Connect()
+    $task = $service.GetFolder("\").GetTask($Name)
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $security = New-Object Security.AccessControl.RawSecurityDescriptor($task.GetSecurityDescriptor(4))
+    $fileAllAccess = 0x1F01FF
+    foreach ($existingAce in $security.DiscretionaryAcl) {
+        if ($existingAce -is [Security.AccessControl.CommonAce] -and
+            $existingAce.SecurityIdentifier -eq $sid -and
+            $existingAce.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+            ($existingAce.AccessMask -band $fileAllAccess) -eq $fileAllAccess) { return }
+    }
+    $ace = New-Object Security.AccessControl.CommonAce(
+        [Security.AccessControl.AceFlags]::None,
+        [Security.AccessControl.AceQualifier]::AccessAllowed,
+        $fileAllAccess, $sid, $false, $null
+    )
+    $security.DiscretionaryAcl.InsertAce(0, $ace)
+    $task.SetSecurityDescriptor($security.GetSddlForm([Security.AccessControl.AccessControlSections]::Access), 0)
+}
+
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -141,8 +168,9 @@ if ($Every12HoursEnabled) {
         -Trigger @($repeatTrigger) `
         -Settings $settings `
         -Principal $principal `
-        -Description "Starts TikTok Heart worker every $IntervalHours hours from the last worker start." `
+        -Description "TikTok Heart: every $IntervalHours hours; next run follows the actual send cooldown. No background polling." `
         -Force | Out-Null
+    Grant-WorkerTaskAccess $TaskName
     $registered += "$($TaskName): every $IntervalHours hours"
 }
 else {
@@ -166,6 +194,7 @@ if ($AtStartupEnabled -or $AtLogonEnabled) {
         -Principal $principal `
         -Description "Starts TikTok Heart worker once after Windows sign-in and bypasses cooldown for that boot session." `
         -Force | Out-Null
+    Grant-WorkerTaskAccess $StartupTaskName
     $registered += "$($StartupTaskName): Windows sign-in startup"
 }
 else {

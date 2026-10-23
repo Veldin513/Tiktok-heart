@@ -57,7 +57,19 @@ class WorkerScheduleService:
         ]
         if first_run_at:
             args.extend(["-FirstRunAt", str(first_run_at)])
-        self.adapter._run_powershell_script(self.adapter.worker_schedule_register_script_path, args)
+        self._status_cache = (0.0, {})
+        try:
+            self.adapter._run_powershell_script(self.adapter.worker_schedule_register_script_path, args)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if any(token in message for token in ('access is denied', 'access denied', 'отказано в доступе', '0x80070005')):
+                raise RuntimeError(
+                    'Windows запретила изменение задачи расписания. Закройте TikTok Heart и один раз '
+                    'запустите scripts/windows/register_worker_schedule.bat от имени администратора. '
+                    'Затем откройте приложение обычным способом. Сохранение расписания не завершено; '
+                    'настройки могли измениться частично.'
+                ) from None
+            raise
         status = self.status()
         self._status_cache = (time.time(), dict(status))
         return status
@@ -70,6 +82,44 @@ class WorkerScheduleService:
         status = self.status()
         self._status_cache = (time.time(), dict(status))
         return status
+
+    def reanchor_from_queue(self) -> dict[str, Any]:
+        """Adjust only the existing repeat trigger after a run, never poll."""
+        if os.name != 'nt':
+            return {'updated': False, 'reason': 'unsupported'}
+        status = self.status_cached(max_age_seconds=0)
+        if not status.get('repeat_task_installed') or not status.get('enabled') or not status.get('every_12_hours'):
+            return {'updated': False, 'reason': 'repeat_disabled'}
+        queue = self.adapter.queue_snapshot()
+        due = queue.get('next_send_at')
+        if not due or int(queue.get('ready_count') or 0) > 0:
+            return {'updated': False, 'reason': 'no_future_cooldown'}
+        due = float(due)
+        if due <= time.time() + 1:
+            return {'updated': False, 'reason': 'already_due'}
+        next_run = self.parse_timestamp(status.get('next_run_time'))
+        if next_run is not None and abs(next_run - due) < 2:
+            return {'updated': False, 'reason': 'already_aligned'}
+        first_run_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(due))
+        command = r"""
+$ErrorActionPreference = 'Stop'
+$task = Get-ScheduledTask -TaskName '__TASK_NAME__' -ErrorAction Stop
+if ([string]$task.State -eq 'Disabled') { exit 0 }
+$changed = $false
+foreach ($trigger in @($task.Triggers)) {
+    if ($trigger.Enabled -and [string]$trigger.Repetition.Interval -eq 'PT12H') {
+        $trigger.StartBoundary = ([datetime]::ParseExact('__FIRST_RUN__', 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)).ToString('yyyy-MM-ddTHH:mm:ss')
+        $changed = $true
+    }
+}
+if ($changed) {
+    Set-ScheduledTask -TaskName '__TASK_NAME__' -Trigger @($task.Triggers) -ErrorAction Stop | Out-Null
+}
+"""
+        command = command.replace('__TASK_NAME__', self.task_name.replace("'", "''")).replace('__FIRST_RUN__', first_run_at)
+        self.adapter._run_powershell_command(command)
+        self._status_cache = (0.0, {})
+        return {'updated': True, 'first_run_at': first_run_at}
 
     def status_cached(self, *, max_age_seconds: float = 60.0) -> dict[str, Any]:
         timestamp, cached = self._status_cache

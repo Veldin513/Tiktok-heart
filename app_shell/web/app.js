@@ -176,7 +176,7 @@ function scheduleMetaLabel(schedule = {}) {
   if (!schedule.installed) return "ручной режим";
   if (scheduleIsStale(schedule)) return "дата в прошлом · пересохрани";
   const trigger = schedule.at_startup ? "старт ПК" : "ручной режим";
-  const repeat = schedule.every_12_hours ? "12 ч от worker" : "без 12 ч";
+  const repeat = schedule.every_12_hours ? "повтор 12 ч" : "без повтора";
   return `${trigger} · ${repeat}`;
 }
 

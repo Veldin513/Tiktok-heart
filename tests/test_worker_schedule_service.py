@@ -53,6 +53,23 @@ def test_schedule_service_rejects_empty_trigger_set(tmp_path: Path) -> None:
         service.register(at_startup=False, at_logon=False, every_12_hours=False)
 
 
+def test_schedule_save_access_denied_reports_failure_without_querying_success(tmp_path, monkeypatch):
+    service = WorkerScheduleService(FakeAdapter(tmp_path))
+    def denied(*_args):
+        raise RuntimeError('Register-ScheduledTask : Отказано в доступе. 0x80070005')
+    monkeypatch.setattr(service.adapter, '_run_powershell_script', denied)
+    monkeypatch.setattr(service, 'status', lambda: pytest.fail('failed registration is not success'))
+    with pytest.raises(RuntimeError, match='Сохранение расписания не завершено'):
+        service.register()
+
+
+def test_schedule_disabled_does_not_get_recreated(tmp_path, monkeypatch):
+    service = WorkerScheduleService(FakeAdapter(tmp_path))
+    monkeypatch.setattr(service, 'status_cached', lambda **_kwargs: {'enabled': False})
+    assert service.reanchor_from_queue() == {'updated': False, 'reason': 'repeat_disabled'}
+    assert service.adapter.calls == []
+
+
 def test_schedule_service_marks_stale_next_run(tmp_path: Path, monkeypatch) -> None:
     service = WorkerScheduleService(FakeAdapter(tmp_path))
     now = time.mktime(time.strptime("2026-07-20 12:00:00", "%Y-%m-%d %H:%M:%S"))

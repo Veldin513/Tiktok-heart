@@ -114,6 +114,8 @@ scripts\windows\unregister_worker_schedule.bat
 
 The intended schedule is Windows sign-in plus every 12 hours. The sign-in task waits two minutes for the desktop session to become available.
 
+The next repeat is aligned once with the actual send cooldown, including manual runs. There is no frequent background queue polling. If an older task cannot be saved because of access permissions, register it once as administrator as described in [INSTALL.md](INSTALL.md#11-включите-расписание--по-желанию).
+
 After updating an existing installation, the scheduled tasks continue using the scripts in this project folder. Replace the source files in place; keep your local `control/` and `profiles/` folders. If you move the project, register the schedule again so its paths are updated.
 
 ### Tests
@@ -281,6 +283,8 @@ scripts\windows\unregister_worker_schedule.bat
 ```
 
 Основной режим: запуск после входа в Windows и далее каждые 12 часов. Задача входа ждёт две минуты, чтобы рабочий стол успел загрузиться.
+
+Время следующего повтора один раз согласуется с фактической отправкой, включая ручные запуски. Частых фоновых проверок очереди нет. Если старые задачи не сохраняются из-за прав доступа, один раз перерегистрируй их от имени администратора по [инструкции установки](INSTALL.md#11-включите-расписание--по-желанию).
 
 При обновлении на месте задачи продолжают использовать скрипты из этой папки. Замени исходники, сохранив локальные папки `control/` и `profiles/`. Если переносишь проект в другую папку, зарегистрируй расписание заново для обновления путей.
 
