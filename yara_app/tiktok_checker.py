@@ -499,12 +499,20 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
     with timed_phase('target_open_messages', target=target.name):
         open_messages(page)
     require_work_session(page)
-    # Prefer the configured unique profile URL over a display name shared by
-    # several conversations. A failed profile lookup must not pick a namesake.
+    # Prefer the DM list, but verify its unique account handle when configured.
+    # A duplicate/unknown name falls back to the configured public profile.
     try:
-        method = 'profile' if target.profile_url else 'list'
-        with timed_phase('target_open_chat', target=target.name, method=method):
-            chat_opened = open_chat_by_profile(page, target.profile_url) if target.profile_url else open_chat_by_list(page, target.name)
+        with timed_phase('target_open_chat', target=target.name, method='list'):
+            chat_opened = (open_chat_by_list(page, target.name, target.profile_url) if target.profile_url
+                           else open_chat_by_list(page, target.name))
+        if not chat_opened and target.profile_url:
+            with timed_phase('target_open_chat', target=target.name, method='profile'):
+                chat_opened = open_chat_by_profile(page, target.profile_url)
+    except SendNotAttempted as exc:
+        logger.warning('Чат недоступен: %s', exc)
+        summary.add_result(target=target.name, success=False, reason='chat_blocked')
+        _append_run_history('target_result', target=target.name, success=False, reason='chat_blocked', error=str(exc))
+        return
     except Exception:
         chat_opened = False
     if not chat_opened:

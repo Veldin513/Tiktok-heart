@@ -1,9 +1,4 @@
-"""Messaging helpers for the TikTok inbox.
-
-This module deliberately keeps the historically working selectors and click
-mechanics intact. The refactor focuses on structure, compatibility, and clearer
-fall-back handling rather than altering browser behaviour.
-"""
+"""TikTok DM navigation, recipient verification, and confirmed sending."""
 
 from __future__ import annotations
 
@@ -13,6 +8,7 @@ import time
 import unicodedata
 from collections.abc import Iterable
 from contextlib import suppress
+from urllib.parse import unquote, urlparse
 
 from yara_app.auth_flow import explicitly_logged_out
 from yara_app.delivery import (
@@ -26,6 +22,8 @@ from yara_app.delivery import (
 logger = logging.getLogger(__name__)
 MESSAGES_URL = 'https://www.tiktok.com/messages'
 INBOX_ITEM_SELECTOR = '[data-e2e="inbox-list-item"]'
+DM_ITEM_SELECTOR = '[data-e2e="dm-new-conversation-item"]'
+DM_NAME_SELECTOR = '[data-e2e="dm-new-conversation-nickname"]'
 EDITOR_SELECTOR = '.public-DraftEditor-content'
 MESSAGE_BUTTON_PATTERN = re.compile(r'Сообщение|Message', re.IGNORECASE)
 MESSAGE_BUTTON_TEXTS = (
@@ -59,7 +57,7 @@ def _dom_click(locator) -> None:
 
 def _wait_for_editor(page, timeout_ms: int = 2500) -> bool:
     try:
-        page.locator(EDITOR_SELECTOR).wait_for(state='attached', timeout=timeout_ms)
+        page.locator(EDITOR_SELECTOR).wait_for(state='visible', timeout=timeout_ms)
         return True
     except Exception:
         return False
@@ -74,6 +72,101 @@ def _names_match(expected: str, candidate: str) -> bool:
     expected_norm = _normalize_target_name(expected)
     first_line = next((line for line in (candidate or '').splitlines() if line.strip()), '')
     return bool(expected_norm and expected_norm == _normalize_target_name(first_line))
+
+
+def _profile_handle(value: str) -> str:
+    value = str(value or '').strip()
+    if not value.startswith('@'):
+        parsed = urlparse(value)
+        if parsed.scheme != 'https' or (parsed.hostname or '').lower() not in {'www.tiktok.com', 'tiktok.com'}:
+            return ''
+        value = unquote(parsed.path).rstrip('/')
+        if not value.startswith('/@'):
+            return ''
+        value = value[1:]
+    handle = value[1:]
+    return handle.casefold() if handle and not any(c.isspace() or c in '/?#' for c in handle) else ''
+
+
+def dismiss_chat_notice(page) -> None:
+    """Dismiss only an explicit close/later control; never click consent/OK."""
+    overlays = page.locator('.TUXModal-overlay:visible, [role="dialog"][aria-modal="true"]:visible')
+    for _ in range(2):
+        if not overlays.count():
+            return
+        overlay = overlays.first
+        scopes = [overlay, overlay.locator('..')]
+        closed = False
+        for scope in scopes:
+            close = scope.get_by_role(
+                'button', name=re.compile(r'^(Close|Закрыть|Not now|Не сейчас|Later|Позже)$', re.IGNORECASE),
+            ).filter(visible=True)
+            if close.count() != 1:
+                continue
+            try:
+                close.click(timeout=1500)
+                overlay.wait_for(state='hidden', timeout=2000)
+                closed = True
+                logger.info('Информационное окно TikTok закрыто кнопкой закрытия.')
+                break
+            except Exception:
+                continue
+        if not closed:
+            raise SendNotAttempted(
+                'Всплывающее окно TikTok перекрывает чат. Закройте его вручную через отдельный Chrome '
+                'в разделе «Браузер», затем проверьте вход. Отправка не начиналась.'
+            )
+    if overlays.count():
+        raise SendNotAttempted('Всплывающее окно TikTok осталось открытым. Отправка не начиналась.')
+
+
+def _open_modern_chat(page, target_name: str, profile_url: str | None) -> bool | None:
+    rows = page.locator(DM_ITEM_SELECTOR)
+    # Some older layouts do not have these rows. Keep the legacy path for them.
+    if not callable(getattr(rows, 'locator', None)):
+        return None
+    try:
+        rows.first.wait_for(state='visible', timeout=4500)
+    except Exception:
+        return None
+    dismiss_chat_notice(page)
+    matches = []
+    for index in range(rows.count()):
+        row = rows.nth(index)
+        if not row.is_visible():
+            continue
+        title = row.locator(DM_NAME_SELECTOR).first
+        if title.count() and _names_match(target_name, title.inner_text()):
+            matches.append(row)
+    if len(matches) != 1:
+        logger.info('В списке сообщений нет единственного совпадения имени адресата.')
+        return False
+    # Click the conversation row, not a link to the public profile.
+    try:
+        matches[0].click(timeout=3000)
+    except Exception:
+        dismiss_chat_notice(page)
+        return False
+    if not _wait_for_editor(page, 5000):
+        return False
+    dismiss_chat_notice(page)
+    if profile_url:
+        expected = _profile_handle(profile_url)
+        identifier = page.locator('[data-e2e="chat-uniqueid"]:visible')
+        try:
+            identifier.filter(has_text=re.compile(r'^\s*@?' + re.escape(expected) + r'\s*$', re.IGNORECASE)).first.wait_for(
+                state='visible', timeout=3000,
+            )
+            actual = identifier.first.inner_text().strip()
+            if not actual.startswith('@'):
+                actual = '@' + actual
+            if not expected or identifier.count() != 1 or _profile_handle(actual) != expected:
+                logger.warning('Открытый чат не совпал с @username адресата. Отправка через список отменена.')
+                return False
+        except Exception:
+            return False
+    logger.info('✅ Чат открыт через список сообщений; адресат проверен.')
+    return True
 
 
 def _iter_inbox_items(page, *, visible_first: bool = True) -> Iterable[object]:
@@ -274,6 +367,14 @@ def open_messages(page) -> None:
     page.goto(MESSAGES_URL, wait_until='domcontentloaded')
     _soft_wait(page, 700)  # let the page fully render before probing tabs
 
+    # Modern DMs coexist with hidden legacy notification rows. Do not mistake
+    # those hidden rows for an active Activity tab or click the navigation again.
+    try:
+        page.locator(DM_ITEM_SELECTOR).first.wait_for(state='visible', timeout=4500)
+        return
+    except Exception:
+        pass
+
     # Wait for inbox items to appear first (tells us the page is interactive)
     try:
         page.locator(INBOX_ITEM_SELECTOR).first.wait_for(state='attached', timeout=6000)
@@ -318,18 +419,15 @@ def _inbox_items_attached(page, timeout_ms: int = 1200) -> bool:
         return False
 
 
-def open_chat_by_list(page, target_name: str) -> bool:
-    """Try the original Plan A first, then repair it with DOM-row matching.
+def open_chat_by_list(page, target_name: str, profile_url: str | None = None) -> bool:
+    """Open a unique DM row; verify its handle, or use legacy name-only layouts."""
 
-    The first project version used two exact-text lookups:
-    1. visible text node;
-    2. broader exact lookup without a visibility filter.
-
-    That exact sequence stays first so the historical behaviour is preserved.
-    If both exact lookups miss, we do a conservative recovery pass over the
-    already-rendered inbox rows: visible rows first, hidden rows second, using
-    Unicode-normalized text comparison. Click mechanics stay unchanged.
-    """
+    modern = _open_modern_chat(page, target_name, profile_url)
+    if modern is not None:
+        return modern
+    if profile_url:
+        # The old notification rows cannot prove a DM's unique account identity.
+        return False
 
     import unicodedata as _ud
     name_nfkc = _ud.normalize('NFKC', target_name)
@@ -409,6 +507,7 @@ def open_chat_by_profile(page, profile_url: str) -> bool:
         _dom_click(msg_button)
     if not _wait_for_chat_after_profile_click(page):
         raise RuntimeError('Profile message button was clicked, but chat editor did not become ready.')
+    dismiss_chat_notice(page)
     logger.info('✅ Успешно вошли в чат через профиль!')
     return True
 
@@ -418,9 +517,13 @@ def send_message(page, text: str, *, confirmation_timeout_ms: int = 15000) -> Se
     logger.info('Ожидание поля ввода...')
     input_box = page.locator(EDITOR_SELECTOR)
     input_box.wait_for(state='visible', timeout=15000)
+    dismiss_chat_notice(page)
     if input_box.inner_text(timeout=2000).strip():
         raise SendNotAttempted('В поле ввода есть черновик. Отправка не выполнялась.')
-    input_box.click(timeout=5000)
+    try:
+        input_box.click(timeout=5000)
+    except Exception:
+        raise SendNotAttempted('Поле ввода TikTok недоступно или перекрыто. Отправка не начиналась.') from None
     page.keyboard.insert_text(text)
     if input_box.inner_text(timeout=2000).strip() != text.strip():
         raise SendNotAttempted('Текст не появился в поле ввода. Отправка не выполнялась.')

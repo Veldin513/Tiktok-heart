@@ -107,6 +107,8 @@ class FakePage:
         return self.legacy
 
     def locator(self, selector):
+        if selector == '.TUXModal-overlay:visible, [role="dialog"][aria-modal="true"]:visible':
+            return FakeLocator(count_value=0)
         if selector == '[data-e2e="inbox-list-item"]':
             return self.list_locator
         if selector == '.public-DraftEditor-content':

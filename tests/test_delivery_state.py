@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import yara_app.tiktok_checker as checker
-from yara_app.delivery import DeliveryRejected, DeliveryUnconfirmed, SendReceipt
+from yara_app.delivery import DeliveryRejected, DeliveryUnconfirmed, SendNotAttempted, SendReceipt
 from yara_app.project_adapter import ProjectAdapter
 from yara_app.ttbot.models import RunSummary, Target, safe_name_key
 
@@ -99,10 +99,30 @@ def test_dry_run_does_not_count_as_a_sent_message(dispatch, monkeypatch):
     assert summary.skipped_count == 1
 
 
-def test_unique_profile_url_is_preferred_to_a_possible_namesake(dispatch, monkeypatch):
-    monkeypatch.setattr(checker, 'open_chat_by_list', lambda *_a: pytest.fail('must use configured profile URL'))
+def test_dm_list_receives_unique_identity_before_profile_fallback(dispatch, monkeypatch):
+    checked = []
+    monkeypatch.setattr(checker, 'open_chat_by_list', lambda _page, name, url: checked.append((name, url)) or True)
+    monkeypatch.setattr(checker, 'open_chat_by_profile', lambda *_a: pytest.fail('verified DM list must be preferred'))
+    monkeypatch.setattr(checker, 'send_message', lambda *_a: SendReceipt('123', 'client-1', 'websocket'))
+    checker.process_target(object(), Target('alice', 'https://www.tiktok.com/@unique-alice'), RunSummary('test', 1))
+    assert checked == [('alice', 'https://www.tiktok.com/@unique-alice')]
+
+
+def test_unverified_dm_list_falls_back_to_configured_profile(dispatch, monkeypatch):
+    monkeypatch.setattr(checker, 'open_chat_by_list', lambda *_a: False)
     opened = []
     monkeypatch.setattr(checker, 'open_chat_by_profile', lambda _page, url: opened.append(url) or True)
     monkeypatch.setattr(checker, 'send_message', lambda *_a: SendReceipt('123', 'client-1', 'websocket'))
     checker.process_target(object(), Target('alice', 'https://www.tiktok.com/@unique-alice'), RunSummary('test', 1))
     assert opened == ['https://www.tiktok.com/@unique-alice']
+
+
+def test_blocked_chat_does_not_send_or_navigate_around_modal(dispatch, monkeypatch):
+    def blocked(*_a):
+        raise SendNotAttempted('TikTok modal requires manual action')
+    monkeypatch.setattr(checker, 'open_chat_by_list', blocked)
+    monkeypatch.setattr(checker, 'open_chat_by_profile', lambda *_a: pytest.fail('do not navigate around a blocking modal'))
+    monkeypatch.setattr(checker, 'send_message', lambda *_a: pytest.fail('blocked chat must not send'))
+    summary = RunSummary('test', 1)
+    checker.process_target(object(), Target('alice', 'https://www.tiktok.com/@alice'), summary)
+    assert summary.results[0].reason == 'chat_blocked'
