@@ -68,6 +68,7 @@ def test_current_run_snapshot_exposes_terminal_result_metadata(tmp_path: Path) -
     assert run["completed_at"] == 999.0
     assert run["is_active"] is False
     assert run["success_count"] == 1
+    assert run['delivery_verified'] is False
 
 
 def test_current_run_snapshot_upgrades_legacy_idle_summary(tmp_path: Path) -> None:

@@ -59,6 +59,7 @@ class TargetResult:
     is_new_day: bool = False
     reason: str | None = None
     screenshot_path: Path | None = None
+    confirmation: str | None = None
 
 
 @dataclass
@@ -91,6 +92,7 @@ class RunSummary:
         streak_count: int | None = None,
         skipped: bool = False,
         reason: str | None = None,
+        confirmation: str | None = None,
     ) -> None:
         """Backward-compatible API kept for legacy tiktok_checker.py.
 
@@ -109,6 +111,7 @@ class RunSummary:
                 message=message,
                 streak_count=streak_count,
                 reason=effective_reason,
+                confirmation=confirmation,
             )
         )
 
@@ -129,6 +132,7 @@ class RunSummary:
                     'streak_count': r.streak_count,
                     'is_new_day': r.is_new_day,
                     'reason': r.reason,
+                    'confirmation': r.confirmation,
                     'skipped': r.skipped or r.reason == 'cooldown',
                     'screenshot_path': str(r.screenshot_path) if r.screenshot_path else None,
                 }

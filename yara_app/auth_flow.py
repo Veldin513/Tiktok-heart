@@ -55,7 +55,7 @@ def _launch_persistent_chromium(playwright, user_data_dir, *, headless: bool, ar
     return playwright.chromium.launch_persistent_context(**kwargs)
 
 
-def record_session_validation(state_dir: Path, *, valid: bool, source: str, reason: str = '') -> None:
+def record_session_validation(state_dir: Path, *, valid: bool | None, source: str, reason: str = '') -> None:
     """Store only validation metadata, never cookies or page contents."""
     temporary = None
     try:
@@ -320,6 +320,17 @@ def notify_auth_rate_limit(tg, auth_runtime: dict, seconds_left: int) -> None:
         f"Wait about {_format_wait_time(seconds_left)} before trying again."
     )
     auth_runtime["auth_rate_limit_notified"] = True
+
+
+def explicitly_logged_out(page) -> bool:
+    """Only positive logout evidence; a timeout or missing DOM is unknown."""
+    try:
+        url = urlparse(page.url)
+        if url.scheme != 'https' or url.hostname not in ('tiktok.com', 'www.tiktok.com'):
+            return False
+        return url.path.startswith('/login') or bool(page.locator('[data-e2e="top-login-button"]:visible').count())
+    except Exception:
+        return False
 
 
 def is_logged_in(page) -> bool:

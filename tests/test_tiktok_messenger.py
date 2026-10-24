@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from yara_app.tiktok_messenger import open_chat_by_list, open_chat_by_profile
+from yara_app.tiktok_messenger import _names_match, open_chat_by_list, open_chat_by_profile
 
 
 class FakeLocator:
@@ -144,6 +144,12 @@ class FakePage:
 
 
 class MessengerTests(unittest.TestCase):
+    def test_similar_name_is_not_the_target(self):
+        self.assertFalse(_names_match('Ann', 'Joanna'))
+        self.assertFalse(_names_match('alice', 'alice123'))
+        self.assertFalse(_names_match('alice', 'bob\nalice'))
+        self.assertTrue(_names_match('alice', 'alice\nlast message'))
+
     def test_legacy_plan_a_is_preferred_when_it_works(self):
         page = FakePage(legacy_opens_editor=True, strict_opens_editor=True)
         self.assertTrue(open_chat_by_list(page, 'alice'))

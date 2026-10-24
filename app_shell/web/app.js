@@ -590,13 +590,14 @@ function renderProfiles(diag) {
 
   targetsBox.innerHTML = targets.map((target) => {
     const targetState = target.state || {};
+    const unconfirmed = Boolean(targetState.delivery_unconfirmed);
     const ready = Boolean(targetState.ready);
     const cooldown = Number(targetState.cooldown_left_h || 0);
     const cooldownLeft = targetState.cooldown_left_text || `${cooldown.toFixed(1)} ч`;
     const nextSend = targetState.next_send_at_text || "";
-    const cooldownText = ready ? "можно отправить сейчас" : `отправка через ${cooldownLeft}`;
+    const cooldownText = unconfirmed ? "результат отправки неизвестен; проверьте чат перед новой попыткой" : (ready ? "можно отправить сейчас" : `отправка через ${cooldownLeft}`);
     const nextSendText = ready ? "" : ` · ${escapeHtml(nextSend)}`;
-    const badge = ready ? `<span class="badge ok">готов</span>` : `<span class="badge warn">cooldown</span>`;
+    const badge = unconfirmed ? `<span class="badge warn">не подтверждено</span>` : (ready ? `<span class="badge ok">готов</span>` : `<span class="badge warn">cooldown</span>`);
     const streak = Number(targetState.streak_count || 0);
     const stateFiles = targetState.state_files || {};
     const fileCount = (stateFiles.last_send || []).length + (stateFiles.stats || []).length;
@@ -615,7 +616,7 @@ function renderProfiles(diag) {
           <span style="width:${ready ? 100 : cooldownProgress}%"></span>
         </div>
         <div class="target-actions">
-          <button class="btn secondary" data-target-action="reset_cooldown" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">Сброс cooldown</button>
+          <button class="btn secondary" data-target-action="reset_cooldown" data-unconfirmed="${unconfirmed}" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">${unconfirmed ? "Разрешить новую попытку" : "Сброс cooldown"}</button>
           <button class="btn secondary" data-copy-text="${escapeHtml(target.url || target.name || "")}" data-copy-label="Ссылка на адресата">Скопировать ссылку</button>
           <input class="mini-input" type="number" min="0" step="1" value="${streak}" data-streak-input />
           <button class="btn secondary" data-target-action="set_streak" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">Серия</button>
@@ -693,7 +694,7 @@ function renderFocusPanel(diag = {}) {
   const last = history.length ? history[history.length - 1] : null;
   const runStatus = String(run.status || "unknown");
   const runLabels = {
-    success: `Отправлено ${Number(run.success_count || 0)}/${Number(run.total_targets || 0)}`,
+    success: run.delivery_verified ? `TikTok принял ${Number(run.success_count || 0)}/${Number(run.total_targets || 0)}` : "Успех записан без подтверждения (старая версия)",
     partial: `Частично: ${Number(run.success_count || 0)} успешно`,
     failed: "Запуск завершён с ошибкой",
     skipped: "Запуск пропущен",
@@ -709,6 +710,12 @@ function renderFocusPanel(diag = {}) {
     no_targets: "нет адресатов",
     offline: "нет подключения к интернету",
     auth_failed: "нужна авторизация",
+    auth_check_inconclusive: "страница не проверена; потеря входа не подтверждена",
+    delivery_unconfirmed: "результат отправки неизвестен — проверьте чат",
+    send_rejected: "TikTok отклонил сообщение",
+    send_not_attempted: "отправка не выполнялась",
+    chat_not_confirmed: "чат адресата не подтверждён",
+    dry_run: "тест без отправки",
     stop_requested: "остановлено пользователем",
     paused: "пауза",
     recent_guard: "защита от повторной отправки",
@@ -1599,6 +1606,14 @@ function bindActions() {
     button.disabled = true;
     try {
       let value = 0;
+      if (button.dataset.unconfirmed === "true") {
+        const confirmed = await confirmAction({
+          title: "Разрешить новую попытку?",
+          message: "Предыдущий результат неизвестен. Проверьте чат TikTok: повторная попытка может создать дубликат. Вы проверили, что сообщение не отправлено?",
+          confirmLabel: "Проверил, разрешить",
+        });
+        if (!confirmed) return;
+      }
       if (button.dataset.targetAction === "set_streak") {
         const input = button.closest(".target-item")?.querySelector("[data-streak-input]");
         value = Math.max(0, Number(input ? input.value : 0) || 0);

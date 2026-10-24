@@ -1374,6 +1374,8 @@ class ProjectAdapter:
             if target_state.get("ready"):
                 ready_count += 1
                 continue
+            if target_state.get('delivery_unconfirmed'):
+                continue
             cooldown_count += 1
             next_send_at = target_state.get("next_send_at")
             if next_send_at and (next_item is None or float(next_send_at) < float(next_item.get("next_send_at") or 0)):
@@ -1498,6 +1500,10 @@ class ProjectAdapter:
         existing_last_send = [str(path) for path in paths['last_send'] if path.exists()]
         existing_stats = [str(path) for path in paths['stats'] if path.exists()]
         cooldown_progress = 100.0 if cooldown_left_s <= 0 else 100.0 - ((cooldown_left_s / cooldown_total_s) * 100.0)
+        delivery_guard = self._read_json(
+            self._get_profile_state_dir(profile_key) / 'target_send_guards' / f'{safe_name_key(target_name)}.json', {},
+        )
+        delivery_unconfirmed = isinstance(delivery_guard, dict) and delivery_guard.get('status') == 'unconfirmed'
 
         return {
             'last_send_at': last_send_at,
@@ -1510,7 +1516,8 @@ class ProjectAdapter:
             'cooldown_left_text': self._format_seconds_short(cooldown_left_s),
             'next_send_at': next_send_at,
             'next_send_at_text': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_send_at)) if next_send_at else '',
-            'ready': cooldown_left_s <= 0,
+            'ready': cooldown_left_s <= 0 and not delivery_unconfirmed,
+            'delivery_unconfirmed': delivery_unconfirmed,
             'state_files': {
                 'last_send': existing_last_send,
                 'stats': existing_stats,
@@ -1539,6 +1546,11 @@ class ProjectAdapter:
         deletes only that file, and returns ``(1, path_str)`` on success or
         ``(0, '')`` if no file was found.
         """
+        guard_path = self._get_profile_state_dir(profile_key) / 'target_send_guards' / f'{safe_name_key(target_name)}.json'
+        guard = self._read_json(guard_path, {})
+        cleared_guard = isinstance(guard, dict) and guard.get('status') == 'unconfirmed'
+        if cleared_guard:
+            guard_path.unlink(missing_ok=True)
         for path in self._iter_target_state_paths(target_name, profile_key)['last_send']:
             if path.exists():
                 try:
@@ -1546,7 +1558,7 @@ class ProjectAdapter:
                 except FileNotFoundError:
                     return 0, ''
                 return 1, str(path)
-        return 0, ''
+        return (1, str(guard_path)) if cleared_guard else (0, '')
 
     def set_target_streak(self, target_name: str, new_count: int,
                           profile_key: str | None = None) -> tuple[int, str]:
@@ -1750,6 +1762,10 @@ class ProjectAdapter:
             "current_target": run_state.get("current_target"),
             "total_targets": int(run_state.get("total_targets") or summary.get("total_targets") or 0),
             "success_count": success_count,
+            "delivery_verified": success_count > 0 and sum(
+                1 for result in results if isinstance(result, dict) and result.get('success')
+                and result.get('confirmation') == 'server_ack'
+            ) == success_count,
             "skipped_count": skipped_count,
             "failed_count": failed_count,
             "duration_seconds": float(summary.get("duration_seconds") or 0),

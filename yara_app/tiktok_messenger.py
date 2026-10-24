@@ -9,9 +9,19 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import unicodedata
 from collections.abc import Iterable
 from contextlib import suppress
+
+from yara_app.auth_flow import explicitly_logged_out
+from yara_app.delivery import (
+    DeliveryRejected,
+    DeliveryUnconfirmed,
+    SendNotAttempted,
+    SendReceipt,
+    attach_delivery_tracker,
+)
 
 logger = logging.getLogger(__name__)
 MESSAGES_URL = 'https://www.tiktok.com/messages'
@@ -62,8 +72,8 @@ def _normalize_target_name(value: str) -> str:
 
 def _names_match(expected: str, candidate: str) -> bool:
     expected_norm = _normalize_target_name(expected)
-    candidate_norm = _normalize_target_name(candidate)
-    return bool(expected_norm and candidate_norm and (expected_norm in candidate_norm or candidate_norm in expected_norm))
+    first_line = next((line for line in (candidate or '').splitlines() if line.strip()), '')
+    return bool(expected_norm and expected_norm == _normalize_target_name(first_line))
 
 
 def _iter_inbox_items(page, *, visible_first: bool = True) -> Iterable[object]:
@@ -103,25 +113,13 @@ def _open_chat_by_strict_list(page, target_name: str) -> bool:
     Also tries scrolling the inbox list to reveal virtualised rows that
     are not yet in the DOM (TikTok uses a windowed list).
     """
-    import unicodedata as _ud
-
     try:
         page.locator(INBOX_ITEM_SELECTOR).first.wait_for(state='attached', timeout=5000)
     except Exception:
         return False
 
-    _nfkc = _ud.normalize('NFKC', target_name)
-    _slug = _ud.normalize('NFKD', _nfkc).encode('ascii', 'ignore').decode('ascii').lower()
-
     def _any_match(candidate_text: str) -> bool:
-        if _names_match(target_name, candidate_text):
-            return True
-        if _slug and len(_slug) >= 3:
-            slug2 = _ud.normalize('NFKD', _ud.normalize('NFKC', candidate_text)
-                    ).encode('ascii', 'ignore').decode('ascii').lower()
-            if _slug in slug2:
-                return True
-        return False
+        return _names_match(target_name, candidate_text)
 
     def _scan_current_rows() -> bool:
         for locator in _iter_inbox_items(page, visible_first=True):
@@ -175,7 +173,7 @@ def _open_chat_from_inbox_items(page, target_name: str, *, visible: bool) -> boo
         # Skip activity/notification items — they are not chat conversations
         if _item_is_activity(candidate_text):
             continue
-        if target_name not in candidate_text and not _names_match(target_name, candidate_text):
+        if not _names_match(target_name, candidate_text):
             continue
         _dom_click(locator)
         if _wait_for_editor(page, 2500):
@@ -342,7 +340,7 @@ def open_chat_by_list(page, target_name: str) -> bool:
     # Step 1: exact visible-text search — try original name then NFKC variant
     for _name in dict.fromkeys([target_name, name_nfkc]):
         try:
-            loc = page.get_by_text(_name).filter(visible=True).first
+            loc = page.get_by_text(_name, exact=True).filter(visible=True).first
             if _try_open_locator(loc, page, wait_timeout_ms=1500, editor_timeout_ms=3000):
                 logger.info('✅ Чат найден в списке (visible exact, вариант «%s»)!', _name)
                 return True
@@ -352,7 +350,7 @@ def open_chat_by_list(page, target_name: str) -> bool:
     # Step 2: broad search (includes hidden locators) — try original name then NFKC
     for _name in dict.fromkeys([target_name, name_nfkc]):
         try:
-            loc = page.get_by_text(_name).first
+            loc = page.get_by_text(_name, exact=True).first
             if _try_open_locator(loc, page, wait_timeout_ms=1500, editor_timeout_ms=2500):
                 logger.info('✅ Чат найден в списке (broad, вариант «%s»)!', _name)
                 return True
@@ -386,7 +384,7 @@ def open_chat_by_profile(page, profile_url: str) -> bool:
     page.goto(final_url, wait_until='domcontentloaded')
     logger.info("Ищу кнопку 'Сообщение' в профиле...")
     opened = False
-    for selector in ('[data-e2e="message-button"]', 'button[data-e2e*="message"]', 'a[href*="/messages"]'):
+    for selector in ('[data-e2e="message-button"]', 'button[data-e2e*="message"]'):
         try:
             candidate = page.locator(selector).first
             candidate.wait_for(state='attached', timeout=2500)
@@ -398,7 +396,7 @@ def open_chat_by_profile(page, profile_url: str) -> bool:
     if not opened:
         for label in MESSAGE_BUTTON_TEXTS:
             try:
-                candidate = page.get_by_text(label, exact=False).first
+                candidate = page.get_by_role('button', name=label, exact=True).first
                 candidate.wait_for(state='attached', timeout=1500)
                 _dom_click(candidate)
                 opened = True
@@ -415,15 +413,48 @@ def open_chat_by_profile(page, profile_url: str) -> bool:
     return True
 
 
-def send_message(page, text: str) -> None:
+def send_message(page, text: str, *, confirmation_timeout_ms: int = 15000) -> SendReceipt:
+    tracker = attach_delivery_tracker(page)
     logger.info('Ожидание поля ввода...')
     input_box = page.locator(EDITOR_SELECTOR)
-    input_box.wait_for(state='attached', timeout=15000)
-    input_box.evaluate('node => node.focus()')
-    logger.info('Печатаем сообщение: %s', text)
+    input_box.wait_for(state='visible', timeout=15000)
+    if input_box.inner_text(timeout=2000).strip():
+        raise SendNotAttempted('В поле ввода есть черновик. Отправка не выполнялась.')
+    input_box.click(timeout=5000)
     page.keyboard.insert_text(text)
-    page.wait_for_timeout(250)
-    page.keyboard.press('Enter')
+    if input_box.inner_text(timeout=2000).strip() != text.strip():
+        raise SendNotAttempted('Текст не появился в поле ввода. Отправка не выполнялась.')
+    tracker.begin(text)
+    try:
+        send_button = page.locator('[data-e2e="message-send"]:visible').first
+        if send_button.count():
+            if not send_button.is_enabled():
+                raise SendNotAttempted('Кнопка отправки недоступна. Отправка не выполнялась.')
+            send_button.click(timeout=3000)
+        else:
+            page.keyboard.press('Enter')
+        deadline = time.monotonic() + confirmation_timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if tracker.rejection:
+                raise DeliveryRejected(tracker.rejection)
+            if tracker.receipt is not None:
+                return tracker.receipt
+            if explicitly_logged_out(page):
+                raise DeliveryUnconfirmed('Вход потерян во время отправки. Приём сообщения не подтверждён.')
+            page.wait_for_timeout(200)
+        raise DeliveryUnconfirmed('TikTok не подтвердил приём сообщения. Результат неизвестен; успех не записан.')
+    except (DeliveryUnconfirmed, DeliveryRejected, SendNotAttempted):
+        raise
+    except Exception:
+        raise DeliveryUnconfirmed('Не удалось проверить результат отправки; успех не записан.') from None
+    finally:
+        if tracker.receipt is None:
+            # Remove only the exact text this attempt put into an initially
+            # empty composer. Do not erase a different/user-authored draft.
+            with suppress(Exception):
+                if input_box.inner_text(timeout=1000).strip() == text.strip():
+                    input_box.fill('')
+        tracker.end()
 
 
 __all__ = [

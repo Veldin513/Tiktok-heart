@@ -13,6 +13,9 @@ class FakePage:
     def __init__(self) -> None:
         self.goto_calls: list[str] = []
 
+    def on(self, *_args):
+        pass
+
     def goto(self, url: str, **_kwargs) -> None:
         self.goto_calls.append(url)
 
@@ -91,6 +94,7 @@ def test_lost_session_stops_future_browser_attempts_and_preserves_profile(tmp_pa
     monkeypatch.setattr(checker, 'init_work_browser', lambda *_a: launches.append(True) or context)
     monkeypatch.setattr(checker, 'detect_captcha', lambda *_a, **_kw: {'found': False})
     monkeypatch.setattr(checker, 'wait_for_authenticated_page', lambda _page: False)
+    monkeypatch.setattr(checker, 'explicitly_logged_out', lambda _page: True)
     monkeypatch.setattr(checker, 'safe_close_context', lambda *_a: context.close())
 
     assert checker.open_logged_in_work_browser(object()) == (False, None, None)
@@ -104,9 +108,20 @@ def test_lost_session_stops_future_browser_attempts_and_preserves_profile(tmp_pa
 def test_mid_run_session_loss_stops_dispatch(tmp_path, monkeypatch):
     monkeypatch.setattr(checker, 'PATHS', SimpleNamespace(state_dir=tmp_path))
     monkeypatch.setattr(checker, 'is_logged_in', lambda _page: False)
+    monkeypatch.setattr(checker, 'explicitly_logged_out', lambda _page: True)
     with pytest.raises(checker.AuthSessionUnavailable):
         checker.require_work_session(object())
     assert (tmp_path / 'session_import_required.json').exists()
+
+
+def test_missing_dom_without_logout_is_unknown_not_a_revoked_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(checker, 'PATHS', SimpleNamespace(state_dir=tmp_path))
+    monkeypatch.setattr(checker, 'is_logged_in', lambda _p: False)
+    monkeypatch.setattr(checker, 'explicitly_logged_out', lambda _p: False)
+    monkeypatch.setattr(checker, 'detect_captcha', lambda *_a, **_k: {'found': False})
+    with pytest.raises(checker.AuthCheckInconclusive):
+        checker.require_work_session(object())
+    assert not (tmp_path / 'session_import_required.json').exists()
 
 
 def test_missing_metadata_does_not_block_authenticated_browser(tmp_path, monkeypatch):

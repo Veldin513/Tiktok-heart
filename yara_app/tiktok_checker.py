@@ -18,6 +18,7 @@ from playwright.sync_api import sync_playwright
 from yara_app.auth_flow import (
     auth_backoff_seconds_left,
     clear_auth_backoff,
+    explicitly_logged_out,
     init_work_browser,
     is_logged_in,
     record_session_validation,
@@ -25,6 +26,13 @@ from yara_app.auth_flow import (
     wait_for_authenticated_page,
 )
 from yara_app.config import BOT_NAME, TG_CHAT_IDS, TG_DISABLE_NOTIFICATIONS, TG_TOKEN, MessageSelector, get_cli_profile
+from yara_app.delivery import (
+    DeliveryRejected,
+    DeliveryUnconfirmed,
+    SendNotAttempted,
+    SendReceipt,
+    attach_delivery_tracker,
+)
 from yara_app.project_adapter import ProjectAdapter
 from yara_app.runtime_paths import (
     RunLock,
@@ -353,6 +361,10 @@ def ready_targets_for_run(targets: list[Target], summary: RunSummary) -> list[Ta
     ready: list[Target] = []
     boot_force = force_send_on_boot()
     for target in targets:
+        if target_delivery_unconfirmed(target.name):
+            summary.add_result(target=target.name, success=False, skipped=True, reason='delivery_unconfirmed')
+            _append_run_history('target_result', target=target.name, success=False, skipped=True, reason='delivery_unconfirmed')
+            continue
         cooldown = store.get_cooldown_status(target.name)
         if cooldown.allowed:
             ready.append(target)
@@ -388,6 +400,13 @@ def target_guard_path(target_name: str) -> Path:
     return TARGET_GUARD_DIR / f'{safe_name_key(target_name)}.json'
 
 
+def target_delivery_unconfirmed(target_name: str) -> bool:
+    try:
+        return json.loads(target_guard_path(target_name).read_text(encoding='utf-8')).get('status') == 'unconfirmed'
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def acquire_target_send_guard(target_name: str) -> tuple[bool, dict[str, Any]]:
     TARGET_GUARD_DIR.mkdir(parents=True, exist_ok=True)
     path = target_guard_path(target_name)
@@ -409,6 +428,8 @@ def acquire_target_send_guard(target_name: str) -> tuple[bool, dict[str, Any]]:
                 existing = json.loads(path.read_text(encoding='utf-8-sig'))
             except Exception:
                 existing = {}
+            if existing.get('status') == 'unconfirmed':
+                return False, {'path': str(path), 'reason': 'delivery_unconfirmed'}
             started_at = float(existing.get('started_at') or 0)
             age = now - started_at if started_at else TARGET_SEND_GUARD_SECONDS + 1
             if age >= TARGET_SEND_GUARD_SECONDS:
@@ -478,28 +499,18 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
     with timed_phase('target_open_messages', target=target.name):
         open_messages(page)
     require_work_session(page)
+    # Prefer the configured unique profile URL over a display name shared by
+    # several conversations. A failed profile lookup must not pick a namesake.
     try:
-        with timed_phase('target_open_chat', target=target.name, method='list'):
-            chat_opened = open_chat_by_list(page, target.name)
-    except Exception as exc:
-        logger.warning('List strategy failed for %s; trying profile fallback: %s', target.name, exc)
+        method = 'profile' if target.profile_url else 'list'
+        with timed_phase('target_open_chat', target=target.name, method=method):
+            chat_opened = open_chat_by_profile(page, target.profile_url) if target.profile_url else open_chat_by_list(page, target.name)
+    except Exception:
         chat_opened = False
     if not chat_opened:
-        logger.info('List strategy did not open chat for %s; trying profile fallback.', target.name)
-        _append_run_history('target_open_chat_result', target=target.name, method='list', ok=False, reason='not_found')
-    if not chat_opened and target.profile_url:
-        try:
-            with timed_phase('target_open_chat', target=target.name, method='profile'):
-                chat_opened = open_chat_by_profile(page, target.profile_url)
-        except Exception as exc:
-            logger.error('Не удалось открыть чат через профиль для %s: %s', target.name, exc)
-            summary.add_result(target=target.name, success=False, reason='profile_open_failed')
-            _append_run_history('target_result', target=target.name, success=False, reason='profile_open_failed', error=str(exc))
-            return
-    elif not chat_opened and not target.profile_url:
-        logger.error('Пропускаем %s: нет ссылки.', target.name)
-        summary.add_result(target=target.name, success=False, reason='profile_url_missing')
-        _append_run_history('target_result', target=target.name, success=False, reason='profile_url_missing')
+        logger.warning('Не удалось подтвердить чат адресата. Отправка пропущена.')
+        summary.add_result(target=target.name, success=False, reason='chat_not_confirmed')
+        _append_run_history('target_result', target=target.name, success=False, reason='chat_not_confirmed')
         return
 
     require_work_session(page)
@@ -507,8 +518,8 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
     message = message_selector.next()
     if runtime_state.dry_run:
         logger.info('DRY RUN: сообщение для %s не отправляется: %s', target.name, message)
-        summary.add_result(target=target.name, success=True, message=message, streak_count=store.get_streak_count(target.name))
-        _append_run_history('target_result', target=target.name, success=True, dry_run=True, reason='dry_run', message=message)
+        summary.add_result(target=target.name, success=False, skipped=True, reason='dry_run', message=message, streak_count=store.get_streak_count(target.name))
+        _append_run_history('target_result', target=target.name, success=False, skipped=True, dry_run=True, reason='dry_run', message=message)
         return
 
     guard_ok, guard = acquire_target_send_guard(target.name)
@@ -520,7 +531,23 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
 
     try:
         with timed_phase('target_send_message', target=target.name):
-            send_message(page, message)
+            receipt = send_message(page, message)
+            if not isinstance(receipt, SendReceipt):
+                raise DeliveryUnconfirmed('Нет подтверждения сервера TikTok.')
+    except (DeliveryUnconfirmed, DeliveryRejected, SendNotAttempted) as exc:
+        reason = 'send_not_attempted' if isinstance(exc, SendNotAttempted) else ('send_rejected' if isinstance(exc, DeliveryRejected) else 'delivery_unconfirmed')
+        if reason == 'delivery_unconfirmed':
+            path = target_guard_path(target.name)
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            payload.update({'status': 'unconfirmed', 'updated_at': time.time()})
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        logger.warning('Отправка не подтверждена: %s', exc)
+        summary.add_result(target=target.name, success=False, reason=reason)
+        _append_run_history('target_result', target=target.name, success=False, reason=reason)
+        if explicitly_logged_out(page):
+            mark_session_import_required('session_lost_during_send')
+            raise AuthSessionUnavailable('Вход потерян во время отправки.') from None
+        return
     except Exception as exc:
         logger.error('Не удалось отправить сообщение для %s: %s', target.name, exc)
         summary.add_result(target=target.name, success=False, reason='send_failed')
@@ -531,14 +558,19 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
         store.mark_sent_now(target.name)
         mark_target_guard_sent(target.name)
         streak = store.update_streak_stats(target.name)
-    logger.info('✅ Успех! Текущий огонек: %s', streak.current_count)
+    logger.info('✅ TikTok подтвердил приём сообщения. Текущий огонек: %s', streak.current_count)
     tg.send_target_success(target_name=target.name, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day)
-    summary.add_result(target=target.name, success=True, message=message, streak_count=streak.current_count)
-    _append_run_history('target_result', target=target.name, success=True, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day)
+    summary.add_result(target=target.name, success=True, message=message, streak_count=streak.current_count, confirmation='server_ack')
+    _append_run_history('target_result', target=target.name, success=True, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day,
+                        confirmation='server_ack', server_message_id=receipt.server_message_id, transport=receipt.transport)
     time.sleep(1.5)
 
 
 class AuthSessionUnavailable(RuntimeError):
+    pass
+
+
+class AuthCheckInconclusive(RuntimeError):
     pass
 
 
@@ -551,9 +583,12 @@ def mark_session_import_required(reason: str) -> None:
 
 
 def require_work_session(page) -> None:
-    if not is_logged_in(page) or detect_captcha(page, timeout_ms=700).get('found'):
+    if explicitly_logged_out(page) or detect_captcha(page, timeout_ms=700).get('found'):
         mark_session_import_required('session_lost_during_run')
         raise AuthSessionUnavailable('Сессия потеряна. Повторите перенос входа из Chrome.')
+    if not is_logged_in(page):
+        record_session_validation(PATHS.state_dir, valid=None, source='worker', reason='page_not_ready')
+        raise AuthCheckInconclusive('Страница не готова; потеря входа не подтверждена.')
 
 
 def open_logged_in_work_browser(playwright):
@@ -574,6 +609,7 @@ def open_logged_in_work_browser(playwright):
         with timed_phase('work_browser_launch'):
             context = init_work_browser(playwright, PATHS.user_data_dir)
         page = context.pages[0] if context.pages else context.new_page()
+        attach_delivery_tracker(page)
         with timed_phase('work_browser_goto_messages'):
             response = page.goto('https://www.tiktok.com/messages', wait_until='domcontentloaded', timeout=60000)
         if response is not None and response.status >= 400:
@@ -583,8 +619,11 @@ def open_logged_in_work_browser(playwright):
             mark_session_import_required('verification_required')
             return False, None, None
         if not wait_for_authenticated_page(page):
-            mark_session_import_required('session_not_confirmed')
-            return False, None, None
+            if explicitly_logged_out(page):
+                mark_session_import_required('session_not_confirmed')
+                return False, None, None
+            record_session_validation(PATHS.state_dir, valid=None, source='worker', reason='auth_check_timeout')
+            raise AuthCheckInconclusive('Страница TikTok не загрузилась или изменилась. Требование нового входа не установлено.')
         clear_auth_backoff(AUTH_BACKOFF_FILE)
         record_session_validation(PATHS.state_dir, valid=True, source='worker')
         keep = True
@@ -642,11 +681,13 @@ def run_browser_self_test() -> dict[str, Any]:
                 with local_phase('auth_probe'):
                     result['logged_in'] = wait_for_authenticated_page(page)
                     result['url'] = getattr(page, 'url', '') or result.get('url', '')
+                    result['explicit_logout'] = explicitly_logged_out(page)
             finally:
                 safe_close_context(context, page)
         result['ok'] = bool(result['opened_browser']) and bool(result['logged_in']) and not bool(result['captcha'].get('found'))
-        record_session_validation(PATHS.state_dir, valid=result['ok'], source='self_test', reason='' if result['ok'] else 'session_not_confirmed')
-        if not result['ok']:
+        invalid = bool(result['captcha'].get('found')) or bool(result.get('explicit_logout'))
+        record_session_validation(PATHS.state_dir, valid=True if result['ok'] else (False if invalid else None), source='self_test', reason='' if result['ok'] else 'session_not_confirmed')
+        if not result['ok'] and invalid:
             mark_session_import_required('self_test_not_confirmed')
     except Exception as exc:  # noqa: BLE001
         result['ok'] = False
@@ -775,6 +816,12 @@ def check_tiktok_streak() -> None:
             finally:
                 logger.info('Закрытие браузера.')
                 safe_close_context(work_context, work_page)
+    except AuthCheckInconclusive:
+        terminal_status = 'failed'
+        terminal_reason = 'auth_check_inconclusive'
+        summary.add_result(target='__run__', success=False, reason=terminal_reason)
+        _append_run_history('run_failed', reason=terminal_reason)
+        logger.warning('Не удалось проверить страницу TikTok. Вход не признан потерянным; отправка не выполняется.')
     except AuthSessionUnavailable:
         terminal_status = 'failed'
         terminal_reason = 'session_import_required'
