@@ -301,6 +301,7 @@ function renderDiagnostics(diag) {
 }
 
 function renderLiveStatus(diag, options = {}) {
+  renderProfileLoginShortcut(diag);
   const worker = diag.worker || {};
   const telegram = diag.telegram_bot || {};
   const browser = diag.browser_profile || {};
@@ -532,6 +533,13 @@ async function loadMessages(force = false) {
   $("#message-editor-state").textContent = "Загружено";
 }
 
+function renderProfileLoginShortcut(diag) {
+  const button = $("#profile-import-shortcut");
+  if (!button) return;
+  const profileKey = state.selectedProfileKey || diag.state?.active_profile;
+  button.hidden = !profileKey || diag.profile_login_confirmed?.[profileKey] === true;
+}
+
 function renderProfiles(diag) {
   const profiles = ((diag.profiles && diag.profiles.items) || []).filter(Boolean);
   const profilesBox = $("#profiles-list");
@@ -539,6 +547,7 @@ function renderProfiles(diag) {
   if (!profilesBox || !targetsBox) return;
 
   if (!profiles.length) {
+    $("#profile-import-shortcut").hidden = true;
     profilesBox.innerHTML = `<div class="list-item">Профили не найдены</div>`;
     targetsBox.innerHTML = `<div class="list-item">Нет адресатов</div>`;
     return;
@@ -549,6 +558,7 @@ function renderProfiles(diag) {
     state.selectedProfileKey = activeProfile.key;
   }
   const selectedProfile = profiles.find((profile) => profile.key === state.selectedProfileKey) || activeProfile;
+  renderProfileLoginShortcut(diag);
   $("#target-profile-caption").textContent = `Адресаты профиля: ${selectedProfile.label || selectedProfile.key}. Для работы нажмите «Использовать» у нужного профиля.`;
 
   profilesBox.innerHTML = profiles.map((profile) => {

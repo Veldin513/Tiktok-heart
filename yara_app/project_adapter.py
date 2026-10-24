@@ -1341,6 +1341,19 @@ class ProjectAdapter:
             return {'valid': None, 'checked_at': None}
         return {'valid': payload['valid'], 'checked_at': checked_at}
 
+    def profile_login_confirmed(self, profile_key: str) -> bool:
+        """Last verified local state; never contact TikTok to render a button."""
+        root = self._bot_profile_root(profile_key)
+        if self._session_validation_summary(root).get('valid') is not True:
+            return False
+        if (root / 'state' / 'session_import_required.json').exists() or (root / 'browser' / LOGIN_PENDING).exists():
+            return False
+        data = root / 'browser' / 'user_data'
+        return (
+            any((data / 'Default' / rel).is_file() for rel in ('Network/Cookies', 'Cookies'))
+            and not browser_profile_needs_recovery(data)
+        )
+
     def browser_profile_summary(self, profile_key: str | None = None) -> dict[str, Any]:
         profile_root = self._bot_profile_root(profile_key)
         browser_dir = profile_root / "browser"
@@ -2674,6 +2687,7 @@ class ProjectAdapter:
         return {
             "app": self.app_metadata(),
             "mode": "live",
+            "profile_login_confirmed": {profile.key: self.profile_login_confirmed(profile.key) for profile in profiles},
             "updated_at": time.time(),
             "base_dir": str(self.base_dir),
             "telegram_ready": telegram_ready,
@@ -3308,6 +3322,7 @@ class ProjectAdapter:
                 "items": chrome_profiles,
                 "error": chrome_profiles_error,
             },
+            "profile_login_confirmed": {profile.key: self.profile_login_confirmed(profile.key) for profile in profiles},
             "worker_schedule": worker_schedule,
             "profiles": {
                 "total": len(profiles),
