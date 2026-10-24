@@ -267,30 +267,14 @@ function browserAuthStatus(browser = {}) {
   return { label: "Вход не проверен", kind: "info", details: "Cookies сохранены; результат проверки входа ещё не записан. Это не означает потерю авторизации." };
 }
 
-function liveHealth(diag = {}) {
-  const browser = diag.browser_profile || {};
-  const schedule = diag.worker_schedule || {};
-  const telegramReady = Boolean(diag.telegram_ready);
-  const issues = [];
-  const auth = browserAuthStatus(browser);
-  if (auth.kind !== "ok") issues.push({ severity: auth.kind, title: auth.label, details: auth.details });
-  if (!schedule.installed) {
-    issues.push({ severity: "info", title: "Автозапуск выключен", details: "Worker запускается только вручную." });
-  }
-  if (!telegramReady) {
-    issues.push({ severity: "info", title: "Telegram не настроен", details: "Это не мешает работе worker." });
-  }
-  const warningCount = issues.filter((item) => item.severity === "warning").length;
-  const critical = issues.some((item) => item.severity === "critical");
-  const score = Math.min(critical ? 64 : 100, Math.max(0, 100 - warningCount * 25));
-  const status = critical ? "critical" : (warningCount ? "warning" : "ok");
+function pendingHealth() {
   return {
-    score,
-    status,
-    label: status === "ok" ? "Локальные проверки пройдены" : "Нужна проверка",
-    summary: status === "ok" ? "Основные компоненты доступны." : "Есть один или несколько пунктов для проверки.",
-    issues,
-    recommendations: issues.filter((item) => ["critical", "warning"].includes(item.severity)).map((item) => item.details),
+    score: null,
+    status: "info",
+    label: "Расчёт готовности",
+    summary: "Ожидание результата локальной диагностики.",
+    issues: [],
+    recommendations: [],
   };
 }
 
@@ -406,11 +390,12 @@ function renderLiveStatus(diag, options = {}) {
 }
 
 function renderHealth(health) {
-  const score = Math.max(0, Math.min(100, Number(health.score || 0)));
+  const hasScore = Number.isFinite(health.score);
+  const score = hasScore ? Math.max(0, Math.min(100, health.score)) : 0;
   const kind = healthKind(health.status);
   const panel = $(".health-panel");
   panel.className = `health-panel ${kind}`;
-  $("#health-score").textContent = text(score, "0");
+  $("#health-score").textContent = hasScore ? String(score) : "--";
   $("#health-label").textContent = text(health.label, "Проверка");
   $("#health-summary").textContent = text(health.summary, "Нет данных");
   $("#health-score-fill").style.width = `${score}%`;
@@ -847,7 +832,7 @@ function renderOverviewSummary(diag) {
   const scheduleStale = scheduleIsStale(schedule);
 
   const cards = [
-    ["Готовность", `${health.score || 0}/100`, health.status || "info"],
+    ["Готовность", Number.isFinite(health.score) ? `${health.score}/100` : "Расчёт", health.status || "info"],
     ["Авторизация", browserAuthStatus(browser).label, browserAuthStatus(browser).kind],
     ["Автозапуск", schedule.installed ? (scheduleStale ? "проверить" : "включён") : "выключен", scheduleKind(schedule)],
     ["Профиль", stateData.active_profile || "—", "info"],
@@ -887,7 +872,7 @@ function renderOverviewSummary(diag) {
   ].filter(Boolean).join(" + ") || "выключен";
   const recommendations = (health.recommendations || []).slice(0, 5);
   report.textContent = [
-    `Готовность         : ${health.score || 0}/100 · ${health.summary || "—"}`,
+    `Готовность         : ${Number.isFinite(health.score) ? `${health.score}/100` : "расчёт"} · ${health.summary || "—"}`,
     `Активный профиль  : ${stateData.active_profile || "—"}`,
     `Cookies Chromium   : ${browser.cookies_exists ? "есть" : "нет"}`,
     `Размер профиля     : ${formatBytes(browser.size_bytes)}`,
@@ -1244,7 +1229,9 @@ async function refresh(options = {}) {
         browser_profile: { ...(state.diagnostics?.browser_profile || {}), ...(diag.browser_profile || {}) },
       };
       if (!state.fullDiagnosticsLoaded) {
-        merged.health = liveHealth(merged);
+        merged.health = pendingHealth();
+        state.refreshQueued = true;
+        state.refreshQueuedFull = true;
       }
       state.diagnostics = merged;
       renderLiveStatus(merged, { full: true });

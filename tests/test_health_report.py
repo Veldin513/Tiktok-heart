@@ -43,6 +43,19 @@ def test_existing_cookies_without_validation_are_unknown(tmp_path):
     assert any(item['key'] == 'browser' and item['state'] == 'Не проверена' for item in health['signals'])
 
 
+@pytest.mark.parametrize('worker_running', [False, True])
+def test_optional_telegram_does_not_change_readiness_score(tmp_path, worker_running):
+    adapter = ProjectAdapter(tmp_path)
+    reports = [adapter._build_health(
+        worker_running, False, telegram_ready, {'unique_count': 12}, [object()], {},
+        {'issues': []}, _healthy_browser(), {'installed': True},
+    ) for telegram_ready in (False, True)]
+    assert [report['score'] for report in reports] == [100, 100]
+    assert [report['status'] for report in reports] == ['ok', 'ok']
+    assert reports[0]['breakdown'] == reports[1]['breakdown']
+    assert any(issue['severity'] == 'info' and 'Telegram' in issue['title'] for issue in reports[0]['issues'])
+
+
 @pytest.mark.parametrize('valid', [True, None])
 def test_missing_metadata_alone_does_not_block_working_profile(tmp_path, valid):
     browser = {**_healthy_browser(), 'local_state_exists': False, 'preferences_exists': False,

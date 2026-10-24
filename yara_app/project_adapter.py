@@ -2900,7 +2900,6 @@ class ProjectAdapter:
                        "Профили Google Chrome не найдены.")
 
         if not telegram_ready:
-            control_score -= 10
             add_signal("telegram", "Telegram", "Не настроен", "info",
                        "Удалённое управление через Telegram недоступно.")
             add_issue("info", "Telegram control не настроен",
