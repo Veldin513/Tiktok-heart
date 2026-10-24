@@ -61,6 +61,24 @@ def test_modern_dm_title_not_combined_with_preview_or_hidden_activity(page):
     assert page.locator('.public-DraftEditor-content').inner_text() == ''
 
 
+def test_wait_for_target_nickname_after_first_conversation_row_is_visible(page):
+    seed_inbox(page, title='')
+    page.evaluate('''() => setTimeout(() => {
+      document.querySelector('[data-e2e="dm-new-conversation-nickname"]').textContent='ᵉʳ.ᵐⁱⁿᵉ';
+    }, 800)''')
+    assert open_chat_by_list(page, 'er.mine', 'https://www.tiktok.com/@recipient')
+    assert page.evaluate('window.opened') == 1
+
+
+@pytest.mark.parametrize('title', ['ᵉʳ.ᵐⁱⁿᵉ', 'ᵉʳ.ᵐⁱⁿᵉ •'])
+def test_historical_text_node_click_precedes_row_scan_and_verifies_handle(page, monkeypatch, title):
+    seed_inbox(page, title=title)
+    monkeypatch.setattr('yara_app.tiktok_messenger._open_modern_chat',
+                        lambda *_a: pytest.fail('historical text lookup must work before row scanning'))
+    assert open_chat_by_list(page, 'ᵉʳ.ᵐⁱⁿᵉ', 'https://www.tiktok.com/@recipient')
+    assert page.evaluate('window.opened') == 1
+
+
 def test_message_preview_cannot_match_another_recipient(page):
     seed_inbox(page, title='Bob', preview='er.mine')
     assert not open_chat_by_list(page, 'er.mine', 'https://www.tiktok.com/@recipient')

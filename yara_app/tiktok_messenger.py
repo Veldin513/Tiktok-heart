@@ -120,6 +120,25 @@ def dismiss_chat_notice(page) -> None:
         raise SendNotAttempted('Всплывающее окно TikTok осталось открытым. Отправка не начиналась.')
 
 
+def _chat_profile_verified(page, profile_url: str | None) -> bool:
+    if not profile_url:
+        return True
+    expected = _profile_handle(profile_url)
+    if not expected:
+        return False
+    identifier = page.locator('[data-e2e="chat-uniqueid"]:visible')
+    try:
+        identifier.filter(has_text=re.compile(r'^\s*@?' + re.escape(expected) + r'\s*$', re.IGNORECASE)).first.wait_for(
+            state='visible', timeout=3000,
+        )
+        actual = identifier.first.inner_text().strip()
+        if not actual.startswith('@'):
+            actual = '@' + actual
+        return identifier.count() == 1 and _profile_handle(actual) == expected
+    except Exception:
+        return False
+
+
 def _open_modern_chat(page, target_name: str, profile_url: str | None) -> bool | None:
     rows = page.locator(DM_ITEM_SELECTOR)
     # Some older layouts do not have these rows. Keep the legacy path for them.
@@ -130,14 +149,20 @@ def _open_modern_chat(page, target_name: str, profile_url: str | None) -> bool |
     except Exception:
         return None
     dismiss_chat_notice(page)
-    matches = []
-    for index in range(rows.count()):
-        row = rows.nth(index)
-        if not row.is_visible():
-            continue
-        title = row.locator(DM_NAME_SELECTOR).first
-        if title.count() and _names_match(target_name, title.inner_text()):
-            matches.append(row)
+    deadline = time.monotonic() + 3.0
+    while True:
+        matches = []
+        for index in range(rows.count()):
+            with suppress(Exception):
+                row = rows.nth(index)
+                title = row.locator(DM_NAME_SELECTOR).first
+                if row.is_visible() and title.count() and _names_match(target_name, title.inner_text()):
+                    matches.append(row)
+        if matches or time.monotonic() >= deadline:
+            break
+        # The first row can be interactive while the target's nickname is still
+        # loading. Re-read locators; do not freeze the first incomplete snapshot.
+        _soft_wait(page, 150)
     if len(matches) != 1:
         logger.info('В списке сообщений нет единственного совпадения имени адресата.')
         return False
@@ -150,21 +175,9 @@ def _open_modern_chat(page, target_name: str, profile_url: str | None) -> bool |
     if not _wait_for_editor(page, 5000):
         return False
     dismiss_chat_notice(page)
-    if profile_url:
-        expected = _profile_handle(profile_url)
-        identifier = page.locator('[data-e2e="chat-uniqueid"]:visible')
-        try:
-            identifier.filter(has_text=re.compile(r'^\s*@?' + re.escape(expected) + r'\s*$', re.IGNORECASE)).first.wait_for(
-                state='visible', timeout=3000,
-            )
-            actual = identifier.first.inner_text().strip()
-            if not actual.startswith('@'):
-                actual = '@' + actual
-            if not expected or identifier.count() != 1 or _profile_handle(actual) != expected:
-                logger.warning('Открытый чат не совпал с @username адресата. Отправка через список отменена.')
-                return False
-        except Exception:
-            return False
+    if not _chat_profile_verified(page, profile_url):
+        logger.warning('Открытый чат не совпал с @username адресата. Отправка через список отменена.')
+        return False
     logger.info('✅ Чат открыт через список сообщений; адресат проверен.')
     return True
 
@@ -396,10 +409,20 @@ def open_messages(page) -> None:
         pass
 
 
-def _try_open_locator(locator, page, *, wait_timeout_ms: int, editor_timeout_ms: int) -> bool:
-    locator.wait_for(state='attached', timeout=wait_timeout_ms)
-    _dom_click(locator)
-    return _wait_for_editor(page, editor_timeout_ms)
+def _try_open_locator(
+    locator, page, *, wait_timeout_ms: int, editor_timeout_ms: int,
+    profile_url: str | None = None, unique: bool = False,
+) -> bool:
+    first = locator.first
+    first.wait_for(state='attached', timeout=wait_timeout_ms)
+    if unique and locator.count() != 1:
+        return False
+    dismiss_chat_notice(page)
+    _dom_click(first)
+    if not _wait_for_editor(page, editor_timeout_ms):
+        return False
+    dismiss_chat_notice(page)
+    return _chat_profile_verified(page, profile_url)
 
 
 def _wait_for_chat_after_profile_click(page) -> bool:
@@ -420,14 +443,7 @@ def _inbox_items_attached(page, timeout_ms: int = 1200) -> bool:
 
 
 def open_chat_by_list(page, target_name: str, profile_url: str | None = None) -> bool:
-    """Open a unique DM row; verify its handle, or use legacy name-only layouts."""
-
-    modern = _open_modern_chat(page, target_name, profile_url)
-    if modern is not None:
-        return modern
-    if profile_url:
-        # The old notification rows cannot prove a DM's unique account identity.
-        return False
+    """Keep historical name lookup timing first, then scan DM rows if needed."""
 
     import unicodedata as _ud
     name_nfkc = _ud.normalize('NFKC', target_name)
@@ -435,25 +451,49 @@ def open_chat_by_list(page, target_name: str, profile_url: str | None = None) ->
     _soft_wait(page, 350)
     logger.info('Ищу %s в списке слева...', target_name)
 
+    # Preserve the old text-node click, including decorated nicknames. In the
+    # new layout restrict it to nickname nodes so message previews/notifications
+    # cannot become candidates. A configured URL is verified after every click.
+    modern_layout = callable(getattr(page.get_by_text(target_name), 'and_', None)) and bool(page.locator(DM_ITEM_SELECTOR).count())
+
+    def _name_locator(name):
+        loc = page.get_by_text(name, exact=not bool(profile_url))
+        if modern_layout:
+            loc = loc.and_(page.locator(f'{DM_NAME_SELECTOR}, {DM_NAME_SELECTOR} *'))
+        return loc
+
     # Step 1: exact visible-text search — try original name then NFKC variant
     for _name in dict.fromkeys([target_name, name_nfkc]):
         try:
-            loc = page.get_by_text(_name, exact=True).filter(visible=True).first
-            if _try_open_locator(loc, page, wait_timeout_ms=1500, editor_timeout_ms=3000):
+            loc = _name_locator(_name).filter(visible=True)
+            if _try_open_locator(loc, page, wait_timeout_ms=1500, editor_timeout_ms=3000,
+                                 profile_url=profile_url, unique=modern_layout):
                 logger.info('✅ Чат найден в списке (visible exact, вариант «%s»)!', _name)
                 return True
+        except SendNotAttempted:
+            raise
         except Exception:
             pass
 
     # Step 2: broad search (includes hidden locators) — try original name then NFKC
     for _name in dict.fromkeys([target_name, name_nfkc]):
         try:
-            loc = page.get_by_text(_name, exact=True).first
-            if _try_open_locator(loc, page, wait_timeout_ms=1500, editor_timeout_ms=2500):
+            loc = _name_locator(_name)
+            if _try_open_locator(loc, page, wait_timeout_ms=1500, editor_timeout_ms=2500,
+                                 profile_url=profile_url, unique=modern_layout):
                 logger.info('✅ Чат найден в списке (broad, вариант «%s»)!', _name)
                 return True
+        except SendNotAttempted:
+            raise
         except Exception:
             pass
+
+    modern = _open_modern_chat(page, target_name, profile_url)
+    if modern is not None:
+        return modern
+    if profile_url:
+        # No verified DM/header: do not recover by clicking hidden notifications.
+        return False
 
     # Step 3+4: DOM row scan — unicode-normalised matching, visible then hidden.
     # Do not make this selector mandatory: TikTok sometimes renders the inbox
