@@ -388,6 +388,17 @@ class AppShellHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/import-chrome":
                     self._handle_import_chrome(payload)
                     return
+                if parsed.path in {"/api/dedicated-login/open", "/api/dedicated-login/verify", "/api/dedicated-login/cancel"}:
+                    profile_key = str(payload.get("bot_profile_key") or "") or None
+                    if parsed.path.endswith("/open"):
+                        result = self.adapter.begin_dedicated_login(profile_key)
+                    elif parsed.path.endswith("/verify"):
+                        result = self.adapter.finish_dedicated_login(profile_key)
+                    else:
+                        result = self.adapter.cancel_dedicated_login(profile_key)
+                    self._clear_diagnostics_cache()
+                    self._send_json({"ok": True, "data": result})
+                    return
                 if parsed.path == "/api/import-chrome-request":
                     result = self.adapter.import_chrome_request(
                         request_text=payload.get("request_text", ""),

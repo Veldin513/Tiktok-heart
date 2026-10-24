@@ -579,13 +579,13 @@ def mark_session_import_required(reason: str) -> None:
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(json.dumps({'reason': reason, 'at': time.time()}), encoding='utf-8')
     record_session_validation(PATHS.state_dir, valid=False, source='worker', reason=reason)
-    logger.warning('Работа остановлена: нужен новый перенос входа из Chrome. Причина: %s', reason)
+    logger.warning('Работа остановлена: нужен ручной вход через раздел «Браузер». Причина: %s', reason)
 
 
 def require_work_session(page) -> None:
     if explicitly_logged_out(page) or detect_captcha(page, timeout_ms=700).get('found'):
         mark_session_import_required('session_lost_during_run')
-        raise AuthSessionUnavailable('Сессия потеряна. Повторите перенос входа из Chrome.')
+        raise AuthSessionUnavailable('Сессия потеряна. Выполните ручной вход через раздел «Браузер».')
     if not is_logged_in(page):
         record_session_validation(PATHS.state_dir, valid=None, source='worker', reason='page_not_ready')
         raise AuthCheckInconclusive('Страница не готова; потеря входа не подтверждена.')
@@ -594,7 +594,7 @@ def require_work_session(page) -> None:
 def open_logged_in_work_browser(playwright):
     # Unattended runs never reset profiles or open a password/QR login flow.
     if (PATHS.state_dir / 'session_import_required.json').exists():
-        logger.warning('Нужен перенос входа из Chrome; повторная проверка браузером пропущена.')
+        logger.warning('Нужен ручной вход; повторная проверка браузером пропущена.')
         return False, None, None
     if auth_backoff_seconds_left(AUTH_BACKOFF_FILE) > 0:
         logger.warning('Пауза авторизации активна; браузер не открывается.')

@@ -95,13 +95,14 @@ def test_compact_browser_profile_removes_heavy_dirs_and_filters_existing_cookies
 
     result = ProjectAdapter(tmp_path).compact_browser_profile("alpha")
 
-    assert result["removed_count"] == 4
-    assert result["freed_bytes"] == 1024
+    assert result["removed_count"] == 3
+    assert result["freed_bytes"] == 768
     assert _cookie_hosts(profile / "Network" / "Cookies") == [".byteoversea.com", ".tiktok.com"]
     assert not (profile / "IndexedDB" / "https_chatgpt.com_0.indexeddb.leveldb").exists()
     assert (profile / "IndexedDB" / "https_www.tiktok.com_0.indexeddb.leveldb").exists()
     assert (profile / "Local Storage" / "keep.ldb").exists()
-    for heavy_dir in ("Cache", "Code Cache", "Service Worker", "Extensions"):
+    assert (profile / 'Service Worker' / 'payload.bin').exists()
+    for heavy_dir in ("Cache", "Code Cache", "Extensions"):
         assert not (profile / heavy_dir).exists()
 
 

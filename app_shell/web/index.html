@@ -130,7 +130,7 @@
               <div id="setup-summary" class="setup-summary"></div>
               <div id="overview-timeline" class="timeline-list"></div>
               <div class="button-grid top-gap">
-                <button class="btn secondary" data-go-view="browser">Импорт из Chrome</button>
+                <button class="btn secondary" data-go-view="browser">Вход в TikTok</button>
                 <button class="btn secondary" data-go-view="services">Автозапуск</button>
                 <button class="btn secondary" data-open-kind="browser_profile">Открыть профиль</button>
                 <button class="btn secondary" data-open-kind="logs">Логи</button>
@@ -224,7 +224,7 @@
                 <button class="btn primary" type="submit">Добавить адресата</button>
                 <p id="target-create-status" class="hint" role="status" aria-live="polite"></p>
               </form>
-              <button id="profile-import-shortcut" class="btn secondary full">Перенести вход для этого профиля</button>
+              <button id="profile-import-shortcut" class="btn secondary full">Войти в TikTok для этого профиля</button>
               <div id="targets-list" class="target-list"></div>
             </article>
           </div>
@@ -251,11 +251,26 @@
               </details>
             </article>
             <article class="panel">
-              <div class="panel-title">Импорт из Chrome</div>
+              <div class="panel-title">Вход в TikTok</div>
               <button class="btn secondary full" data-go-view="profiles">Создать профиль и добавить адресатов</button>
               <label class="field-label" for="bot-profile">Куда сохранить авторизацию</label>
               <select id="bot-profile" class="select"></select>
-              <p class="hint">Один раз перенесите текущий вход из Chrome. После этого приложение будет использовать сохранённую сессию автоматически.</p>
+              <p class="hint">Создайте отдельный вход приложения через обычный Google Chrome. При работе по расписанию браузер останется скрытым.</p>
+              <ol class="hint">
+                <li>Остановите worker и нажмите «Открыть Chrome для входа».</li>
+                <li>В открывшемся отдельном окне вручную войдите в TikTok. Входить в аккаунт Google или включать синхронизацию Chrome не требуется.</li>
+                <li>Убедитесь, что открываются ваши сообщения, и закройте это окно Chrome.</li>
+                <li>Нажмите «Проверить вход». Приложение выполнит одну скрытую проверку без отправки сообщений.</li>
+              </ol>
+              <button id="dedicated-login-open" class="btn primary full">Открыть Chrome для входа</button>
+              <button id="dedicated-login-verify" class="btn secondary full">Проверить вход</button>
+              <button id="dedicated-login-cancel" class="btn secondary full">Отменить незавершённый вход</button>
+              <p id="dedicated-login-result" class="hint backup-status" role="status" aria-live="polite"></p>
+              <p class="hint">Основная сессия Chrome не копируется. При первом переходе прежний профиль приложения заменяется только после успешной проверки. Если вход позже завершится, используйте эти же кнопки: приложение откроет сохранённый отдельный профиль.</p>
+              <details class="disclosure browser-disclosure">
+                <summary>Перенос существующей сессии через cURL</summary>
+                <div class="disclosure-content">
+              <p class="hint">Этот способ копирует сессию обычного Chrome. При одновременном выходе на нескольких устройствах используйте отдельный вход выше.</p>
               <ol class="hint">
                 <li>В Chrome с выполненным входом откройте tiktok.com/messages.</li>
                 <li>Нажмите F12 → Network (Сеть), затем Ctrl+R.</li>
@@ -268,6 +283,8 @@
               <button id="session-import-button" class="btn primary full">Проверить и сохранить вход</button>
               <p id="session-import-result" class="hint backup-status" role="status" aria-live="polite"></p>
               <p class="hint">Проверка занимает до 90 секунд. При успехе создаётся резервная копия текущего входа. Содержимое запроса не сохраняется в логах; поле очищается после отправки.</p>
+                </div>
+              </details>
               <details class="disclosure browser-disclosure">
                 <summary>Старый способ: копирование профиля Chrome</summary>
                 <div class="disclosure-content">

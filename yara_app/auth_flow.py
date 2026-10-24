@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from yara_app.config import AUTH_BROWSER_HEADLESS, TIKTOK_BROWSER_CHANNEL, WORK_BROWSER_HEADLESS
+from yara_app.native_login import LOGIN_PENDING, acquire_browser_lease, chrome_profile_running, uses_google_chrome
 
 logger = logging.getLogger(__name__)
 auth_logger = logging.getLogger("auth_debug")
@@ -42,17 +43,37 @@ def init_auth_browser(playwright, user_data_dir):
     )
 
 
-def _launch_persistent_chromium(playwright, user_data_dir, *, headless: bool, args: list[str] | None = None):
+def _launch_persistent_chromium(
+    playwright, user_data_dir, *, headless: bool, args: list[str] | None = None, _acquire_lease: bool = True,
+):
+    user_data_dir = Path(user_data_dir)
+    lease = acquire_browser_lease(user_data_dir.parent) if _acquire_lease else None
     kwargs = {
-        'user_data_dir': user_data_dir,
+        'user_data_dir': str(user_data_dir),
         'headless': headless,
         'viewport': {'width': 1280, 'height': 720},
         'ignore_default_args': ['--enable-automation'],
     }
     kwargs['args'] = [*(args or []), '--disable-blink-features=AutomationControlled']
-    if TIKTOK_BROWSER_CHANNEL:
+    if uses_google_chrome(user_data_dir):
+        kwargs['channel'] = 'chrome'
+    elif TIKTOK_BROWSER_CHANNEL:
         kwargs['channel'] = TIKTOK_BROWSER_CHANNEL
-    return playwright.chromium.launch_persistent_context(**kwargs)
+    try:
+        if _acquire_lease and (user_data_dir.parent / LOGIN_PENDING).exists():
+            raise RuntimeError('Ручной вход ещё не завершён. Закройте отдельный Chrome и нажмите «Проверить вход».')
+        if _acquire_lease and (user_data_dir.parent / '.session_import.lock').exists():
+            raise RuntimeError('Выполняется импорт сессии. Дождитесь результата.')
+        if kwargs.get('channel') == 'chrome' and chrome_profile_running(user_data_dir):
+            raise RuntimeError('Закройте отдельное окно Chrome для этого профиля перед скрытой работой.')
+        context = playwright.chromium.launch_persistent_context(**kwargs)
+        if lease:
+            context.on('close', lambda *_args: lease.release())
+        return context
+    except BaseException:
+        if lease:
+            lease.release()
+        raise
 
 
 def record_session_validation(state_dir: Path, *, valid: bool | None, source: str, reason: str = '') -> None:

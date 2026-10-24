@@ -260,7 +260,8 @@ function applyUiMode(mode) {
 }
 
 function browserAuthStatus(browser = {}) {
-  if (browser.session_import_required || browser.session_validation?.valid === false) return { label: "Нужен вход", kind: "critical", details: "Последняя проверка не подтвердила вход; нужен свежий перенос из Chrome." };
+  if (browser.manual_login_pending) return { label: "Ручной вход", kind: "critical", details: "Закройте отдельный Chrome и нажмите «Проверить вход». Worker до проверки остановлен." };
+  if (browser.session_import_required || browser.session_validation?.valid === false) return { label: "Нужен вход", kind: "critical", details: "Последняя проверка не подтвердила вход; откройте отдельный Chrome в разделе «Браузер»." };
   if (browser.needs_recovery) return { label: "Профиль не читается", kind: "critical", details: "Windows не может расшифровать данные профиля." };
   if (!browser.default_profile_exists || !browser.cookies_exists) return { label: "Профиль не готов", kind: "warning", details: "Проверьте профиль и перенос входа в разделе «Браузер»." };
   if (browser.session_validation?.valid === true) return { label: "Проверена ранее", kind: "ok", details: `Последняя успешная проверка: ${formatDate(browser.session_validation.checked_at)}. Текущий вход удалённо не проверялся.` };
@@ -971,6 +972,8 @@ function renderBrowser(browser) {
     ["Настройки браузера", browser.local_state_exists ? "готовы" : "не найдены"],
     ["Авторизация", browserAuthStatus(browser).label],
     ["Проверка входа", browserAuthStatus(browser).details],
+    ["Браузер worker", browser.browser_channel === "chrome" ? "Google Chrome (скрыто)" : "Chromium"],
+    ["Ручной вход", browser.manual_login_pending ? "Требуется закрыть отдельный Chrome и проверить вход" : "не выполняется"],
     ["Пауза авторизации", browser.auth_backoff_left ? `${Math.ceil(browser.auth_backoff_left / 60)} мин` : "нет"],
     ["Резервные копии", backupSummary(browser.backup_count, browser.backup_bytes)],
     ["Копии авторизации", backupSummary(browser.auth_backup_count, browser.auth_backup_bytes)],
@@ -1859,6 +1862,33 @@ function bindActions() {
       button.disabled = false;
     }
   });
+
+  for (const action of ["open", "verify", "cancel"]) {
+    $(`#dedicated-login-${action}`).addEventListener("click", async () => {
+      const profileKey = $("#bot-profile").value;
+      const buttons = [$("#dedicated-login-open"), $("#dedicated-login-verify"), $("#dedicated-login-cancel")];
+      const status = $("#dedicated-login-result");
+      buttons.forEach((button) => { button.disabled = true; });
+      status.textContent = action === "open"
+        ? "Открываем отдельный Chrome для ручного входа…"
+        : action === "verify" ? "Проверяем вход скрыто, без отправки сообщений…" : "Отменяем незавершённый вход…";
+      try {
+        const result = await api(`/api/dedicated-login/${action}`, {
+          method: "POST", body: JSON.stringify({ bot_profile_key: profileKey }),
+        });
+        status.textContent = action === "open"
+          ? `Окно входа профиля «${result.bot_profile_key}» ${result.already_open ? "уже открыто" : "открыто"}. Войдите в TikTok, закройте это окно Chrome и нажмите «Проверить вход». Worker до проверки приостановлен.`
+          : action === "verify"
+            ? `Вход профиля «${result.bot_profile_key}» подтверждён. Последующие запуски будут скрытыми. Worker автоматически не запускался.`
+            : "Незавершённый вход отменён. Профили сохранены. Прежнее требование входа, если оно было, остаётся в силе.";
+        await refresh();
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+    });
+  }
 
   $("#session-import-button").addEventListener("click", async () => {
     const button = $("#session-import-button");

@@ -99,7 +99,7 @@ Use the Browser tab to:
 - compact profile storage;
 - create or delete authorization backups for the selected profile.
 
-For modern Chrome, use **Browser → Import from Chrome → Request from Chrome**, then **Verify and save login**. Copy the main `messages` document request using Chrome DevTools → Network → Copy as cURL. If login expires, repeat the transfer with a fresh request. File copying cannot transfer Chrome `v20` cookies. See [the session import guide](docs/CHROME_SESSION_IMPORT.md).
+Use **Browser → Open Chrome for login** to sign in manually in a separate Google Chrome profile. Close that window, then click **Verify login**. Routine runs reuse this profile in hidden Chrome; your regular Chrome session is not copied. If login expires, use the same buttons to reopen the saved profile. See [the login guide](docs/CHROME_SESSION_IMPORT.md). cURL transfer remains a secondary option; file copying cannot transfer Chrome `v20` cookies to Chromium.
 
 Authorization backup archives may contain cookies, browser session files, Telegram config, targets, and local state. Keep them private.
 
@@ -163,7 +163,7 @@ If a token was ever pushed to GitHub, rotate it and rewrite Git history or recre
 ### Troubleshooting
 
 - App does not open: check [INSTALL.md](INSTALL.md#13-если-что-то-не-получилось), then try `.\start_app.bat` and the fallback web shell.
-- Browser authorization is missing: open Browser tab and import from Chrome again.
+- Browser authorization is missing: open Browser, sign in through the separate Chrome window, close it, and verify login.
 - Telegram control is not ready: verify local `control/telegram_bot_v2.json`.
 - Worker opens too often: check scheduler status and worker logs.
 - UI data looks stale: use Refresh or check whether auto-refresh is enabled.
@@ -269,7 +269,7 @@ Telegram можно также настроить через `control/telegram_b
 - сжать профиль;
 - создать или удалить backup авторизации выбранного профиля.
 
-Для современного Chrome используйте **«Браузер» → «Импорт из Chrome» → «Запрос из Chrome» → «Проверить и сохранить вход»**. В Chrome скопируйте основной запрос `messages` через F12 → Network → Copy as cURL. Если вход слетит, повторите перенос свежего запроса. Простое копирование папки не переносит cookies Chrome `v20`. Подробности: [инструкция переноса](docs/CHROME_SESSION_IMPORT.md).
+Используйте **«Браузер» → «Открыть Chrome для входа»**. Войдите в TikTok вручную в отдельном окне, закройте его и нажмите **«Проверить вход»**. Дальше worker использует этот же профиль в скрытом Google Chrome; основная сессия обычного Chrome не копируется. При потере входа те же кнопки откроют сохранённый профиль. Подробности: [инструкция входа](docs/CHROME_SESSION_IMPORT.md). Перенос cURL оставлен дополнительным способом; простое копирование папки не переносит cookies Chrome `v20` в Chromium.
 
 Backup авторизации может содержать cookies, browser session, Telegram config, адресатов и локальное состояние. Его нельзя публиковать.
 
@@ -333,7 +333,7 @@ git status --ignored
 ### Частые проблемы
 
 - Приложение не открывается: проверь [раздел решения проблем](INSTALL.md#13-если-что-то-не-получилось), затем попробуй `.\start_app.bat` и диагностическую web-оболочку.
-- Слетела авторизация: заново импортируй авторизацию во вкладке "Браузер".
+- Слетела авторизация: во вкладке «Браузер» открой отдельный Chrome, войди вручную, закрой окно и проверь вход.
 - Telegram не готов: проверь локальный `control/telegram_bot_v2.json`.
 - Worker запускается лишний раз: проверь расписание и worker logs.
 - Информация в UI не обновляется: нажми Refresh или проверь автообновление.

@@ -21,6 +21,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 from yara_app.backups import BackupService
+from yara_app.native_login import (
+    LOGIN_PENDING,
+    browser_lease,
+    chrome_profile_running,
+    find_google_chrome,
+    mark_google_chrome,
+    uses_google_chrome,
+    verify_chrome_session,
+)
 from yara_app.performance import PerformanceService
 from yara_app.runtime_paths import browser_profile_needs_recovery, extend_env_with_site_packages
 from yara_app.scheduler import WorkerScheduleService
@@ -874,6 +883,18 @@ class ProjectAdapter:
         return backup_path, rollback
 
     def import_google_chrome_profile(
+        self, *, chrome_profile_id: str = "Default", bot_profile_key: str | None = None,
+        copy_mode: str = "tiktok_session",
+    ) -> dict[str, Any]:
+        profile_root = self._bot_profile_root(bot_profile_key)
+        with browser_lease(profile_root / 'browser'):
+            if (profile_root / 'browser' / LOGIN_PENDING).exists():
+                raise RuntimeError('Сначала завершите ручной вход через отдельный Chrome.')
+            return self._import_google_chrome_profile(
+                chrome_profile_id=chrome_profile_id, bot_profile_key=bot_profile_key, copy_mode=copy_mode,
+            )
+
+    def _import_google_chrome_profile(
         self,
         *,
         chrome_profile_id: str = "Default",
@@ -993,7 +1014,98 @@ class ProjectAdapter:
             **import_details,
         }
 
+    def begin_dedicated_login(self, bot_profile_key: str | None = None) -> dict[str, Any]:
+        profile_root = self._bot_profile_root(bot_profile_key)
+        browser_dir = profile_root / 'browser'
+        chrome = find_google_chrome()
+        with browser_lease(browser_dir):
+            if self.get_worker_status().running:
+                raise RuntimeError('Остановите worker перед ручным входом.')
+            active = browser_dir / 'user_data'
+            # Reauthentication reuses the same Chrome profile and device storage.
+            # Only the first migration stages a new, independent login.
+            mode = 'active' if uses_google_chrome(active) else 'staged'
+            target = active if mode == 'active' else browser_dir / 'dedicated_login' / 'user_data'
+            already_open = chrome_profile_running(target)
+            if mode == 'active' and not already_open and not (browser_dir / LOGIN_PENDING).exists():
+                self.create_auth_backup(profile_root.name)
+            mark_google_chrome(target)
+            (browser_dir / LOGIN_PENDING).write_text(json.dumps({'mode': mode}), encoding='utf-8')
+            if not already_open:
+                try:
+                    subprocess.Popen(
+                        [str(chrome), f'--user-data-dir={target}', '--profile-directory=Default',
+                         '--no-first-run', '--no-default-browser-check', '--disable-background-mode',
+                         'https://www.tiktok.com/messages'],
+                        cwd=str(self.base_dir), stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except OSError:
+                    raise RuntimeError('Не удалось открыть Google Chrome. Повторите вход по кнопке.') from None
+            return {'bot_profile_key': profile_root.name, 'pending': True, 'already_open': already_open}
+
+    def finish_dedicated_login(self, bot_profile_key: str | None = None) -> dict[str, Any]:
+        from yara_app.auth_flow import clear_auth_backoff, record_session_validation
+
+        profile_root = self._bot_profile_root(bot_profile_key)
+        browser_dir = profile_root / 'browser'
+        with browser_lease(browser_dir):
+            if self.get_worker_status().running:
+                raise RuntimeError('Остановите worker перед проверкой входа.')
+            pending = browser_dir / LOGIN_PENDING
+            data = self._read_json(pending, {})
+            if data.get('mode') not in {'active', 'staged'}:
+                raise RuntimeError('Сначала нажмите «Открыть Chrome для входа».')
+            destination = browser_dir / 'user_data'
+            target = destination if data['mode'] == 'active' else browser_dir / 'dedicated_login' / 'user_data'
+            if not uses_google_chrome(target):
+                raise RuntimeError('Отдельный профиль не найден. Откройте Chrome для входа заново.')
+            if chrome_profile_running(target):
+                raise RuntimeError('Закройте отдельное окно Chrome для входа, затем нажмите «Проверить вход». Обычные окна Chrome можно оставить.')
+            verify_chrome_session(target)
+            if self.get_worker_status().running:
+                raise RuntimeError('Worker запущен во время проверки. Остановите его и повторите проверку.')
+            previous = None
+            if target != destination:
+                if destination.exists():
+                    self.create_auth_backup(profile_root.name)
+                previous, _rollback = self._commit_staged_browser_profile(
+                    browser_dir=browser_dir, user_data_dir=destination, staged_user_data_dir=target,
+                    timestamp=time.strftime('%Y%m%d_%H%M%S'),
+                )
+            clear_auth_backoff(profile_root / 'state' / 'auth_backoff.json')
+            (profile_root / 'state' / 'session_import_required.json').unlink(missing_ok=True)
+            record_session_validation(profile_root / 'state', valid=True, source='dedicated_chrome')
+            pending.unlink()
+            return {'bot_profile_key': profile_root.name, 'verified': True, 'channel': 'chrome',
+                    'backup': str(previous) if previous else ''}
+
+    def cancel_dedicated_login(self, bot_profile_key: str | None = None) -> dict[str, Any]:
+        profile_root = self._bot_profile_root(bot_profile_key)
+        browser_dir = profile_root / 'browser'
+        with browser_lease(browser_dir):
+            pending = browser_dir / LOGIN_PENDING
+            data = self._read_json(pending, {})
+            target = browser_dir / 'user_data' if data.get('mode') == 'active' else browser_dir / 'dedicated_login' / 'user_data'
+            if chrome_profile_running(target):
+                raise RuntimeError('Сначала закройте отдельное окно Chrome для входа.')
+            if data.get('mode') == 'active':
+                # The active session may have changed during manual login.
+                from yara_app.auth_flow import record_session_validation
+                state_dir = profile_root / 'state'
+                state_dir.mkdir(parents=True, exist_ok=True)
+                (state_dir / 'session_import_required.json').write_text(
+                    json.dumps({'reason': 'manual_login_cancelled', 'at': time.time()}), encoding='utf-8',
+                )
+                record_session_validation(state_dir, valid=None, source='manual_login_cancelled')
+            pending.unlink(missing_ok=True)
+            return {'bot_profile_key': profile_root.name, 'cancelled': True}
+
     def import_chrome_request(self, *, request_text: str, bot_profile_key: str | None = None) -> dict[str, Any]:
+        with browser_lease(self._bot_profile_root(bot_profile_key) / 'browser'):
+            return self._import_chrome_request(request_text=request_text, bot_profile_key=bot_profile_key)
+
+    def _import_chrome_request(self, *, request_text: str, bot_profile_key: str | None = None) -> dict[str, Any]:
         from yara_app.auth_flow import clear_auth_backoff, record_session_validation
         from yara_app.session_import import cookies_from_curl, prepare_session
 
@@ -1002,6 +1114,8 @@ class ProjectAdapter:
         if self.get_worker_status().running:
             raise RuntimeError('Остановите worker перед переносом авторизации, затем нажмите кнопку ещё раз.')
         browser_dir = profile_root / 'browser'
+        if (browser_dir / LOGIN_PENDING).exists():
+            raise RuntimeError('Сначала завершите ручной вход через отдельный Chrome.')
         browser_dir.mkdir(parents=True, exist_ok=True)
         lock = browser_dir / '.session_import.lock'
         try:
@@ -1048,6 +1162,15 @@ class ProjectAdapter:
         return size
 
     def compact_browser_profile(
+        self, profile_key: str | None = None, *, filter_cookies: bool = True,
+    ) -> dict[str, Any]:
+        profile_root = self._bot_profile_root(profile_key)
+        with browser_lease(profile_root / 'browser'):
+            if (profile_root / 'browser' / LOGIN_PENDING).exists() or chrome_profile_running(profile_root / 'browser' / 'user_data'):
+                raise RuntimeError('Завершите ручной вход и закройте отдельный Chrome перед очисткой кэша.')
+            return self._compact_browser_profile(profile_key, filter_cookies=filter_cookies)
+
+    def _compact_browser_profile(
         self,
         profile_key: str | None = None,
         *,
@@ -1070,6 +1193,9 @@ class ProjectAdapter:
         freed_bytes = 0
         for base_dir in (default_dir, user_data_dir):
             for name in CHROMIUM_COMPACT_DIRS:
+                # Site/service-worker storage may hold device and session state.
+                if name == 'Service Worker':
+                    continue
                 target = base_dir / name
                 size = self._remove_profile_path_for_compact(target, user_data_dir)
                 if size:
@@ -1083,7 +1209,8 @@ class ProjectAdapter:
                     removed.append({"path": str(target), "bytes": size, "type": "file"})
 
         indexeddb_dir = default_dir / "IndexedDB"
-        if indexeddb_dir.exists():
+        dedicated = uses_google_chrome(user_data_dir)
+        if indexeddb_dir.exists() and not dedicated:
             for item in indexeddb_dir.iterdir():
                 if self._is_tiktok_storage_name(item.name):
                     continue
@@ -1093,7 +1220,7 @@ class ProjectAdapter:
                     removed.append({"path": str(item), "bytes": size, "type": "indexeddb"})
 
         cookie_results: list[dict[str, Any]] = []
-        if filter_cookies:
+        if filter_cookies and not dedicated:
             for cookies_path in (default_dir / "Network" / "Cookies", default_dir / "Cookies"):
                 if not cookies_path.exists():
                     continue
@@ -1170,11 +1297,13 @@ class ProjectAdapter:
         *,
         include_global: bool = False,
     ) -> dict[str, Any]:
-        return self.backups.restore_auth_backup(
-            profile_key,
-            backup_name,
-            include_global=include_global,
-        )
+        profile_root = self._bot_profile_root(profile_key)
+        with browser_lease(profile_root / 'browser'):
+            if (profile_root / 'browser' / LOGIN_PENDING).exists() or chrome_profile_running(profile_root / 'browser' / 'user_data'):
+                raise RuntimeError('Завершите ручной вход и закройте отдельный Chrome перед восстановлением.')
+            return self.backups.restore_auth_backup(
+                profile_key, backup_name, include_global=include_global,
+            )
 
     def prune_auth_backups(
         self,
@@ -1295,6 +1424,8 @@ class ProjectAdapter:
             "modified_at": user_data_stat.st_mtime if user_data_stat else None,
             "needs_recovery": needs_recovery,
             "session_import_required": (profile_root / 'state' / 'session_import_required.json').exists(),
+            "manual_login_pending": (browser_dir / LOGIN_PENDING).exists(),
+            "browser_channel": 'chrome' if uses_google_chrome(user_data_dir) else 'chromium',
             "session_validation": self._session_validation_summary(profile_root),
             "auth_backoff_exists": auth_backoff_path.exists(),
             "auth_backoff_left": auth_backoff_left,
@@ -1334,6 +1465,8 @@ class ProjectAdapter:
             "cookies_path": str(cookies_path),
             "needs_recovery": needs_recovery,
             "session_import_required": (profile_root / 'state' / 'session_import_required.json').exists(),
+            "manual_login_pending": (browser_dir / LOGIN_PENDING).exists(),
+            "browser_channel": 'chrome' if uses_google_chrome(user_data_dir) else 'chromium',
             "session_validation": self._session_validation_summary(profile_root),
             "auth_backoff_exists": auth_backoff_path.exists(),
             "auth_backoff_left": self._auth_backoff_seconds_left(auth_backoff_path) if auth_backoff_path.exists() else 0,
@@ -2281,6 +2414,8 @@ class ProjectAdapter:
             raise FileNotFoundError(f"Main script not found: {self.main_script_path}")
 
         active_profile = self._active_profile_name()
+        if (self._bot_profile_root(active_profile) / 'browser' / LOGIN_PENDING).exists():
+            raise RuntimeError('Завершите ручной вход: закройте отдельный Chrome и нажмите «Проверить вход».')
         self._refresh_runtime_paths(active_profile)
         self.update_control_state({"stop_requested": False})
         started = self._launch_python_process(
@@ -2859,12 +2994,18 @@ class ProjectAdapter:
                       "Создай или импортируй профиль бота.")
 
         if browser_profile:
-            if session_invalid:
+            if browser_profile.get('manual_login_pending'):
+                content_score -= 60
+                add_signal('browser', 'Авторизация', 'Ручной вход', 'critical', 'Worker остановлен до проверки ручного входа.')
+                add_issue('critical', 'Ручной вход не завершён',
+                          'Закройте отдельное окно Chrome после входа в TikTok.',
+                          'В разделе «Браузер» нажмите «Проверить вход».')
+            elif session_invalid:
                 content_score -= 60
                 add_signal("browser", "Авторизация", "Нужен вход", "critical", "Последняя проверка не подтвердила сессию TikTok.")
                 add_issue("critical", "Авторизация TikTok не подтверждена",
                           "Файл cookies не доказывает действующий вход. Повторные попытки worker остановлены.",
-                          "Войдите в обычном Chrome и выполните свежий перенос через раздел «Браузер».")
+                          "В разделе «Браузер» откройте отдельный Chrome для входа и выполните проверку.")
             elif browser_profile.get("needs_recovery"):
                 content_score -= 60
                 add_signal("browser", "Авторизация", "Сломана", "critical",
@@ -2899,6 +3040,7 @@ class ProjectAdapter:
                 and browser_profile.get("cookies_exists")
                 and not browser_profile.get("needs_recovery")
                 and not session_invalid
+                and not browser_profile.get('manual_login_pending')
             ):
                 validation = browser_profile.get('session_validation') or {}
                 if validation.get('valid') is True:

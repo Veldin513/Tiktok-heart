@@ -1,8 +1,8 @@
 # Setup
 
 For numbered Windows installation, build, update and login recovery steps,
-see [INSTALL.md](../INSTALL.md). For modern Chrome use
-[Copy as cURL session import](CHROME_SESSION_IMPORT.md).
+see [INSTALL.md](../INSTALL.md). Use a
+[separate Chrome login](CHROME_SESSION_IMPORT.md) for the app, then close its window and verify login.
 The file-copy importer below is a legacy option.
 
 ## Runtime dependencies
@@ -26,6 +26,13 @@ The worker automatically uses this folder when present. An explicitly set
 remain in `profiles/`.
 
 ## Chrome session import
+
+The primary login flow launches installed Google Chrome with a separate user-data
+directory and no automation or debugging flags for manual login. Verification and
+routine runs then use the Chrome channel, hidden, with the same saved profile.
+Neither this choice nor browser launch settings guarantee that TikTok will retain
+the session. No unattended password, QR login, or session renewal is attempted.
+The cURL and file-copy importers remain secondary options.
 
 The desktop importer and `scripts/windows/import_chrome_session.bat` use the
 same validation and preserve the current profile if the copy is unusable.

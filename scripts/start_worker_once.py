@@ -223,6 +223,9 @@ def main() -> int:
     if (profile_root / 'browser' / '.session_import.lock').exists():
         print_lifecycle('skip_session_import_running')
         return 0
+    if (profile_root / 'browser' / '.manual_login.json').exists():
+        print_lifecycle('skip_manual_login_pending')
+        return 0
     backoff_left = adapter._auth_backoff_seconds_left(profile_root / 'state' / 'auth_backoff.json')
     if backoff_left > 0:
         print_lifecycle('skip_auth_backoff', seconds_left=backoff_left)
