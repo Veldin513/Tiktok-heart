@@ -8,11 +8,14 @@ import shutil
 import sys
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from yara_app.config import BASE_DIR
+from yara_app.fileio import atomic_write_text, file_lock
+from yara_app.paths import profile_directory
+from yara_app.redaction import RedactingFormatter
 
 _NATIVE_PATH_CLS = type(Path('.'))
 
@@ -34,18 +37,28 @@ class RunLock:
     path: Path
     acquired: bool = False
 
+    _lease: object = field(default=None, init=False, repr=False)
+
     def acquire(self) -> bool:
-        for _ in range(2):
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, 'w', encoding='utf-8') as file_obj:
-                    file_obj.write(str(os.getpid()))
-                self.acquired = True
-                return True
-            except FileExistsError:
-                if not self._discard_stale_lock():
-                    return False
-        return False
+        if self.acquired:
+            return True
+        lease = file_lock(self.path, timeout=0)
+        try:
+            lease.__enter__()
+        except TimeoutError:
+            return False
+        pid = _read_lock_pid(self.path)
+        if pid is not None and _process_is_running(pid) and not _lock_pid_was_reused(self.path, pid):
+            lease.__exit__(None, None, None)
+            return False
+        try:
+            atomic_write_text(self.path, str(os.getpid()))
+        except Exception:
+            lease.__exit__(None, None, None)
+            raise
+        self._lease = lease
+        self.acquired = True
+        return True
 
     def _discard_stale_lock(self) -> bool:
         pid = _read_lock_pid(self.path)
@@ -63,12 +76,12 @@ class RunLock:
         if not self.acquired:
             return
         try:
-            if self.path.exists():
-                self.path.unlink()
-        except Exception:
-            pass
+            if _read_lock_pid(self.path) == os.getpid():
+                self.path.unlink(missing_ok=True)
         finally:
             self.acquired = False
+            self._lease.__exit__(None, None, None)
+            self._lease = None
 
 
 def _read_lock_pid(path: Path) -> int | None:
@@ -120,7 +133,7 @@ def _lock_pid_was_reused(path: Path, pid: int) -> bool:
 
 
 def build_profile_paths(active_profile: str) -> ProfilePaths:
-    profile_root = BASE_DIR / 'profiles' / active_profile
+    profile_root = profile_directory(BASE_DIR, active_profile)
     browser_dir = profile_root / 'browser'
     user_data_dir = browser_dir / 'user_data'
     logs_dir = profile_root / 'logs'
@@ -258,7 +271,7 @@ def configure_logging(paths: ProfilePaths) -> logging.Logger:
 
     log_format = '%(asctime)s [%(levelname)s] %(message)s'
     date_format = '%d.%m.%Y %H:%M:%S'
-    formatter = logging.Formatter(log_format, datefmt=date_format)
+    formatter = RedactingFormatter(log_format, datefmt=date_format)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)

@@ -104,6 +104,14 @@ fn python_executable() -> PathBuf {
             return path;
         }
     }
+    for candidate in [
+        project_root().join(".venv").join("Scripts").join("python.exe"),
+        project_root().join(".venv").join("bin").join("python"),
+    ] {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
     if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
         let local = PathBuf::from(local_app_data);
         for candidate in [

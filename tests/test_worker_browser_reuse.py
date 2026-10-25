@@ -247,7 +247,7 @@ def test_target_send_guard_blocks_recent_duplicate(tmp_path, monkeypatch) -> Non
     assert first_ok is True
     assert first["target"] == "target"
     assert second_ok is False
-    assert second["reason"] == "recent_guard"
+    assert second["reason"] == "delivery_unconfirmed"
 
 
 @pytest.mark.parametrize('saved_pid', [None, -1, os.getpid()])

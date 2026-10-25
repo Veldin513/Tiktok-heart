@@ -34,7 +34,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from yara_app.project_adapter import ProjectAdapter  # noqa: E402
+from yara_app.redaction import redact_secrets, redact_value  # noqa: E402
 from yara_app.single_instance import SingleInstanceGuard  # noqa: E402
+from yara_app.telegram_setup import TelegramSetup  # noqa: E402
 
 LOG_LABELS = {
     "worker_stdout": "Worker stdout",
@@ -213,6 +215,32 @@ class AppShellHandler(BaseHTTPRequestHandler):
 
     server_version = "TikTokHeartDesktop/2.1"
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(15)
+
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        port = self.server.server_address[1]
+        hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}
+        host = self.headers.get('Host', '').lower()
+        origin = self.headers.get('Origin')
+        valid_origin = origin is None or origin == f'http://{host}'
+        if (len(self.headers.get_all('Host', [])) != 1 or host not in hosts
+                or not valid_origin or self.headers.get('Sec-Fetch-Site') == 'cross-site'):
+            self.send_error(HTTPStatus.FORBIDDEN, 'Local same-origin requests only')
+            self.close_connection = True
+            return False
+        if self.command == 'POST' and (
+                self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json'
+                or self.headers.get('Transfer-Encoding')
+                or len(self.headers.get_all('Content-Length', [])) != 1):
+            self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, 'Expected JSON with Content-Length')
+            self.close_connection = True
+            return False
+        return True
+
     def log_message(self, fmt: str, *args: Any) -> None:
         if os.getenv("APP_SHELL_HTTP_LOG") != "1":
             return
@@ -220,17 +248,20 @@ class AppShellHandler(BaseHTTPRequestHandler):
         print(f"[{timestamp}] {self.address_string()} {fmt % args}")
 
     def _send_json(self, payload: Any, status: int = 200) -> None:
-        body = json.dumps(json_ready(payload), ensure_ascii=False, indent=2).encode("utf-8")
+        body = json.dumps(redact_value(json_ready(payload)), ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionError):
+            self.close_connection = True
 
     def _send_error_json(self, exc: Exception, status: int = 500) -> None:
-        self._send_json({"ok": False, "error": str(exc), "type": type(exc).__name__}, status)
+        self._send_json({"ok": False, "error": redact_secrets(str(exc)), "type": type(exc).__name__}, status)
 
     def _send_security_headers(self) -> None:
         for name, value in SECURITY_HEADERS.items():
@@ -300,6 +331,9 @@ class AppShellHandler(BaseHTTPRequestHandler):
         started = time.perf_counter()
         try:
             try:
+                if parsed.path == '/api/telegram/settings':
+                    self._send_json({'ok': True, 'data': TelegramSetup(self.adapter).public_settings()})
+                    return
                 if parsed.path == "/api/diagnostics":
                     query = parse_qs(parsed.query)
                     self._send_json({"ok": True, "data": self._get_diagnostics(fresh=query.get("fresh") == ["1"])})
@@ -355,6 +389,22 @@ class AppShellHandler(BaseHTTPRequestHandler):
             try:
                 payload = read_json_body(self)
                 self._clear_diagnostics_cache()
+                if parsed.path.startswith('/api/telegram/'):
+                    setup = TelegramSetup(self.adapter)
+                    token = str(payload.get('token') or '')
+                    if parsed.path == '/api/telegram/settings':
+                        result = setup.save(payload)
+                    elif parsed.path == '/api/telegram/check':
+                        result = setup.check(token)
+                    elif parsed.path == '/api/telegram/chats':
+                        result = setup.discover_chats(token)
+                    elif parsed.path == '/api/telegram/botfather':
+                        webbrowser.open('https://t.me/BotFather')
+                        result = {'opened': True}
+                    else:
+                        raise ValueError('Неизвестная операция Telegram.')
+                    self._send_json({'ok': True, 'data': result})
+                    return
                 if parsed.path == "/api/action":
                     self._handle_action(payload)
                     return
@@ -670,7 +720,7 @@ class AppShellHandler(BaseHTTPRequestHandler):
         fmt = str(payload.get("format") or "json").strip().lower()
         if fmt not in {"json", "txt"}:
             raise ValueError("format must be json or txt")
-        diag = self.adapter.diagnostics()
+        diag = redact_value(self.adapter.diagnostics())
         target_dir = self.adapter.get_common_logs_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")

@@ -18,7 +18,7 @@ def setup_project(tmp_path: Path) -> ProjectAdapter:
     (tmp_path / 'telegram_control_bot.py').write_text('print("tg")\n', encoding='utf-8')
     write_json(tmp_path / 'control' / 'profiles.json', {'alpha': []})
     write_json(tmp_path / 'control' / 'control_state.json', {'active_profile': 'alpha'})
-    write_json(tmp_path / 'control' / 'telegram_bot_v2.json', {'token': 'abc123'})
+    write_json(tmp_path / 'control' / 'telegram_bot_v2.json', {'token': 'abc123', 'allowed_chat_ids': [12345]})
     return ProjectAdapter(tmp_path)
 
 

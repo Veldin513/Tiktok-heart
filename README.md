@@ -89,6 +89,8 @@ Important variables:
 
 The app can also read Telegram settings from `control/telegram_bot_v2.json`. That file is local-only and must never be committed.
 
+Telegram setup is available in **Advanced mode → Management**: open BotFather, check a token, find your chat ID after `/start`, select allowed users, and save or edit settings. Stop the bot before editing, then start it again. See [the step-by-step setup](INSTALL.md#14-создайте-telegram-бота--по-желанию).
+
 ### Browser Authorization
 
 Use the Browser tab to:
@@ -258,6 +260,8 @@ scripts\windows\start_app_shell.bat
 - `TIKTOK_BOT_PROFILE` - профиль для helper-скриптов.
 
 Telegram можно также настроить через `control/telegram_bot_v2.json`. Это локальный файл, его нельзя коммитить.
+
+В **Расширенном режиме → Управление** есть мастер настройки Telegram: переход к BotFather, проверка токена, поиск своего ID после `/start`, выбор пользователей и сохранение или редактирование настроек. Перед изменением остановите бота, после сохранения запустите снова. [Пошаговая инструкция](INSTALL.md#14-создайте-telegram-бота--по-желанию).
 
 ### Авторизация браузера
 

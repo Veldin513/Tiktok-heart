@@ -33,7 +33,9 @@ from yara_app.delivery import (
     SendReceipt,
     attach_delivery_tracker,
 )
+from yara_app.fileio import atomic_write_text
 from yara_app.project_adapter import ProjectAdapter
+from yara_app.redaction import redact_value
 from yara_app.runtime_paths import (
     RunLock,
     browser_profile_needs_recovery,
@@ -248,7 +250,7 @@ def _write_run_state(**data) -> None:
         'timestamp': time.time(),
         **data,
     }
-    RUN_STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    atomic_write_text(RUN_STATE_FILE, json.dumps(redact_value(payload), ensure_ascii=False, indent=2))
 
 
 def trim_run_history(path: Path, *, max_bytes: int = RUN_HISTORY_MAX_BYTES, keep_bytes: int = RUN_HISTORY_KEEP_BYTES) -> None:
@@ -281,7 +283,7 @@ def _append_run_history(event: str, **data: Any) -> None:
     try:
         RUN_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with RUN_HISTORY_FILE.open('a', encoding='utf-8') as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, separators=(',', ':')) + '\n')
+            handle.write(json.dumps(redact_value(payload), ensure_ascii=False, separators=(',', ':')) + '\n')
         trim_run_history(RUN_HISTORY_FILE)
     except Exception as exc:
         logger.warning('Не удалось записать run history: %s', exc)
@@ -346,7 +348,7 @@ def wait_for_internet() -> bool:
 
 
 def save_run_summary(summary: RunSummary) -> None:
-    (PATHS.artifacts_dir / 'run_summary.json').write_text(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
+    atomic_write_text(PATHS.artifacts_dir / 'run_summary.json', json.dumps(redact_value(summary.to_dict()), ensure_ascii=False, indent=2))
 
 
 def send_start_message(targets: list[Target], *, dry_run: bool) -> None:
@@ -417,6 +419,7 @@ def acquire_target_send_guard(target_name: str) -> tuple[bool, dict[str, Any]]:
         'pid': os.getpid(),
         'started_at': now,
         'ttl_seconds': TARGET_SEND_GUARD_SECONDS,
+        'status': 'unconfirmed',
     }
     for attempt in range(2):
         try:
@@ -427,7 +430,7 @@ def acquire_target_send_guard(target_name: str) -> tuple[bool, dict[str, Any]]:
             try:
                 existing = json.loads(path.read_text(encoding='utf-8-sig'))
             except Exception:
-                existing = {}
+                return False, {'path': str(path), 'reason': 'unreadable_guard'}
             if existing.get('status') == 'unconfirmed':
                 return False, {'path': str(path), 'reason': 'delivery_unconfirmed'}
             started_at = float(existing.get('started_at') or 0)
@@ -460,7 +463,7 @@ def mark_target_guard_sent(target_name: str) -> None:
     payload.update({'sent_at': time.time(), 'status': 'sent'})
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
     except Exception as exc:
         logger.warning('Failed to mark target send guard for %s: %s', target_name, exc)
 
@@ -513,6 +516,8 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
         summary.add_result(target=target.name, success=False, reason='chat_blocked')
         _append_run_history('target_result', target=target.name, success=False, reason='chat_blocked', error=str(exc))
         return
+    except (AuthSessionUnavailable, AuthCheckInconclusive):
+        raise
     except Exception:
         chat_opened = False
     if not chat_opened:
@@ -548,7 +553,9 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
             path = target_guard_path(target.name)
             payload = json.loads(path.read_text(encoding='utf-8'))
             payload.update({'status': 'unconfirmed', 'updated_at': time.time()})
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            target_guard_path(target.name).unlink(missing_ok=True)
         logger.warning('Отправка не подтверждена: %s', exc)
         summary.add_result(target=target.name, success=False, reason=reason)
         _append_run_history('target_result', target=target.name, success=False, reason=reason)
@@ -556,6 +563,8 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
             mark_session_import_required('session_lost_during_send')
             raise AuthSessionUnavailable('Вход потерян во время отправки.') from None
         return
+    except (AuthSessionUnavailable, AuthCheckInconclusive):
+        raise
     except Exception as exc:
         logger.error('Не удалось отправить сообщение для %s: %s', target.name, exc)
         summary.add_result(target=target.name, success=False, reason='send_failed')
@@ -563,11 +572,31 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
         return
 
     with timed_phase('target_save_state', target=target.name):
-        store.mark_sent_now(target.name)
+        try:
+            store.mark_sent_now(target.name)
+        except OSError:
+            # The initial uncertain guard survives crashes and storage errors.
+            summary.add_result(target=target.name, success=True, message=message,
+                               confirmation='server_ack', reason='local_state_write_failed')
+            _append_run_history('target_result', target=target.name, success=True, confirmation='server_ack',
+                                server_message_id=receipt.server_message_id, reason='local_state_write_failed')
+            logger.exception('TikTok подтвердил сообщение, но локальное состояние не записано. Повтор заблокирован.')
+            return
         mark_target_guard_sent(target.name)
-        streak = store.update_streak_stats(target.name)
+        try:
+            streak = store.update_streak_stats(target.name)
+        except Exception:
+            summary.add_result(target=target.name, success=True, message=message,
+                               confirmation='server_ack', reason='streak_write_failed')
+            _append_run_history('target_result', target=target.name, success=True, confirmation='server_ack',
+                                server_message_id=receipt.server_message_id, reason='streak_write_failed')
+            logger.exception('TikTok accepted the message; streak storage failed')
+            return
     logger.info('✅ TikTok подтвердил приём сообщения. Текущий огонек: %s', streak.current_count)
-    tg.send_target_success(target_name=target.name, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day)
+    try:
+        tg.send_target_success(target_name=target.name, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day)
+    except Exception:
+        logger.exception('Ошибка уведомления Telegram после подтверждённой отправки')
     summary.add_result(target=target.name, success=True, message=message, streak_count=streak.current_count, confirmation='server_ack')
     _append_run_history('target_result', target=target.name, success=True, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day,
                         confirmation='server_ack', server_message_id=receipt.server_message_id, transport=receipt.transport)
@@ -819,7 +848,15 @@ def check_tiktok_streak() -> None:
                         summary.add_result(target='__run__', success=False, skipped=True, reason=stop_reason)
                         _append_run_history('run_stopped', reason=stop_reason)
                         break
-                    process_target(work_page, target, summary)
+                    try:
+                        process_target(work_page, target, summary)
+                    except (AuthSessionUnavailable, AuthCheckInconclusive):
+                        raise
+                    except Exception as exc:
+                        logger.exception('Ошибка адресата %s', target.name)
+                        summary.add_result(target=target.name, success=False, reason='target_error')
+                        _append_run_history('target_result', target=target.name, success=False,
+                                            reason='target_error', error=str(exc))
                 logger.info('Выход из check_tiktok_streak(). success_count=%s, targets=%s', summary.success_count, len(targets))
             finally:
                 logger.info('Закрытие браузера.')

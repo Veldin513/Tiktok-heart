@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from yara_app.backups import BackupService
+from yara_app.fileio import atomic_write_text, file_lock, read_json, read_text
 from yara_app.native_login import (
     LOGIN_PENDING,
     browser_lease,
@@ -31,6 +32,7 @@ from yara_app.native_login import (
     verify_chrome_session,
 )
 from yara_app.performance import PerformanceService
+from yara_app.processes import run_bounded
 from yara_app.runtime_paths import browser_profile_needs_recovery, extend_env_with_site_packages
 from yara_app.scheduler import WorkerScheduleService
 from yara_app.ttbot.models import legacy_safe_filename, safe_name_key
@@ -213,7 +215,8 @@ class ProjectAdapter:
 
     def _profile_logs_dir(self, profile_name: str | None = None) -> Path:
         profile_key = str(profile_name or self._read_active_profile_name_quick() or "default")
-        path = self.base_dir / "profiles" / profile_key / "logs"
+        from yara_app.paths import profile_directory
+        path = profile_directory(self.base_dir, profile_key) / 'logs'
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -285,49 +288,47 @@ class ProjectAdapter:
         }
 
     def _read_json(self, path: Path, default: Any) -> Any:
-        if not path.exists():
-            return default
         try:
-            return json.loads(path.read_text(encoding="utf-8-sig"))
-        except Exception:
+            return read_json(path, default)
+        except (json.JSONDecodeError, UnicodeError):
             return default
 
     def _write_json(self, path: Path, payload: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def ensure_runtime_files(self) -> None:
         self.control_dir.mkdir(parents=True, exist_ok=True)
         self.common_logs_dir.mkdir(parents=True, exist_ok=True)
 
-        profiles = self._read_json(self.profiles_path, None)
-        if not isinstance(profiles, dict):
-            profiles = {"default": []}
-            self._write_json(self.profiles_path, profiles)
+        with file_lock(self.profiles_path):
+            profiles = self._read_json(self.profiles_path, None)
+            if not isinstance(profiles, (dict, list)):
+                if self.profiles_path.exists():
+                    raise ValueError('profiles.json повреждён. Исходный файл сохранён; восстановите резервную копию.')
+                profiles = {"default": []}
+                self._write_json(self.profiles_path, profiles)
+        first_profile = next(iter(profiles), 'default') if isinstance(profiles, dict) else 'default'
+        with file_lock(self.control_state_path):
+            state = self._read_json(self.control_state_path, None)
+            defaults = self._default_state(first_profile)
+            if not isinstance(state, dict):
+                if self.control_state_path.exists():
+                    raise ValueError('control_state.json повреждён. Исходный файл сохранён; восстановите резервную копию.')
+                self._write_json(self.control_state_path, defaults)
+            elif any(key not in state for key in defaults):
+                self._write_json(self.control_state_path, {**defaults, **state})
 
-        first_profile = next(iter(profiles.keys()), "default")
-        state = self._read_json(self.control_state_path, None)
-        defaults = self._default_state(first_profile)
-        if not isinstance(state, dict):
-            self._write_json(self.control_state_path, defaults)
-        else:
-            changed = False
-            for key, value in defaults.items():
-                if key not in state:
-                    state[key] = value
-                    changed = True
-            if changed:
-                self._write_json(self.control_state_path, state)
-
-        if not self.message_pool_path.exists():
-            self.message_pool_path.write_text(self.DEFAULT_MESSAGE_POOL, encoding="utf-8")
+        with file_lock(self.message_pool_path):
+            if not self.message_pool_path.exists():
+                atomic_write_text(self.message_pool_path, self.DEFAULT_MESSAGE_POOL)
 
         self._refresh_runtime_paths(first_profile if first_profile else None)
         self._migrate_legacy_log_files()
         for path in self.log_files().values():
             if not path.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("", encoding="utf-8")
+                with suppress(FileExistsError), path.open('x', encoding='utf-8'):
+                    pass
 
     def log_files(self) -> dict[str, Path]:
         self._refresh_runtime_paths()
@@ -394,6 +395,12 @@ class ProjectAdapter:
         token = str(config.get("token") or "").strip()
         if not token or token == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
             return False, "Не заполнен token в control/telegram_bot_v2.json"
+        from yara_app.telegram_setup import parse_chat_ids
+        try:
+            if not parse_chat_ids(config.get('allowed_chat_ids', [])):
+                return False, 'Не указан ни один разрешённый Telegram ID'
+        except ValueError as exc:
+            return False, str(exc)
         return True, "ok"
 
     def get_control_state(self) -> dict[str, Any]:
@@ -408,9 +415,13 @@ class ProjectAdapter:
         return state
 
     def update_control_state(self, patch: dict[str, Any]) -> dict[str, Any]:
-        state = self.get_control_state()
-        state.update(patch)
-        self._write_json(self.control_state_path, state)
+        self.ensure_runtime_files()
+        with file_lock(self.control_state_path):
+            state = self._read_json(self.control_state_path, None)
+            if not isinstance(state, dict):
+                raise ValueError('Не удалось прочитать состояние; изменения не записаны.')
+            state.update(patch)
+            self._write_json(self.control_state_path, state)
         if "active_profile" in patch:
             self._refresh_runtime_paths(str(state.get("active_profile") or "default"))
             self._migrate_legacy_log_files()
@@ -501,7 +512,7 @@ class ProjectAdapter:
             'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(10)), *(f'LPT{i}' for i in range(10)),
         }:
             raise ValueError('Название профиля: 1–48 латинских букв, цифр, дефисов или подчёркиваний. Например: main.')
-        with _PROFILE_EDIT_LOCK:
+        with _PROFILE_EDIT_LOCK, file_lock(self.profiles_path):
             if self.get_worker_status().running:
                 raise RuntimeError('Остановите worker перед изменением профилей.')
             if any(item.key.casefold() == key.casefold() for item in self.get_profiles()):
@@ -524,7 +535,7 @@ class ProjectAdapter:
         if url.scheme != 'https' or url.netloc not in ('www.tiktok.com', 'tiktok.com') or not re.fullmatch(r'/@[A-Za-z0-9._]{1,64}/?', url.path):
             raise ValueError('Укажите @username или ссылку вида https://www.tiktok.com/@username.')
         target = {'name': name, 'url': 'https://www.tiktok.com/' + url.path.strip('/')}
-        with _PROFILE_EDIT_LOCK:
+        with _PROFILE_EDIT_LOCK, file_lock(self.profiles_path):
             if self.get_worker_status().running:
                 raise RuntimeError('Остановите worker перед добавлением адресата.')
             payload = self._read_json(self.profiles_path, {})
@@ -602,13 +613,8 @@ class ProjectAdapter:
 
     def _bot_profile_root(self, profile_key: str | None = None) -> Path:
         key = str(profile_key or self._active_profile_name() or "default").strip() or "default"
-        profiles_root = (self.base_dir / "profiles").resolve()
-        profile_root = (profiles_root / key).resolve()
-        try:
-            profile_root.relative_to(profiles_root)
-        except ValueError as exc:
-            raise ValueError(f"Invalid profile key: {key}") from exc
-        return profile_root
+        from yara_app.paths import profile_directory
+        return profile_directory(self.base_dir, key)
 
     def _running_process_pids_by_name(self, process_names: set[str]) -> list[int]:
         names = {name.lower() for name in process_names}
@@ -626,7 +632,7 @@ class ProjectAdapter:
 
         if os.name == "nt":
             for name in names:
-                result = subprocess.run(
+                result = run_bounded(
                     ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
                     capture_output=True,
                     check=False,
@@ -1552,7 +1558,7 @@ class ProjectAdapter:
         if profile_key is None:
             state = self.get_control_state()
             profile_key = str(state.get("active_profile") or "default")
-        return self.base_dir / "profiles" / profile_key / "state"
+        return self._bot_profile_root(profile_key) / 'state'
 
     @staticmethod
     def _make_file_keys(target_name: str) -> list[str]:
@@ -1575,7 +1581,7 @@ class ProjectAdapter:
         normalized = unicodedata.normalize('NFKC', raw)
         ascii_slug = unicodedata.normalize('NFKD', normalized).encode('ascii', 'ignore').decode('ascii')
         ascii_slug = re.sub(r'[\W_]+', '_', ascii_slug).strip('_').lower()
-        digest = hashlib.sha1((normalized or 'target').encode('utf-8')).hexdigest()[:10]
+        digest = hashlib.sha1((normalized or 'target').encode('utf-8'), usedforsecurity=False).hexdigest()[:10]
         prefix = ascii_slug[:40] if ascii_slug else 'target'
         keys.append(f'{prefix}_{digest}')
 
@@ -1613,7 +1619,7 @@ class ProjectAdapter:
         for path in paths['last_send']:
             if path.exists():
                 try:
-                    last_send_at = float(path.read_text(encoding='utf-8').strip())
+                    last_send_at = float(read_text(path).strip())
                     break
                 except Exception:
                     continue
@@ -1621,7 +1627,7 @@ class ProjectAdapter:
         for path in paths['stats']:
             if path.exists():
                 try:
-                    parts = path.read_text(encoding='utf-8').strip().split('|')
+                    parts = read_text(path).strip().split('|')
                     streak_count = int(parts[0]) if parts and parts[0] else 0
                     streak_date = parts[1] if len(parts) > 1 else ''
                     break
@@ -1708,6 +1714,11 @@ class ProjectAdapter:
 
     def set_target_streak(self, target_name: str, new_count: int,
                           profile_key: str | None = None) -> tuple[int, str]:
+        with file_lock(self._iter_target_state_paths(target_name, profile_key)['stats'][0]):
+            return self._set_target_streak_locked(target_name, new_count, profile_key)
+
+    def _set_target_streak_locked(self, target_name: str, new_count: int,
+                                 profile_key: str | None = None) -> tuple[int, str]:
         """Write streak count to the active stats file.
 
         Finds the first existing stats file and updates only that file,
@@ -1740,10 +1751,15 @@ class ProjectAdapter:
 
         payload = f'{int(new_count)}|{existing_date}'
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(payload, encoding='utf-8')
+        with file_lock(target_path):
+            atomic_write_text(target_path, payload)
         return 1, str(target_path)
 
     def toggle_profile(self, index: int) -> ProfileEntry:
+        with file_lock(self.profiles_path):
+            return self._toggle_profile_locked(index)
+
+    def _toggle_profile_locked(self, index: int) -> ProfileEntry:
         payload = self._read_json(self.profiles_path, {})
         if isinstance(payload, list):
             if index < 0 or index >= len(payload) or not isinstance(payload[index], dict):
@@ -1834,7 +1850,8 @@ class ProjectAdapter:
         payload = str(text or "").replace("\r\n", "\n")
         if payload and not payload.endswith("\n"):
             payload += "\n"
-        self.message_pool_path.write_text(payload, encoding="utf-8")
+        with file_lock(self.message_pool_path):
+            atomic_write_text(self.message_pool_path, payload)
         return self.get_message_pool_stats()
 
     def create_message_pool_backup(self, text: str | None = None) -> Path:
@@ -1862,7 +1879,7 @@ class ProjectAdapter:
         return self.get_message_pool_stats()
 
     def _active_profile_artifacts_dir(self) -> Path:
-        return self.base_dir / "profiles" / self._active_profile_name() / "artifacts"
+        return self._bot_profile_root() / 'artifacts'
 
     def get_current_run_snapshot(self) -> dict[str, Any]:
         artifacts_dir = self._active_profile_artifacts_dir()
@@ -1921,7 +1938,7 @@ class ProjectAdapter:
 
     def get_run_history(self, profile_key: str | None = None, *, limit: int = 40) -> list[dict[str, Any]]:
         profile = str(profile_key or self._active_profile_name() or "default")
-        history_path = self.base_dir / "profiles" / profile / "artifacts" / "run_history.jsonl"
+        history_path = self._bot_profile_root(profile) / 'artifacts' / 'run_history.jsonl'
         limit = max(1, min(300, int(limit)))
         if not history_path.exists():
             return []
@@ -2011,7 +2028,7 @@ class ProjectAdapter:
             str(script_path),
             *(args or []),
         ]
-        result = subprocess.run(
+        result = run_bounded(
             cmd,
             cwd=str(self.base_dir),
             capture_output=True,
@@ -2029,7 +2046,7 @@ class ProjectAdapter:
     def _run_powershell_command(self, command: str, args: list[str] | None = None) -> subprocess.CompletedProcess:
         if os.name != "nt":
             raise RuntimeError("PowerShell command is available only on Windows.")
-        result = subprocess.run(
+        result = run_bounded(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command, *(args or [])],
             cwd=str(self.base_dir),
             capture_output=True,
@@ -2214,7 +2231,7 @@ class ProjectAdapter:
         if not self._pid_exists(pid):
             return
         if os.name == "nt":
-            result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False, **self._windows_subprocess_kwargs())
+            result = run_bounded(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False, **self._windows_subprocess_kwargs())
             output = (self._decode_process_output(result.stdout or b"") + "\n" + self._decode_process_output(result.stderr or b"")).strip()
             time.sleep(0.6)
             low = output.lower()
@@ -2244,7 +2261,7 @@ class ProjectAdapter:
                 pass
         if os.name == "nt":
             try:
-                result = subprocess.run(
+                result = run_bounded(
                     ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                     capture_output=True,
                     check=False,
@@ -2372,7 +2389,7 @@ class ProjectAdapter:
             time.sleep(0.4)
 
         if os.name == "nt":
-            result = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False, **self._windows_subprocess_kwargs())
+            result = run_bounded(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False, **self._windows_subprocess_kwargs())
             output = (self._decode_process_output(result.stdout or b"") + "\n" + self._decode_process_output(result.stderr or b"")).strip()
             time.sleep(0.6)
             low = output.lower()
@@ -2809,7 +2826,7 @@ class ProjectAdapter:
         if no_browser:
             args.append("--no-browser")
         try:
-            result = subprocess.run(
+            result = run_bounded(
                 args,
                 cwd=str(self.base_dir),
                 capture_output=True,

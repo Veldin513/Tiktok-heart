@@ -2,13 +2,31 @@ from __future__ import annotations
 
 import json
 import shutil
+import stat
+import tempfile
 import time
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from yara_app.project_adapter import ProjectAdapter
+
+
+@contextmanager
+def restore_staging(base: Path):
+    parent = (base / 'backups').resolve()
+    staging = Path(tempfile.mkdtemp(prefix='auth_restore_', dir=parent)).resolve()
+    try:
+        yield staging
+    except Exception as exc:
+        # Preserve originals even if the rollback itself meets an I/O error.
+        raise RuntimeError(f'Восстановление отменено. Файлы для восстановления сохранены: {staging}') from exc
+    else:
+        if staging.parent != parent or not staging.name.startswith('auth_restore_'):
+            raise ValueError('Unexpected restore staging directory')
+        shutil.rmtree(staging)
 
 
 class BackupService:
@@ -35,6 +53,8 @@ class BackupService:
 
     @staticmethod
     def safe_zip_name(name: str) -> bool:
+        if not name or '\\' in name or ':' in name or '\x00' in name:
+            return False
         try:
             pure = PurePosixPath(name)
         except Exception:
@@ -42,7 +62,8 @@ class BackupService:
         if pure.is_absolute() or ".." in pure.parts:
             return False
         text = pure.as_posix()
-        return bool(text and not text.startswith("/") and ":" not in pure.parts[0])
+        return bool(text and not text.startswith('/') and all(
+            part and not part.endswith(('.', ' ')) for part in pure.parts))
 
     @staticmethod
     def auth_restore_policy(profile_key: str, *, include_global: bool = False) -> dict[str, tuple[str, ...]]:
@@ -108,6 +129,14 @@ class BackupService:
         global_entries = 0
         try:
             with zipfile.ZipFile(backup) as archive:
+                infos = archive.infolist()
+                if (len(infos) > 50000 or sum(info.file_size for info in infos) > 4 * 1024**3
+                        or any(info.file_size > 1024**3 for info in infos)):
+                    return {'ok': False, 'error': 'Архив превышает лимиты восстановления (50000 файлов, 4 ГБ).'}
+                if any(stat.S_ISLNK(info.external_attr >> 16) for info in infos):
+                    return {'ok': False, 'error': 'Архив содержит символические ссылки.'}
+                if any(info.filename == 'BACKUP_MANIFEST.json' and info.file_size > 1024**2 for info in infos):
+                    return {'ok': False, 'error': 'Манифест архива слишком большой.'}
                 if deep:
                     first_bad = archive.testzip()
                     if first_bad:
@@ -128,6 +157,8 @@ class BackupService:
                     if kind == "manifest":
                         try:
                             manifest = json.loads(archive.read(info).decode("utf-8"))
+                            if not isinstance(manifest, dict):
+                                manifest = {}
                         except Exception:
                             manifest = {}
                         continue
@@ -190,40 +221,70 @@ class BackupService:
         if not validation.get("ok"):
             raise RuntimeError(str(validation.get("error") or "Backup validation failed"))
 
+        if include_global and adapter.get_telegram_bot_status().running:
+            raise RuntimeError('Остановите Telegram-бота перед восстановлением общих настроек.')
         pre_restore = self.create_auth_backup(profile_root.name)
+        if pre_restore.get('error_count'):
+            raise RuntimeError('Не удалось полностью сохранить текущий профиль. Восстановление отменено.')
         restored: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
-        profile_restore_prefixes = self.auth_restore_policy(profile_root.name, include_global=False)["profile"]
-        dirs_to_reset = {
-            profile_root / "browser" / "user_data",
-            profile_root / "state",
-        }
+        # Fully extract and CRC-check before touching the live profile. Then
+        # replace each directory/file, retaining originals for rollback.
+        with restore_staging(adapter.base_dir) as staging:
+            replacements: dict[Path, Path] = {}
+            with zipfile.ZipFile(backup) as archive:
+                for info in archive.infolist():
+                    name = info.filename
+                    if info.is_dir() or name == 'BACKUP_MANIFEST.json':
+                        continue
+                    kind = self.classify_auth_backup_member(name, profile_root.name, include_global=include_global)
+                    if kind == 'blocked':
+                        skipped.append({'name': name, 'reason': 'not_allowed'})
+                        continue
+                    relative = PurePosixPath(name)
+                    destination = adapter.base_dir / relative
+                    if destination.resolve() != destination.absolute():
+                        raise ValueError('Путь восстановления содержит ссылку или перенаправление.')
+                    if kind == 'profile':
+                        components = relative.parts
+                        length = 4 if components[2] == 'browser' else 3
+                        root_rel = Path(*components[:length])
+                    else:
+                        root_rel = Path(*relative.parts)
+                    live_root = adapter.base_dir / root_rel
+                    staged_root = staging / 'new' / root_rel
+                    if live_root not in replacements:
+                        replacements[live_root] = staged_root
+                        if kind == 'profile' and relative.parts[2] in {'logs', 'artifacts'} and live_root.exists():
+                            shutil.copytree(live_root, staged_root)
+                    target = staging / 'new' / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as src, target.open('wb') as dst:
+                        shutil.copyfileobj(src, dst)
+                    restored.append({'name': name, 'kind': kind, 'bytes': info.file_size})
+            from contextlib import ExitStack
 
-        with zipfile.ZipFile(backup) as archive:
-            member_names = [info.filename for info in archive.infolist() if not info.is_dir()]
-            if any(any(name.startswith(prefix) for prefix in profile_restore_prefixes) for name in member_names):
-                for target in sorted(dirs_to_reset, key=lambda path: len(path.parts), reverse=True):
-                    if target.exists():
-                        adapter._remove_profile_path_for_compact(target, profile_root)
-
-            for info in archive.infolist():
-                name = info.filename
-                if info.is_dir() or name == "BACKUP_MANIFEST.json":
-                    continue
-                kind = self.classify_auth_backup_member(name, profile_root.name, include_global=include_global)
-                if kind == "blocked":
-                    skipped.append({"name": name, "reason": "not_allowed"})
-                    continue
-                target = (adapter.base_dir / PurePosixPath(name)).resolve()
+            from yara_app.fileio import file_lock
+            swapped = []
+            with ExitStack() as locks:
+                for live in sorted(replacements, key=str):
+                    locks.enter_context(file_lock(live))
                 try:
-                    target.relative_to(adapter.base_dir.resolve())
-                except ValueError:
-                    skipped.append({"name": name, "reason": "outside_project"})
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(info) as src, target.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                restored.append({"name": name, "kind": kind, "bytes": int(info.file_size or 0)})
+                    for index, (live, staged) in enumerate(replacements.items()):
+                        previous = staging / f'previous_{index}'
+                        live.parent.mkdir(parents=True, exist_ok=True)
+                        existed = live.exists()
+                        if existed:
+                            live.rename(previous)
+                        swapped.append((live, previous, existed))
+                        staged.rename(live)
+                except Exception:
+                    for index, (live, previous, existed) in enumerate(reversed(swapped)):
+                        if live.exists():
+                            live.rename(staging / f'failed_{index}')
+                        if existed:
+                            previous.rename(live)
+                    raise
 
         return {
             "ok": True,

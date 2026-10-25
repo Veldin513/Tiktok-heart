@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import os
 import time
 import urllib.error
 import urllib.request
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from yara_app.fileio import atomic_write_text, file_lock, read_json
 from yara_app.project_adapter import ProjectAdapter
+from yara_app.redaction import RedactingFormatter
+from yara_app.telegram_setup import parse_chat_ids
 
 CONFIG_NAME = "telegram_bot_v2.json"
 LOCK_NAME = "telegram_bot_v2.lock"
@@ -134,10 +137,11 @@ class TelegramControlBot:
         self.adapter = ProjectAdapter(base_dir)
         self.settings = self._load_settings()
         self.api = TelegramAPI(self.settings.token, self.settings.connect_timeout)
-        self.state_path = self.adapter.base_dir / self.settings.state_file
+        self.state_path = self.adapter.base_dir / 'control' / 'telegram_bot_v2_state.json'
         self.lock_path = self.adapter.control_dir / LOCK_NAME
         self.instance_pid = os.getpid()
         self._lock_acquired = False
+        self._instance_lease = None
         self.offset, self.known_chat_ids = self._load_state()
         self.logger = self._configure_logger()
 
@@ -149,7 +153,7 @@ class TelegramControlBot:
         path = self.adapter.telegram_log_path
         path.parent.mkdir(parents=True, exist_ok=True)
         handler = logging.FileHandler(path, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        handler.setFormatter(RedactingFormatter("%(asctime)s [%(levelname)s] %(message)s"))
         logger.addHandler(handler)
         return logger
 
@@ -158,12 +162,14 @@ class TelegramControlBot:
         if not path.exists():
             raise FileNotFoundError(f"Config not found: {path}")
 
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = read_json(path)
         token = str(payload.get("token") or "").strip()
         if not token or token == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
             raise ValueError("Не заполнен token в control/telegram_bot_v2.json")
 
-        allowed = {int(item) for item in payload.get("allowed_chat_ids", [])}
+        allowed = set(parse_chat_ids(payload.get("allowed_chat_ids", [])))
+        if not allowed:
+            raise ValueError('Укажите allowed_chat_ids: без списка владельцев запуск Telegram закрыт.')
         return BotSettings(
             token=token,
             allowed_chat_ids=allowed,
@@ -175,74 +181,76 @@ class TelegramControlBot:
         )
 
     def _load_state(self) -> tuple[int | None, set[int]]:
-        if not self.state_path.exists():
+        payload = read_json(self.state_path)
+        if payload is None:
             return None, set()
-        try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
+        if not isinstance(payload, dict):
+            raise ValueError('Состояние Telegram повреждено. Запуск остановлен, чтобы не повторить старые команды.')
+        fingerprint = hashlib.sha256(self.settings.token.encode()).hexdigest()
+        if payload.get('token_fingerprint') not in (None, fingerprint):
             return None, set()
         offset = payload.get("offset")
-        raw_chats = payload.get("known_chat_ids") or []
-        chats: set[int] = set()
-        for item in raw_chats:
-            try:
-                chats.add(int(item))
-            except Exception:
-                continue
-        return (int(offset) if offset is not None else None), chats
+        if offset is not None and (type(offset) is not int or offset < 0):
+            raise ValueError('Некорректный offset Telegram. Исходный файл сохранён.')
+        chats = set(parse_chat_ids(payload.get('known_chat_ids', [])))
+        return offset, chats
 
     def _try_create_lock_file(self) -> bool:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({"pid": self.instance_pid, "updated_at": time.time()}, ensure_ascii=False, indent=2)
-        for _attempt in range(2):
-            try:
-                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                existing_pid = self.adapter._read_pid_file(self.lock_path)
-                if existing_pid and existing_pid != self.instance_pid and self.adapter._pid_exists(existing_pid):
-                    self.logger.error("Telegram bot already running with PID %s", existing_pid)
-                    return False
-                self.adapter._clear_pid_file(self.lock_path)
-                continue
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(payload)
-            except Exception:
-                with suppress(Exception):
-                    os.close(fd)
-                raise
-            return True
-        return False
+        lease = file_lock(self.lock_path, timeout=0)
+        try:
+            lease.__enter__()
+        except TimeoutError:
+            return False
+        existing_pid = self.adapter._read_pid_file(self.lock_path)
+        if existing_pid and existing_pid != self.instance_pid and self.adapter._pid_exists(existing_pid):
+            lease.__exit__(None, None, None)
+            return False
+        try:
+            atomic_write_text(self.lock_path, json.dumps({'pid': self.instance_pid, 'updated_at': time.time()}))
+        except Exception:
+            lease.__exit__(None, None, None)
+            raise
+        self._instance_lease = lease
+        return True
 
     def _acquire_instance_lock(self) -> bool:
         if not self._try_create_lock_file():
             return False
-        self.adapter.update_control_state({"telegram_bot_pid": self.instance_pid, "telegram_bot_started_at": time.time()})
+        try:
+            self.adapter.update_control_state({"telegram_bot_pid": self.instance_pid, "telegram_bot_started_at": time.time()})
+        except Exception:
+            self._instance_lease.__exit__(None, None, None)
+            self._instance_lease = None
+            raise
         self._lock_acquired = True
         return True
 
     def _release_instance_lock(self) -> None:
         if not self._lock_acquired:
             return
-        current_pid = self.adapter._read_pid_file(self.lock_path)
-        if current_pid == self.instance_pid:
-            self.adapter._clear_pid_file(self.lock_path)
-        state = self.adapter.get_control_state()
-        if state.get("telegram_bot_pid") == self.instance_pid:
-            self.adapter.update_control_state({"telegram_bot_pid": None, "telegram_bot_started_at": None})
-        self._lock_acquired = False
+        try:
+            current_pid = self.adapter._read_pid_file(self.lock_path)
+            if current_pid == self.instance_pid:
+                self.adapter._clear_pid_file(self.lock_path)
+            state = self.adapter.get_control_state()
+            if state.get("telegram_bot_pid") == self.instance_pid:
+                self.adapter.update_control_state({"telegram_bot_pid": None, "telegram_bot_started_at": None})
+        finally:
+            self._lock_acquired = False
+            if self._instance_lease is not None:
+                self._instance_lease.__exit__(None, None, None)
+                self._instance_lease = None
 
     def _save_state(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "offset": self.offset,
             "known_chat_ids": sorted(self.known_chat_ids),
+            'token_fingerprint': hashlib.sha256(self.settings.token.encode()).hexdigest(),
         }
-        self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(self.state_path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _authorized(self, chat_id: int) -> bool:
-        if not self.settings.allowed_chat_ids:
-            return True
         return chat_id in self.settings.allowed_chat_ids
 
     def _remember_chat(self, chat_id: int) -> None:
@@ -252,8 +260,7 @@ class TelegramControlBot:
 
     def _restore_reply_panels(self) -> None:
         """Send main inline menu to all known chats on startup."""
-        chat_ids = set(self.known_chat_ids)
-        chat_ids.update(self.settings.allowed_chat_ids)
+        chat_ids = set(self.settings.allowed_chat_ids)
         for chat_id in sorted(chat_ids):
             try:
                 self.api.send_message(
@@ -446,7 +453,10 @@ class TelegramControlBot:
                     updates = self.api.get_updates(self.offset, self.settings.poll_timeout)
                     for update in updates:
                         update_id = int(update["update_id"])
-                        self.process_update(update)
+                        try:
+                            self.process_update(update)
+                        except Exception:
+                            self.logger.exception('Update %s failed; it will not be replayed automatically', update_id)
                         self.offset = update_id + 1
                         self._save_state()
                     backoff = 2

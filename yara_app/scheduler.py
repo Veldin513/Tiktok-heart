@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
+
+from yara_app.processes import run_bounded
 
 if TYPE_CHECKING:
     from yara_app.project_adapter import ProjectAdapter
@@ -191,7 +192,7 @@ if ($changed) {
         if os.name != "nt":
             return None
         try:
-            result = subprocess.run(
+            result = run_bounded(
                 ["schtasks", "/Query", "/TN", self._schtasks_name(task_name), "/FO", "LIST", "/V"],
                 cwd=str(adapter.base_dir),
                 capture_output=True,

@@ -323,6 +323,33 @@
                 <button class="btn secondary" data-action="clear_telegram_lock">Очистить lock</button>
               </div>
             </article>
+            <article class="panel span-2">
+              <div class="panel-title">Создать и настроить Telegram-бота</div>
+              <ol class="muted">
+                <li>Нажмите «Открыть BotFather», отправьте ему <code>/newbot</code>.</li>
+                <li>Укажите название и свободный username с окончанием <code>bot</code>. Вставьте выданный токен ниже.</li>
+                <li>Откройте своего нового бота в Telegram, нажмите «Начать» или отправьте <code>/start</code>.</li>
+                <li>Нажмите «Найти мой ID», выберите свой аккаунт, сохраните настройки и нажмите «Запустить» выше.</li>
+              </ol>
+              <p class="muted">Для изменения токена или доступа сначала остановите бота. Пустое поле токена сохраняет прежний токен. Название, описание и фото бота меняются в BotFather командой <code>/mybots</code>.</p>
+              <form id="telegram-settings-form" class="profile-form" autocomplete="off">
+                <label class="field-label" for="telegram-token">Токен BotFather</label>
+                <input id="telegram-token" class="input" type="password" autocomplete="new-password" placeholder="Вставьте токен нового бота" maxlength="220" />
+                <label class="field-label" for="telegram-admin">Имя владельца в панели управления</label>
+                <input id="telegram-admin" class="input" maxlength="80" value="Admin" required />
+                <label class="field-label" for="telegram-ids">Разрешённые Telegram ID</label>
+                <textarea id="telegram-ids" class="text-editor" rows="2" placeholder="Числа через запятую или с новой строки" required></textarea>
+                <p class="muted">Добавляйте только знакомые ID. Каждый из них получает управление приложением.</p>
+                <div class="button-grid">
+                  <button type="button" id="telegram-botfather" class="btn secondary">Открыть BotFather</button>
+                  <button type="button" id="telegram-check" class="btn secondary">Проверить токен</button>
+                  <button type="button" id="telegram-discover" class="btn secondary">Найти мой ID</button>
+                  <button type="submit" class="btn primary">Сохранить Telegram</button>
+                </div>
+                <div id="telegram-chat-choices" class="button-grid"></div>
+                <p id="telegram-settings-status" class="muted" role="status"></p>
+              </form>
+            </article>
             <article class="panel span-2 schedule-panel">
               <div class="panel-title row-title">
                 <span>Автозапуск</span>

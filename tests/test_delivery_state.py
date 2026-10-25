@@ -126,3 +126,43 @@ def test_blocked_chat_does_not_send_or_navigate_around_modal(dispatch, monkeypat
     summary = RunSummary('test', 1)
     checker.process_target(object(), Target('alice', 'https://www.tiktok.com/@alice'), summary)
     assert summary.results[0].reason == 'chat_blocked'
+
+
+@pytest.mark.parametrize('exception', [checker.AuthSessionUnavailable, checker.AuthCheckInconclusive])
+def test_auth_error_is_not_hidden_as_a_missing_chat(dispatch, monkeypatch, exception):
+    def fail(*_args):
+        raise exception('session check failed')
+    monkeypatch.setattr(checker, 'open_chat_by_list', fail)
+    with pytest.raises(exception):
+        checker.process_target(object(), Target('alice'), RunSummary('test', 1))
+
+
+def test_unexpected_send_error_remains_blocked_after_restart(dispatch, monkeypatch):
+    def fail(*_args):
+        raise RuntimeError('connection closed after click')
+    monkeypatch.setattr(checker, 'send_message', fail)
+    checker.process_target(object(), Target('alice'), RunSummary('test', 1))
+    assert checker.target_delivery_unconfirmed('alice')
+    assert not checker.acquire_target_send_guard('alice')[0]
+
+
+def test_confirmed_send_with_failed_cooldown_write_keeps_no_retry_guard(dispatch, monkeypatch):
+    monkeypatch.setattr(checker, 'send_message', lambda *_a: SendReceipt('123', 'client-1', 'websocket'))
+    def fail(*_args):
+        raise PermissionError('disk busy')
+    monkeypatch.setattr(checker.store, 'mark_sent_now', fail)
+    summary = RunSummary('test', 1)
+    checker.process_target(object(), Target('alice'), summary)
+    assert summary.success_count == 1 and summary.failed_count == 0
+    assert summary.results[0].reason == 'local_state_write_failed'
+    assert checker.target_delivery_unconfirmed('alice')
+
+
+def test_telegram_notification_error_does_not_change_confirmed_delivery(dispatch, monkeypatch):
+    monkeypatch.setattr(checker, 'send_message', lambda *_a: SendReceipt('123', 'client-1', 'websocket'))
+    def fail(**_kwargs):
+        raise OSError('Telegram unavailable')
+    monkeypatch.setattr(checker.tg, 'send_target_success', fail)
+    summary = RunSummary('test', 1)
+    checker.process_target(object(), Target('alice'), summary)
+    assert summary.success_count == 1 and summary.failed_count == 0

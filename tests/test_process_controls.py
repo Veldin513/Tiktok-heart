@@ -46,7 +46,7 @@ def test_start_worker_hides_console_on_windows(tmp_path: Path, monkeypatch) -> N
 
 def test_start_telegram_bot_tracks_pid_and_uses_log(tmp_path: Path, monkeypatch) -> None:
     adapter = setup_project(tmp_path)
-    write_json(tmp_path / 'control' / 'telegram_bot_v2.json', {'token': 'abc123'})
+    write_json(tmp_path / 'control' / 'telegram_bot_v2.json', {'token': 'abc123', 'allowed_chat_ids': [12345]})
     captured: dict[str, object] = {}
 
     class DummyProcess:

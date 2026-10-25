@@ -25,6 +25,7 @@ const state = {
   selectedBrowserProfile: null,
   scheduleSaveInFlight: false,
   fullDiagnosticsLoaded: false,
+  telegramLoaded: false,
   uiMode: (() => {
     try {
       return localStorage.getItem("tiktok-heart-ui-mode") || "simple";
@@ -1419,6 +1420,63 @@ async function runWorkerSelfTestFromButton(button) {
   }
 }
 
+async function loadTelegramSettings() {
+  const data = await api('/api/telegram/settings');
+  $('#telegram-admin').value = data.admin_name;
+  $('#telegram-ids').value = data.allowed_chat_ids.join(', ');
+  $('#telegram-token').placeholder = data.token_configured ? 'Токен сохранён. Оставьте пустым, чтобы сохранить его' : 'Вставьте токен BotFather';
+  state.telegramLoaded = true;
+}
+
+function bindTelegramSettings() {
+  const form = $('#telegram-settings-form');
+  const status = $('#telegram-settings-status');
+  const run = async (action) => {
+    form.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+    status.textContent = 'Выполняется…';
+    try { await action(); }
+    catch (error) { status.textContent = error.message; }
+    finally { form.querySelectorAll('button').forEach((button) => { button.disabled = false; }); }
+  };
+  const post = (action, data = {}) => api(`/api/telegram/${action}`, {
+    method: 'POST', body: JSON.stringify({ token: $('#telegram-token').value.trim(), ...data }), timeoutMs: 20000,
+  });
+  $('#telegram-botfather').addEventListener('click', () => run(async () => {
+    await post('botfather'); status.textContent = 'В BotFather отправьте /newbot для создания или /mybots для редактирования.';
+  }));
+  $('#telegram-check').addEventListener('click', () => run(async () => {
+    const data = await post('check'); status.textContent = `Токен принят: ${data.name} (@${data.username}). Настройки ещё не сохранены.`;
+  }));
+  $('#telegram-discover').addEventListener('click', () => run(async () => {
+    const choices = $('#telegram-chat-choices');
+    choices.replaceChildren();
+    const chats = await post('chats');
+    chats.forEach((chat) => {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'btn secondary';
+      button.textContent = `${chat.name} ${chat.username ? '@' + chat.username : ''} · ${chat.id} — добавить`;
+      button.addEventListener('click', () => {
+        const ids = $('#telegram-ids').value.split(/[,;\s]+/).filter(Boolean);
+        $('#telegram-ids').value = Array.from(new Set([...ids, String(chat.id)])).join(', ');
+        button.remove(); status.textContent = 'ID добавлен в форму. Нажмите «Сохранить Telegram».';
+      });
+      choices.append(button);
+    });
+    status.textContent = chats.length ? 'Выберите свой аккаунт. Доступ автоматически не выдаётся.' : 'Новых /start не найдено. Откройте своего бота, отправьте /start и повторите поиск.';
+  }));
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    run(async () => {
+      await post('settings', { admin_name: $('#telegram-admin').value.trim(), allowed_chat_ids: $('#telegram-ids').value });
+      $('#telegram-token').value = '';
+      $('#telegram-chat-choices').replaceChildren();
+      await loadTelegramSettings();
+      status.textContent = 'Сохранено. Нажмите «Запустить» в блоке Telegram выше.';
+      await refresh({ full: true });
+    });
+  });
+}
+
 function activateView(view) {
   if (state.uiMode === "simple" && isAdvancedView(view)) {
     view = "overview";
@@ -1434,6 +1492,9 @@ function activateView(view) {
   if (view === "messages") {
     loadMessages().catch((error) => toast(error.message));
   }
+  if (view === "services" && !state.telegramLoaded) {
+    loadTelegramSettings().catch((error) => toast(error.message));
+  }
   if (view === "logs") {
     loadLogs().catch((error) => toast(error.message));
   }
@@ -1446,6 +1507,7 @@ function bindNavigation() {
 }
 
 function bindActions() {
+  bindTelegramSettings();
   $("#create-profile-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = event.currentTarget;

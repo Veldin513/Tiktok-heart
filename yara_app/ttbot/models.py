@@ -20,6 +20,7 @@ from yara_app.config import (
     MESSAGE_POOL_FILE,
     PROFILES_FILE,
 )
+from yara_app.fileio import atomic_write_text, file_lock, read_json, read_text
 
 
 @dataclass(frozen=True)
@@ -191,7 +192,7 @@ def safe_name_key(value: str | None) -> str:
     ascii_slug = ascii_slug_source.encode('ascii', 'ignore').decode('ascii')
     ascii_slug = _NON_ALNUM_RE.sub('_', ascii_slug).strip('_').lower()
     digest_source = normalized or 'target'
-    digest = hashlib.sha1(digest_source.encode('utf-8')).hexdigest()[:10]
+    digest = hashlib.sha1(digest_source.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]
     prefix = ascii_slug[:40] if ascii_slug else 'target'
     return f'{prefix}_{digest}'
 
@@ -224,8 +225,8 @@ class StateStore:
         for path in (path_a, path_b):
             if path.exists():
                 try:
-                    return float(path.read_text(encoding='utf-8').strip())
-                except Exception:
+                    return float(read_text(path).strip())
+                except FileNotFoundError:
                     continue
         return None
 
@@ -244,20 +245,25 @@ class StateStore:
 
     def mark_sent_now(self, target_name: str) -> None:
         log_file, _, _, _ = self.get_target_files(target_name)
-        log_file.write_text(str(time.time()), encoding='utf-8')
+        atomic_write_text(log_file, str(time.time()))
 
     def get_streak_count(self, target_name: str) -> int:
         _, stats_file, _, legacy_stats = self.get_target_files(target_name)
         for path in (stats_file, legacy_stats):
             if path.exists():
                 try:
-                    parts = path.read_text(encoding='utf-8').strip().split('|')
+                    parts = read_text(path).strip().split('|')
                     return int(parts[0]) if parts and parts[0] else 0
                 except Exception:
                     continue
         return 0
 
     def update_streak_stats(self, target_name: str) -> StreakUpdate:
+        _, stats_file, _, _ = self.get_target_files(target_name)
+        with file_lock(stats_file):
+            return self._update_streak_stats_locked(target_name)
+
+    def _update_streak_stats_locked(self, target_name: str) -> StreakUpdate:
         _, stats_file, _, legacy_stats = self.get_target_files(target_name)
         today = datetime.datetime.now().strftime('%Y-%m-%d')
         current_count = 0
@@ -265,17 +271,16 @@ class StateStore:
         for path in (stats_file, legacy_stats):
             if path.exists():
                 try:
-                    parts = path.read_text(encoding='utf-8').strip().split('|')
+                    parts = read_text(path).strip().split('|')
                     current_count = int(parts[0]) if parts and parts[0] else 0
                     last_send_date = parts[1] if len(parts) > 1 else ''
                     break
-                except Exception:
-                    current_count = 0
-                    last_send_date = ''
+                except FileNotFoundError:
+                    continue
         is_new_day = last_send_date != today
         if is_new_day:
             current_count += 1
-        stats_file.write_text(f'{current_count}|{today}', encoding='utf-8')
+        atomic_write_text(stats_file, f'{current_count}|{today}')
         return StreakUpdate(current_count=current_count, is_new_day=is_new_day)
 
 
@@ -307,25 +312,27 @@ class ControlStore:
         self._seed_files()
 
     def _seed_files(self) -> None:
-        if not PROFILES_FILE.exists():
-            PROFILES_FILE.write_text(json.dumps(DEFAULT_PROFILES, ensure_ascii=False, indent=2), encoding='utf-8')
-        if not CONTROL_STATE_FILE.exists():
-            state = ControlState(
-                active_profile=DEFAULT_PROFILE_NAME,
-                cooldown_hours=DEFAULT_COOLDOWN_HOURS,
-                dry_run=False,
-                paused=False,
-                stop_requested=False,
-            )
-            CONTROL_STATE_FILE.write_text(json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
-        if not MESSAGE_POOL_FILE.exists():
-            MESSAGE_POOL_FILE.write_text("\n".join(DEFAULT_MESSAGES) + "\n", encoding='utf-8')
+        with file_lock(PROFILES_FILE):
+            if not PROFILES_FILE.exists():
+                atomic_write_text(PROFILES_FILE, json.dumps(DEFAULT_PROFILES, ensure_ascii=False, indent=2))
+        with file_lock(CONTROL_STATE_FILE):
+            if not CONTROL_STATE_FILE.exists():
+                state = ControlState(DEFAULT_PROFILE_NAME, DEFAULT_COOLDOWN_HOURS, False, False, False)
+                atomic_write_text(CONTROL_STATE_FILE, json.dumps(state.to_dict(), ensure_ascii=False, indent=2))
+        with file_lock(MESSAGE_POOL_FILE):
+            if not MESSAGE_POOL_FILE.exists():
+                atomic_write_text(MESSAGE_POOL_FILE, "\n".join(DEFAULT_MESSAGES) + "\n")
 
     def load_profiles(self) -> dict[str, list[dict[str, str]]]:
-        return json.loads(PROFILES_FILE.read_text(encoding='utf-8-sig'))
+        return read_json(PROFILES_FILE)
 
     def load_state(self) -> ControlState:
-        raw = json.loads(CONTROL_STATE_FILE.read_text(encoding='utf-8-sig'))
+        return self._state_from(read_json(CONTROL_STATE_FILE))
+
+    @staticmethod
+    def _state_from(raw) -> ControlState:
+        if not isinstance(raw, dict):
+            raise ValueError('Состояние worker повреждено; автоматическая перезапись отключена.')
         return ControlState(
             active_profile=raw.get('active_profile', DEFAULT_PROFILE_NAME),
             cooldown_hours=int(raw.get('cooldown_hours', DEFAULT_COOLDOWN_HOURS)),
@@ -337,22 +344,19 @@ class ControlStore:
         )
 
     def save_state(self, state: ControlState) -> None:
-        CONTROL_STATE_FILE.write_text(json.dumps(state.to_dict(), ensure_ascii=False, indent=2), encoding='utf-8')
+        with file_lock(CONTROL_STATE_FILE):
+            raw = read_json(CONTROL_STATE_FILE, {})
+            if not isinstance(raw, dict):
+                raise ValueError('Состояние worker повреждено; изменения не записаны.')
+            atomic_write_text(CONTROL_STATE_FILE, json.dumps({**raw, **state.to_dict()}, ensure_ascii=False, indent=2))
 
     def update_state(self, **changes: Any) -> ControlState:
-        state = self.load_state()
-        data = state.to_dict()
-        data.update(changes)
-        new_state = ControlState(
-            active_profile=data['active_profile'],
-            cooldown_hours=int(data['cooldown_hours']),
-            dry_run=bool(data['dry_run']),
-            paused=bool(data['paused']),
-            stop_requested=bool(data['stop_requested']),
-            last_run_pid=data.get('last_run_pid'),
-            last_run_started_at=data.get('last_run_started_at'),
-        )
-        self.save_state(new_state)
+        with file_lock(CONTROL_STATE_FILE):
+            data = read_json(CONTROL_STATE_FILE)
+            new_state = self._state_from(data)
+            data.update(changes)
+            new_state = self._state_from(data)
+            atomic_write_text(CONTROL_STATE_FILE, json.dumps(data, ensure_ascii=False, indent=2))
         return new_state
 
     def ensure_profile(self, profile_name: str) -> None:
