@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from yara_app.notifications import notify_worker_result  # noqa: E402
 from yara_app.project_adapter import ProjectAdapter  # noqa: E402
 
 DEFAULT_COOLDOWN_GRACE_SECONDS = 180
@@ -213,26 +214,39 @@ def main() -> int:
         return 0
 
     state = adapter.get_control_state()
+    def report_blocked(reason: str) -> None:
+        notify_worker_result(adapter, {'profile_name': state.get('active_profile'), 'results': []},
+                             status='failed', reason=reason)
+
     if state.get('paused') or state.get('stop_requested'):
         print_lifecycle('skip_control_flag', paused=bool(state.get('paused')), stop_requested=bool(state.get('stop_requested')))
+        return 0
+    active = next((profile for profile in adapter.get_profiles() if profile.key == state.get('active_profile')), None)
+    if active is not None and not active.enabled:
+        print_lifecycle('skip_profile_disabled')
         return 0
     profile_root = adapter._bot_profile_root()
     if (profile_root / 'state' / 'session_import_required.json').exists():
         print_lifecycle('skip_session_import_required')
+        report_blocked('session_import_required')
         return 0
     if (profile_root / 'browser' / '.session_import.lock').exists():
         print_lifecycle('skip_session_import_running')
+        report_blocked('session_import_running')
         return 0
     if (profile_root / 'browser' / '.manual_login.json').exists():
         print_lifecycle('skip_manual_login_pending')
+        report_blocked('manual_login_pending')
         return 0
     backoff_left = adapter._auth_backoff_seconds_left(profile_root / 'state' / 'auth_backoff.json')
     if backoff_left > 0:
         print_lifecycle('skip_auth_backoff', seconds_left=backoff_left)
+        report_blocked('auth_backoff')
         return 0
     queue = adapter.queue_snapshot()
     if int(queue.get('target_count') or 0) == 0:
         print_lifecycle('skip_no_targets')
+        report_blocked('no_targets')
         return 0
     # Only the explicit sign-in task may bypass cooldown. A recovery tick after
     # a recent reboot must still honour the user's disabled startup setting.
@@ -240,6 +254,8 @@ def main() -> int:
     if not boot_force:
         queue, _waited_for_cooldown = wait_for_near_cooldown(adapter, queue)
     if not boot_force and int(queue.get("target_count") or 0) > 0 and int(queue.get("ready_count") or 0) == 0:
+        if int(queue.get('cooldown_count') or 0) < int(queue.get('target_count') or 0):
+            report_blocked('delivery_unconfirmed')
         wait_seconds = int(queue.get("next_send_in_s") or 0)
         print_lifecycle("skip_all_cooldown", target_count=queue.get("target_count"), next_ready_in_s=wait_seconds)
         try:
@@ -250,7 +266,11 @@ def main() -> int:
             return 3
         return 0
 
-    started = adapter.start_worker()
+    try:
+        started = adapter.start_worker()
+    except Exception:
+        report_blocked('worker_start_failed')
+        raise
     print_lifecycle("worker_started", pid=started.pid)
     return 0
 

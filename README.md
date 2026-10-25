@@ -91,6 +91,8 @@ The app can also read Telegram settings from `control/telegram_bot_v2.json`. Tha
 
 Telegram setup is available in **Advanced mode → Management**: open BotFather, check a token, find your chat ID after `/start`, select allowed users, and save or edit settings. Stop the bot before editing, then start it again. See [the step-by-step setup](INSTALL.md#14-создайте-telegram-бота--по-желанию).
 
+Administrators can manage all profiles. Approved users get personal profiles with their Telegram nickname and ID, and can configure their own recipient, streak, login and worker. Worker reports use a one-shot Telegram connection; the interactive bot only needs to stay running while you use its buttons.
+
 ### Browser Authorization
 
 Use the Browser tab to:
@@ -262,6 +264,8 @@ scripts\windows\start_app_shell.bat
 Telegram можно также настроить через `control/telegram_bot_v2.json`. Это локальный файл, его нельзя коммитить.
 
 В **Расширенном режиме → Управление** есть мастер настройки Telegram: переход к BotFather, проверка токена, поиск своего ID после `/start`, выбор пользователей и сохранение или редактирование настроек. Перед изменением остановите бота, после сохранения запустите снова. [Пошаговая инструкция](INSTALL.md#14-создайте-telegram-бота--по-желанию).
+
+Администратор управляет всеми профилями. Разрешённый пользователь получает личный профиль с ником и Telegram ID: свой адресат, серия, вход и worker. Для итогового уведомления постоянный бот не нужен; для кнопок управления он должен работать.
 
 ### Авторизация браузера
 

@@ -324,7 +324,16 @@ class ControlStore:
                 atomic_write_text(MESSAGE_POOL_FILE, "\n".join(DEFAULT_MESSAGES) + "\n")
 
     def load_profiles(self) -> dict[str, list[dict[str, str]]]:
-        return read_json(PROFILES_FILE)
+        raw = read_json(PROFILES_FILE)
+        if not isinstance(raw, dict):
+            raise ValueError('Профили должны быть объектом с именами профилей.')
+        result = {}
+        for key, value in raw.items():
+            targets = value.get('targets', []) if isinstance(value, dict) else value
+            if not isinstance(targets, list) or any(not isinstance(item, dict) or not item.get('name') for item in targets):
+                raise ValueError(f'Некорректный список адресатов в профиле {key}.')
+            result[key] = [] if isinstance(value, dict) and value.get('enabled') is False else targets
+        return result
 
     def load_state(self) -> ControlState:
         return self._state_from(read_json(CONTROL_STATE_FILE))

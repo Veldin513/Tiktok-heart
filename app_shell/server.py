@@ -398,6 +398,8 @@ class AppShellHandler(BaseHTTPRequestHandler):
                         result = setup.check(token)
                     elif parsed.path == '/api/telegram/chats':
                         result = setup.discover_chats(token)
+                    elif parsed.path == '/api/telegram/test':
+                        result = setup.test_notification()
                     elif parsed.path == '/api/telegram/botfather':
                         webbrowser.open('https://t.me/BotFather')
                         result = {'opened': True}

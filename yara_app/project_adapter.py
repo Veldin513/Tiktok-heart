@@ -554,6 +554,93 @@ class ProjectAdapter:
             self._write_json(self.profiles_path, payload)
         return target
 
+    def update_target_recipient(self, profile_key: str, target_index: int, profile_url: str,
+                                *, expected_name: str, expected_url: str | None = None) -> dict:
+        """Replace one recipient, rejecting stale buttons and changes during a run."""
+        value = str(profile_url).strip()
+        if value.startswith('@'):
+            value = 'https://www.tiktok.com/' + value
+        parsed = urlparse(value)
+        if (parsed.scheme != 'https' or parsed.netloc not in ('www.tiktok.com', 'tiktok.com')
+                or not re.fullmatch(r'/@[A-Za-z0-9._]{1,64}/?', parsed.path) or parsed.query or parsed.fragment):
+            raise ValueError('Пришлите @username или ссылку https://www.tiktok.com/@username.')
+        normalized = 'https://www.tiktok.com/' + parsed.path.strip('/')
+        with file_lock(self.control_dir / 'worker_launch'), _PROFILE_EDIT_LOCK, file_lock(self.profiles_path):
+            if self.get_worker_status().running:
+                raise RuntimeError('Сейчас идёт запуск. Дождитесь его завершения и повторите изменение.')
+            data = self._read_json(self.profiles_path, None)
+            if not isinstance(data, dict) or profile_key not in data:
+                raise ValueError('Профиль не найден или использует старый формат. Обновите меню.')
+            raw = data[profile_key]
+            targets = raw.get('targets') if isinstance(raw, dict) else raw
+            if not isinstance(targets, list) or target_index < 0 or target_index >= len(targets):
+                raise ValueError('Адресат больше не существует. Обновите меню.')
+            target = targets[target_index]
+            if target.get('name') != expected_name or target.get('url') != expected_url:
+                raise ValueError('Адресат уже изменён. Обновите меню и выберите его снова.')
+            if target.get('url') == normalized:
+                return dict(target)
+            name = parsed.path.strip('/').lstrip('@')
+            if any(index != target_index and (str(item.get('url', '')).rstrip('/') == normalized
+                   or str(item.get('name', '')).casefold() == name.casefold()) for index, item in enumerate(targets)):
+                raise ValueError('Этот адресат уже есть в профиле.')
+            updated = {**target, 'name': name, 'url': normalized}
+            targets[target_index] = updated
+            self._write_json(self.profiles_path, data)
+            return updated
+
+    def ensure_telegram_profile(self, user_id: int, username: str, display_name: str = '') -> ProfileEntry:
+        if user_id <= 0:
+            raise ValueError('Для личного профиля нужен Telegram ID пользователя.')
+        nick = re.sub(r'[^A-Za-z0-9_]', '', username).strip('_') or 'user'
+        label = f'@{username} · {user_id}' if username else f'{display_name or "Telegram"} · {user_id}'
+        key = f'tg_{user_id}_{nick}'[:48]
+        with _PROFILE_EDIT_LOCK, file_lock(self.profiles_path):
+            data = self._read_json(self.profiles_path, {})
+            if not isinstance(data, dict):
+                raise ValueError('Сначала переведите старый список профилей в формат объекта.')
+            existing_key = next((name for name, raw in data.items() if isinstance(raw, dict)
+                                 and raw.get('telegram_owner_id') == user_id), None)
+            if existing_key:
+                key = existing_key
+                data[key]['name'] = f'default · {label}' if key == 'default' else label
+            else:
+                if key in data:
+                    raise ValueError('Имя личного профиля уже занято другим профилем.')
+                data[key] = {'name': label, 'enabled': True, 'telegram_owner_id': user_id, 'targets': []}
+            self._write_json(self.profiles_path, data)
+        return next(profile for profile in self.get_profiles() if profile.key == key)
+
+    def bind_telegram_profile(self, profile_key: str, user_id: int, username: str, display_name: str = '') -> list[str]:
+        """Attach an existing account to a user; discard only empty duplicate entries."""
+        if self.get_worker_status().running:
+            raise RuntimeError('Сначала дождитесь завершения worker.')
+        with _PROFILE_EDIT_LOCK, file_lock(self.profiles_path):
+            data = self._read_json(self.profiles_path, None)
+            if not isinstance(data, dict) or profile_key not in data:
+                raise ValueError('Профиль для объединения не найден.')
+            target = data[profile_key]
+            if isinstance(target, list):
+                target = {'name': profile_key, 'enabled': True, 'targets': target}
+            if not isinstance(target, dict) or target.get('telegram_owner_id') not in (None, user_id):
+                raise ValueError('У этого профиля уже другой владелец.')
+            duplicates = [key for key, raw in data.items() if key != profile_key and isinstance(raw, dict)
+                          and raw.get('telegram_owner_id') == user_id]
+            for key in duplicates:
+                browser = self._bot_profile_root(key) / 'browser'
+                user_data = browser / 'user_data'
+                if (self._extract_targets(data[key]) or self.profile_login_confirmed(key)
+                        or (browser / LOGIN_PENDING).exists() or (user_data.exists() and any(user_data.iterdir()))):
+                    raise ValueError('Другой личный профиль уже настроен. Автоматическое объединение отменено.')
+            nick = '@' + username if username else display_name or 'Telegram'
+            data[profile_key] = {**target, 'name': f'{profile_key} · {nick} · {user_id}', 'telegram_owner_id': user_id}
+            for key in duplicates:
+                del data[key]  # The directories are retained; no cookies/state are moved or deleted.
+            self._write_json(self.profiles_path, data)
+        if self._active_profile_name() in duplicates:
+            self.set_active_profile_key(profile_key)
+        return duplicates
+
     def set_active_profile_key(self, profile_key: str) -> ProfileEntry:
         key = str(profile_key or "").strip()
         profiles = self.get_profiles()
@@ -1774,9 +1861,11 @@ class ProjectAdapter:
                 raise IndexError("profile index out of range")
             profile = profiles[index]
             raw = payload.get(profile.key)
-            if not isinstance(raw, dict) or "enabled" not in raw:
-                raise ValueError("This profile format does not support enable/disable")
-            raw["enabled"] = not bool(raw.get("enabled"))
+            if isinstance(raw, list):
+                raw = {'name': profile.label, 'targets': raw, 'enabled': True}
+            if not isinstance(raw, dict):
+                raise ValueError('Некорректный формат профиля.')
+            raw["enabled"] = not bool(raw.get("enabled", True))
             payload[profile.key] = raw
             self._write_json(self.profiles_path, payload)
             return next(item for item in self.get_profiles() if item.key == profile.key)
@@ -2337,7 +2426,7 @@ class ProjectAdapter:
         env = extend_env_with_site_packages(os.environ.copy())
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
-        env["TG_DISABLE_NOTIFICATIONS"] = "1"
+        env.setdefault("TG_DISABLE_NOTIFICATIONS", "0")
         env.setdefault("WORK_BROWSER_HEADLESS", "1")
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(self.base_dir) if not existing_pythonpath else f"{self.base_dir}{os.pathsep}{existing_pythonpath}"
@@ -2425,7 +2514,6 @@ class ProjectAdapter:
             return WorkerStatus(running=False, pid=None, started_at=started_at)
         if live_pid != tracked_pid:
             self.update_control_state({"telegram_bot_pid": live_pid, "telegram_bot_started_at": started_at or time.time()})
-        self._write_pid_file(self.telegram_lock_path, live_pid)
         return WorkerStatus(running=True, pid=live_pid, started_at=started_at, command=[sys.executable, str(self.telegram_script_path)])
 
     def _active_profile_name(self) -> str:
@@ -2437,17 +2525,74 @@ class ProjectAdapter:
         return active_name
 
     def start_worker(self) -> WorkerStatus:
+        with file_lock(self.control_dir / 'worker_launch'):
+            return self._start_worker_locked()
+
+    def _start_worker_locked(self) -> WorkerStatus:
         status = self.get_worker_status()
         if status.running:
             return status
+        return self._start_worker_profile(self._active_profile_name())
+
+    def _running_worker_profile(self, status: WorkerStatus) -> str | None:
+        if not status.running or not status.pid or psutil is None:
+            return None
+        try:
+            args = psutil.Process(status.pid).cmdline()
+            script = self.main_script_path.resolve()
+            for index, arg in enumerate(args):
+                if Path(arg).resolve() == script:
+                    return args[index + 1] if index + 1 < len(args) else self._active_profile_name()
+        except (OSError, ValueError, psutil.Error):
+            return None
+        return None
+
+    def get_profile_worker_status(self, profile_key: str) -> WorkerStatus:
+        status = self.get_worker_status()
+        return status if self._running_worker_profile(status) == profile_key else WorkerStatus(running=False, pid=None)
+
+    def start_profile_worker(self, profile_key: str) -> WorkerStatus:
+        with file_lock(self.control_dir / 'worker_launch'):
+            return self._start_profile_worker_locked(profile_key)
+
+    def _start_profile_worker_locked(self, profile_key: str) -> WorkerStatus:
+        profile = next((item for item in self.get_profiles() if item.key == profile_key), None)
+        if profile is None:
+            raise ValueError('Профиль не найден.')
+        if not profile.enabled:
+            raise ValueError('Администратор отключил этот профиль.')
+        if self.get_control_state().get('paused'):
+            raise ValueError('Администратор включил общую паузу. Запуск сейчас недоступен.')
+        status = self.get_worker_status()
+        if status.running:
+            if self._running_worker_profile(status) == profile_key:
+                return status
+            raise RuntimeError('Сейчас работает другой профиль. Дождитесь завершения; чужой запуск не остановлен.')
+        return self._start_worker_profile(profile_key)
+
+    def stop_profile_worker(self, profile_key: str) -> WorkerStatus:
+        with file_lock(self.control_dir / 'worker_launch'):
+            return self._stop_profile_worker_locked(profile_key)
+
+    def _stop_profile_worker_locked(self, profile_key: str) -> WorkerStatus:
+        status = self.get_worker_status()
+        if not status.running:
+            return status
+        if self._running_worker_profile(status) != profile_key:
+            raise RuntimeError('Работает другой профиль. Его запуск не остановлен.')
+        return self.stop_worker()
+
+    def _start_worker_profile(self, active_profile: str) -> WorkerStatus:
         if not self.main_script_path.exists():
             raise FileNotFoundError(f"Main script not found: {self.main_script_path}")
 
-        active_profile = self._active_profile_name()
         if (self._bot_profile_root(active_profile) / 'browser' / LOGIN_PENDING).exists():
             raise RuntimeError('Завершите ручной вход: закройте отдельный Chrome и нажмите «Проверить вход».')
+        profile = next((item for item in self.get_profiles() if item.key == active_profile), None)
+        if profile is None or not profile.enabled:
+            raise ValueError('Профиль не найден или отключён администратором.')
         self._refresh_runtime_paths(active_profile)
-        self.update_control_state({"stop_requested": False})
+        self.update_control_state({"stop_requested": False, 'last_run_profile': active_profile})
         started = self._launch_python_process(
             script_path=self.main_script_path,
             stdout_path=self.worker_stdout_path,
@@ -2472,7 +2617,6 @@ class ProjectAdapter:
         if stray_pid is not None:
             started_at = self.get_control_state().get("telegram_bot_started_at") or time.time()
             self.update_control_state({"telegram_bot_pid": stray_pid, "telegram_bot_started_at": started_at})
-            self._write_pid_file(self.telegram_lock_path, stray_pid)
             return WorkerStatus(running=True, pid=stray_pid, started_at=started_at, command=[sys.executable, str(self.telegram_script_path)])
 
         self._refresh_runtime_paths()
@@ -2483,8 +2627,6 @@ class ProjectAdapter:
             state_started_key="telegram_bot_started_at",
             hide_window=True,
         )
-        if status.pid:
-            self._write_pid_file(self.telegram_lock_path, status.pid)
         return status
 
     def stop_worker(self, timeout: float = 8.0) -> WorkerStatus:

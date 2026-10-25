@@ -25,7 +25,7 @@ from yara_app.auth_flow import (
     safe_close_context,
     wait_for_authenticated_page,
 )
-from yara_app.config import BOT_NAME, TG_CHAT_IDS, TG_DISABLE_NOTIFICATIONS, TG_TOKEN, MessageSelector, get_cli_profile
+from yara_app.config import TG_CHAT_IDS, TG_DISABLE_NOTIFICATIONS, TG_TOKEN, MessageSelector, get_cli_profile
 from yara_app.delivery import (
     DeliveryRejected,
     DeliveryUnconfirmed,
@@ -34,6 +34,7 @@ from yara_app.delivery import (
     attach_delivery_tracker,
 )
 from yara_app.fileio import atomic_write_text
+from yara_app.notifications import notify_worker_result
 from yara_app.project_adapter import ProjectAdapter
 from yara_app.redaction import redact_value
 from yara_app.runtime_paths import (
@@ -352,7 +353,7 @@ def save_run_summary(summary: RunSummary) -> None:
 
 
 def send_start_message(targets: list[Target], *, dry_run: bool) -> None:
-    tg.send_run_started(bot_name=BOT_NAME, profile_name=ACTIVE_PROFILE, target_count=len(targets), dry_run=dry_run)
+    logger.info('Запуск для %s адресатов; итог Telegram будет отправлен после закрытия браузера', len(targets))
 
 
 def force_send_on_boot() -> bool:
@@ -593,10 +594,6 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
             logger.exception('TikTok accepted the message; streak storage failed')
             return
     logger.info('✅ TikTok подтвердил приём сообщения. Текущий огонек: %s', streak.current_count)
-    try:
-        tg.send_target_success(target_name=target.name, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day)
-    except Exception:
-        logger.exception('Ошибка уведомления Telegram после подтверждённой отправки')
     summary.add_result(target=target.name, success=True, message=message, streak_count=streak.current_count, confirmation='server_ack')
     _append_run_history('target_result', target=target.name, success=True, message=message, streak_count=streak.current_count, is_new_day=streak.is_new_day,
                         confirmation='server_ack', server_message_id=receipt.server_message_id, transport=receipt.transport)
@@ -759,7 +756,6 @@ def check_tiktok_streak() -> None:
     if not run_lock.acquire():
         logger.warning('Профиль %s уже запущен. Пропускаю этот старт.', ACTIVE_PROFILE)
         log_lifecycle('worker_skip_lock_busy', profile=ACTIVE_PROFILE)
-        tg.send_text(f'⚠️ Профиль {ACTIVE_PROFILE} уже запущен. Новый запуск пропущен.')
         return
     atexit.register(release_worker_run)
 
@@ -793,8 +789,8 @@ def check_tiktok_streak() -> None:
         ready_targets = ready_targets_for_run(targets, summary)
         if not ready_targets:
             terminal_status = 'skipped'
-            terminal_reason = 'cooldown'
-            notify_run_finished = False
+            terminal_reason = next((item.reason for item in summary.results if item.reason != 'cooldown'), 'cooldown')
+            notify_run_finished = terminal_reason != 'cooldown'
             logger.info('No ready targets for %s. Browser and auth check skipped.', ACTIVE_PROFILE)
             log_lifecycle('worker_skip_all_cooldown', profile=ACTIVE_PROFILE, target_count=len(targets))
             _append_run_history('run_skipped', reason='cooldown', cooldown_count=len(targets))
@@ -815,7 +811,6 @@ def check_tiktok_streak() -> None:
                 log_lifecycle('worker_failed_auth', profile=ACTIVE_PROFILE)
                 summary.add_result(target='__run__', success=False, reason='auth_failed')
                 _append_run_history('run_failed', reason='auth_failed')
-                tg.send_text('Авторизация не подтверждена. Остановите worker и повторите перенос входа из Chrome в приложении.')
                 return
             try:
                 logger.info('Рабочий Chromium готов; продолжаем рассылку.')
@@ -880,37 +875,42 @@ def check_tiktok_streak() -> None:
         summary.duration_seconds = time.time() - run_start
         terminal_status = final_run_status(summary, terminal_status)
         completed_at = time.time()
-        save_run_summary(summary)
-        _write_run_state(
-            status=terminal_status,
-            reason=terminal_reason or None,
-            completed_at=completed_at,
-            current_target=None,
-            total_targets=summary.total_targets,
-            summary=summary.to_dict(),
-        )
-        _append_run_history(
-            'run_finished',
-            status=terminal_status,
-            reason=terminal_reason or None,
-            success_count=summary.success_count,
-            skipped_count=summary.skipped_count,
-            failed_count=summary.failed_count,
-            duration_seconds=round(summary.duration_seconds, 2),
-        )
-        if notify_run_finished:
-            tg.send_run_finished(profile_name=summary.profile_name, success_count=summary.success_count, skipped_count=summary.skipped_count, failed_count=summary.failed_count, duration_text=format_duration(int(summary.duration_seconds)))
-        log_lifecycle(
-            'worker_finish',
-            profile=ACTIVE_PROFILE,
-            status=terminal_status,
-            reason=terminal_reason or None,
-            success=summary.success_count,
-            skipped=summary.skipped_count,
-            failed=summary.failed_count,
-            duration_seconds=round(summary.duration_seconds, 2),
-        )
-        release_worker_run()
+        try:
+            save_run_summary(summary)
+            _write_run_state(
+                status=terminal_status,
+                reason=terminal_reason or None,
+                completed_at=completed_at,
+                current_target=None,
+                total_targets=summary.total_targets,
+                summary=summary.to_dict(),
+            )
+            _append_run_history(
+                'run_finished',
+                status=terminal_status,
+                reason=terminal_reason or None,
+                success_count=summary.success_count,
+                skipped_count=summary.skipped_count,
+                failed_count=summary.failed_count,
+                duration_seconds=round(summary.duration_seconds, 2),
+            )
+            log_lifecycle(
+                'worker_finish',
+                profile=ACTIVE_PROFILE,
+                status=terminal_status,
+                reason=terminal_reason or None,
+                success=summary.success_count,
+                skipped=summary.skipped_count,
+                failed=summary.failed_count,
+                duration_seconds=round(summary.duration_seconds, 2),
+            )
+        finally:
+            try:
+                release_worker_run()
+            finally:
+                if notify_run_finished:
+                    notify_worker_result(auth_coord_adapter, summary.to_dict(), status=terminal_status,
+                                         reason=terminal_reason, dry_run=runtime_state.dry_run)
         # Anchor to completed sends, including manual launches. No resident
         # timer or extra queue checks are created by this adjustment.
         try:

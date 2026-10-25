@@ -154,7 +154,7 @@ def test_telegram_settings_keep_secret_and_preserve_unknown_options(tmp_path, mo
     saved = read_json(setup.path)
     assert saved['token'] == TOKEN and saved['extra'] == 'keep' and saved['poll_timeout'] == 41
     with pytest.raises(ValueError):
-        setup.save({'allowed_chat_ids': []})
+        setup.save({'allowed_chat_ids': [], 'admin_chat_ids': []})
     monkeypatch.setattr(adapter, 'get_telegram_bot_status', lambda: SimpleNamespace(running=True))
     with pytest.raises(ValueError):
         setup.save({'allowed_chat_ids': [789]})
@@ -272,7 +272,7 @@ def test_telegram_form_save_and_edit_in_hidden_browser(local_server, monkeypatch
             page.locator('#telegram-check').click()
             page.get_by_text('Токен принят:', exact=False).wait_for()
             page.locator('#telegram-discover').click()
-            page.locator('#telegram-chat-choices button').click()
+            page.locator('#telegram-chat-choices button').first.click()
             page.locator('#telegram-admin').fill('New owner')
             page.locator('#telegram-settings-form button[type=submit]').click()
             page.get_by_text('Сохранено. Нажмите', exact=False).wait_for()

@@ -1423,7 +1423,8 @@ async function runWorkerSelfTestFromButton(button) {
 async function loadTelegramSettings() {
   const data = await api('/api/telegram/settings');
   $('#telegram-admin').value = data.admin_name;
-  $('#telegram-ids').value = data.allowed_chat_ids.join(', ');
+  $('#telegram-admin-ids').value = data.admin_chat_ids.join(', ');
+  $('#telegram-ids').value = data.allowed_chat_ids.filter((id) => !data.admin_chat_ids.includes(id)).join(', ');
   $('#telegram-token').placeholder = data.token_configured ? 'Токен сохранён. Оставьте пустым, чтобы сохранить его' : 'Вставьте токен BotFather';
   state.telegramLoaded = true;
 }
@@ -1447,27 +1448,34 @@ function bindTelegramSettings() {
   $('#telegram-check').addEventListener('click', () => run(async () => {
     const data = await post('check'); status.textContent = `Токен принят: ${data.name} (@${data.username}). Настройки ещё не сохранены.`;
   }));
+  $('#telegram-send-test').addEventListener('click', () => run(async () => {
+    const result = await post('test');
+    status.textContent = `Telegram подтвердил тестовое уведомление: ${result.delivered_count} чатов. Использованы сохранённые настройки. TikTok не запускался.`;
+  }));
   $('#telegram-discover').addEventListener('click', () => run(async () => {
     const choices = $('#telegram-chat-choices');
     choices.replaceChildren();
     const chats = await post('chats');
     chats.forEach((chat) => {
-      const button = document.createElement('button');
-      button.type = 'button'; button.className = 'btn secondary';
-      button.textContent = `${chat.name} ${chat.username ? '@' + chat.username : ''} · ${chat.id} — добавить`;
-      button.addEventListener('click', () => {
-        const ids = $('#telegram-ids').value.split(/[,;\s]+/).filter(Boolean);
-        $('#telegram-ids').value = Array.from(new Set([...ids, String(chat.id)])).join(', ');
-        button.remove(); status.textContent = 'ID добавлен в форму. Нажмите «Сохранить Telegram».';
+      [['#telegram-admin-ids', 'Администратор'], ['#telegram-ids', 'Личный профиль пользователя']].forEach(([field, role]) => {
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'btn secondary';
+        button.textContent = `${chat.name} ${chat.username ? '@' + chat.username : ''} · ${chat.id} — ${role}`;
+        button.addEventListener('click', () => {
+          const ids = $(field).value.split(/[,;\s]+/).filter(Boolean);
+          $(field).value = Array.from(new Set([...ids, String(chat.id)])).join(', ');
+          button.remove(); status.textContent = 'ID добавлен в форму. Нажмите «Сохранить Telegram».';
+        });
+        choices.append(button);
       });
-      choices.append(button);
     });
     status.textContent = chats.length ? 'Выберите свой аккаунт. Доступ автоматически не выдаётся.' : 'Новых /start не найдено. Откройте своего бота, отправьте /start и повторите поиск.';
   }));
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     run(async () => {
-      await post('settings', { admin_name: $('#telegram-admin').value.trim(), allowed_chat_ids: $('#telegram-ids').value });
+      await post('settings', { admin_name: $('#telegram-admin').value.trim(),
+        admin_chat_ids: $('#telegram-admin-ids').value, allowed_chat_ids: $('#telegram-ids').value });
       $('#telegram-token').value = '';
       $('#telegram-chat-choices').replaceChildren();
       await loadTelegramSettings();

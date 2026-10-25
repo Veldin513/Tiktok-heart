@@ -61,7 +61,7 @@ def test_real_receipt_is_required_before_advancing_state(dispatch, monkeypatch):
     summary = RunSummary('test', 1)
     checker.process_target(object(), Target('alice'), summary)
     assert writes == ['cooldown', 'streak']
-    assert notifications == ['success']
+    assert notifications == []  # Worker reports once, after the browser closes.
     assert summary.to_dict()['results'][0]['confirmation'] == 'server_ack'
 
 
@@ -158,7 +158,7 @@ def test_confirmed_send_with_failed_cooldown_write_keeps_no_retry_guard(dispatch
     assert checker.target_delivery_unconfirmed('alice')
 
 
-def test_telegram_notification_error_does_not_change_confirmed_delivery(dispatch, monkeypatch):
+def test_target_processing_does_not_contact_telegram_while_browser_is_open(dispatch, monkeypatch):
     monkeypatch.setattr(checker, 'send_message', lambda *_a: SendReceipt('123', 'client-1', 'websocket'))
     def fail(**_kwargs):
         raise OSError('Telegram unavailable')
