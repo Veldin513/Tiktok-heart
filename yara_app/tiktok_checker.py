@@ -5,6 +5,7 @@ import atexit
 import json
 import logging
 import os
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -360,9 +361,17 @@ def force_send_on_boot() -> bool:
     return str(os.getenv('WORKER_FORCE_SEND_ON_BOOT') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def cooldown_bypass_reason() -> str | None:
+    # A launch argument belongs only to this process. Do not reset timestamps
+    # or persist an override that a later scheduled run could inherit.
+    if '--telegram-manual' in sys.argv[2:]:
+        return 'telegram_manual'
+    return 'pc_startup' if force_send_on_boot() else None
+
+
 def ready_targets_for_run(targets: list[Target], summary: RunSummary) -> list[Target]:
     ready: list[Target] = []
-    boot_force = force_send_on_boot()
+    bypass_reason = cooldown_bypass_reason()
     for target in targets:
         if target_delivery_unconfirmed(target.name):
             summary.add_result(target=target.name, success=False, skipped=True, reason='delivery_unconfirmed')
@@ -372,12 +381,12 @@ def ready_targets_for_run(targets: list[Target], summary: RunSummary) -> list[Ta
         if cooldown.allowed:
             ready.append(target)
             continue
-        if boot_force:
-            logger.info('[%s] Cooldown preflight bypassed by PC startup exception. Left %s.', target.name, format_duration(cooldown.seconds_left))
+        if bypass_reason:
+            logger.info('[%s] Cooldown preflight bypassed: %s. Left %s.', target.name, bypass_reason, format_duration(cooldown.seconds_left))
             _append_run_history(
                 'target_cooldown_bypass',
                 target=target.name,
-                reason='pc_startup',
+                reason=bypass_reason,
                 seconds_left=cooldown.seconds_left,
                 preflight=True,
             )
@@ -488,9 +497,10 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
     with timed_phase('target_cooldown_check', target=target.name):
         cooldown = store.get_cooldown_status(target.name)
     if not cooldown.allowed:
-        if force_send_on_boot():
-            logger.info('[%s] Cooldown bypassed by PC startup exception. Left %s.', target.name, format_duration(cooldown.seconds_left))
-            _append_run_history('target_cooldown_bypass', target=target.name, reason='pc_startup', seconds_left=cooldown.seconds_left)
+        bypass_reason = cooldown_bypass_reason()
+        if bypass_reason:
+            logger.info('[%s] Cooldown bypassed: %s. Left %s.', target.name, bypass_reason, format_duration(cooldown.seconds_left))
+            _append_run_history('target_cooldown_bypass', target=target.name, reason=bypass_reason, seconds_left=cooldown.seconds_left)
         else:
             passed_text = 'неизвестно' if cooldown.hours_passed is None else format_duration(int(cooldown.hours_passed * 3600))
             left_text = format_duration(cooldown.seconds_left)

@@ -2551,11 +2551,11 @@ class ProjectAdapter:
         status = self.get_worker_status()
         return status if self._running_worker_profile(status) == profile_key else WorkerStatus(running=False, pid=None)
 
-    def start_profile_worker(self, profile_key: str) -> WorkerStatus:
+    def start_profile_worker(self, profile_key: str, *, ignore_cooldown: bool = False) -> WorkerStatus:
         with file_lock(self.control_dir / 'worker_launch'):
-            return self._start_profile_worker_locked(profile_key)
+            return self._start_profile_worker_locked(profile_key, ignore_cooldown=ignore_cooldown)
 
-    def _start_profile_worker_locked(self, profile_key: str) -> WorkerStatus:
+    def _start_profile_worker_locked(self, profile_key: str, *, ignore_cooldown: bool = False) -> WorkerStatus:
         profile = next((item for item in self.get_profiles() if item.key == profile_key), None)
         if profile is None:
             raise ValueError('Профиль не найден.')
@@ -2568,7 +2568,7 @@ class ProjectAdapter:
             if self._running_worker_profile(status) == profile_key:
                 return status
             raise RuntimeError('Сейчас работает другой профиль. Дождитесь завершения; чужой запуск не остановлен.')
-        return self._start_worker_profile(profile_key)
+        return self._start_worker_profile(profile_key, ignore_cooldown=ignore_cooldown)
 
     def stop_profile_worker(self, profile_key: str) -> WorkerStatus:
         with file_lock(self.control_dir / 'worker_launch'):
@@ -2582,7 +2582,7 @@ class ProjectAdapter:
             raise RuntimeError('Работает другой профиль. Его запуск не остановлен.')
         return self.stop_worker()
 
-    def _start_worker_profile(self, active_profile: str) -> WorkerStatus:
+    def _start_worker_profile(self, active_profile: str, *, ignore_cooldown: bool = False) -> WorkerStatus:
         if not self.main_script_path.exists():
             raise FileNotFoundError(f"Main script not found: {self.main_script_path}")
 
@@ -2593,12 +2593,15 @@ class ProjectAdapter:
             raise ValueError('Профиль не найден или отключён администратором.')
         self._refresh_runtime_paths(active_profile)
         self.update_control_state({"stop_requested": False, 'last_run_profile': active_profile})
+        extra_args = [active_profile] if active_profile else []
+        if ignore_cooldown:
+            extra_args.append('--telegram-manual')
         started = self._launch_python_process(
             script_path=self.main_script_path,
             stdout_path=self.worker_stdout_path,
             state_pid_key="last_run_pid",
             state_started_key="last_run_started_at",
-            extra_args=[active_profile] if active_profile else None,
+            extra_args=extra_args or None,
             hide_window=True,
         )
         return started

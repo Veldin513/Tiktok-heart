@@ -433,7 +433,8 @@ class TelegramControlBot(PersonalProfileControls):
                 '👥 Адресат — кому отправлять сообщения.\n🔥 Серия — сколько дней уже накоплено.\n'
                 '🔐 Вход — откроет Chrome на компьютере, где установлено приложение. '
                 'Войдите, закройте это окно и нажмите «Я вошёл — проверить».\n'
-                '▶ Запустить отправку — выполнить один запуск для выбранного профиля. '
+                '▶ Запустить отправку — выполнить один запуск для выбранного профиля без ожидания кулдауна. '
+                'Сбрасывать таймер вручную не нужно: он обновится после подтверждённой отправки. '
                 'Итог придёт отдельным сообщением.\n\n'
                 'Кнопки отвечают, пока бот управления включён в приложении. '
                 'Отчёты приходят и при выключенном управлении.', MenuBuilder.secondary(), message_id)
@@ -483,9 +484,10 @@ class TelegramControlBot(PersonalProfileControls):
                 if worker.running:
                     self.adapter.stop_worker()
                 else:
-                    self.adapter.start_worker()
+                    self.adapter.start_profile_worker(self.adapter.get_control_state()['active_profile'], ignore_cooldown=True)
             elif op == "restart":
-                self.adapter.restart_worker()
+                self.adapter.stop_worker()
+                self.adapter.start_profile_worker(self.adapter.get_control_state()['active_profile'], ignore_cooldown=True)
             self._send_control(chat_id, message_id)
             return
 

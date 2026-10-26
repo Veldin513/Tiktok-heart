@@ -143,6 +143,7 @@ class PersonalProfileControls:
         if self._is_admin(chat_id):
             rows.insert(-1, [('⏸ Отключить профиль' if profile.enabled else '▶ Включить профиль', f'p:{token}:enabled'),
                              ('📅 Для расписания', f'p:{token}:activate')])
+        lines.append('Запуск из Telegram не ждёт окончания кулдауна. Таймер обновится только после подтверждённой отправки.')
         self._safe_edit_or_send(chat_id, '\n'.join(lines), keyboard(rows), message_id)
 
     def _handle_profile_callback(self, chat_id: int, message_id: int, data: str) -> None:
@@ -180,7 +181,7 @@ class PersonalProfileControls:
                     [('⬅ К профилю', f'p:{parts[1]}:open')]]), message_id)
             return
         if action == 'start':
-            result = self.adapter.start_profile_worker(profile.key)
+            result = self.adapter.start_profile_worker(profile.key, ignore_cooldown=True)
             text = '▶ Отправка запущена. Итог придёт сюда после завершения.' if result.running else '⚠ Отправка не запущена. Проверьте журнал в приложении.'
         elif action == 'stop':
             self.adapter.stop_profile_worker(profile.key)

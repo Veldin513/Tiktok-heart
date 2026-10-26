@@ -65,6 +65,44 @@ def test_real_receipt_is_required_before_advancing_state(dispatch, monkeypatch):
     assert summary.to_dict()['results'][0]['confirmation'] == 'server_ack'
 
 
+@pytest.mark.parametrize('confirmed', [True, False])
+def test_telegram_manual_send_ignores_cooldown_but_changes_state_only_after_ack(dispatch, monkeypatch, confirmed):
+    writes, _notifications = dispatch
+    monkeypatch.setattr(checker.sys, 'argv', ['tiktok_checker.py', 'test', '--telegram-manual'])
+    monkeypatch.delenv('WORKER_FORCE_SEND_ON_BOOT', raising=False)
+    monkeypatch.setattr(checker.store, 'get_cooldown_status', lambda _n: SimpleNamespace(
+        allowed=False, hours_passed=0.1, seconds_left=42840))
+    monkeypatch.setattr(checker, 'send_message', lambda *_a: SendReceipt('123456', 'client-1', 'websocket') if confirmed else None)
+    target = Target('alice')
+    summary = RunSummary('test', 1)
+    assert checker.ready_targets_for_run([target], summary) == [target]
+    assert writes == []
+    checker.process_target(object(), target, summary)
+    assert writes == (['cooldown', 'streak'] if confirmed else [])
+    assert summary.success_count == int(confirmed)
+
+
+def test_telegram_manual_send_cannot_bypass_unknown_delivery(dispatch, monkeypatch):
+    monkeypatch.setattr(checker.sys, 'argv', ['tiktok_checker.py', 'test', '--telegram-manual'])
+    assert checker.acquire_target_send_guard('alice')[0]
+    summary = RunSummary('test', 1)
+    assert checker.ready_targets_for_run([Target('alice')], summary) == []
+    assert summary.results[0].reason == 'delivery_unconfirmed'
+
+
+def test_telegram_manual_send_cannot_repeat_recent_confirmed_send(dispatch, monkeypatch):
+    monkeypatch.setattr(checker.sys, 'argv', ['tiktok_checker.py', 'test', '--telegram-manual'])
+    monkeypatch.setattr(checker.store, 'get_cooldown_status', lambda _n: SimpleNamespace(
+        allowed=False, hours_passed=0.1, seconds_left=42840))
+    assert checker.acquire_target_send_guard('alice')[0]
+    checker.mark_target_guard_sent('alice')
+    monkeypatch.setattr(checker, 'send_message', lambda *_a: pytest.fail('duplicate sent'))
+    summary = RunSummary('test', 1)
+    checker.process_target(object(), Target('alice'), summary)
+    assert summary.success_count == 0
+    assert dispatch[0] == []
+
+
 def test_unknown_send_stays_blocked_after_guard_ttl_and_can_be_reviewed(dispatch, tmp_path, monkeypatch):
     monkeypatch.setattr(checker, 'send_message', lambda *_a: None)
     checker.process_target(object(), Target('alice'), RunSummary('test', 1))

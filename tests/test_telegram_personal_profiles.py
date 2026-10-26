@@ -122,8 +122,10 @@ def test_own_profile_operations_keep_exact_profile_key(bot, monkeypatch, operati
               'cancel_login': 'cancel_dedicated_login', 'start': 'start_profile_worker',
               'stop': 'stop_profile_worker'}[operation]
     calls = []
-    def action(profile):
+    def action(profile, **options):
         calls.append(profile)
+        if operation == 'start':
+            assert options == {'ignore_cooldown': True}
         return SimpleNamespace(running=True) if operation in {'start', 'stop'} else {'ok': True}
     monkeypatch.setattr(bot.adapter, method, action)
     bot.process_update(callback(200, f'p:{profile_token(key)}:{operation}'))
@@ -139,7 +141,7 @@ def test_old_global_control_button_is_denied_to_regular_user(bot, monkeypatch):
 def test_admin_can_control_foreign_profile_and_manage_roles(bot, monkeypatch):
     key = owned_key(bot, 300)
     calls = []
-    monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda p: calls.append(p) or SimpleNamespace(running=True))
+    monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda p, **_kw: calls.append(p) or SimpleNamespace(running=True))
     bot.process_update(callback(100, f'p:{profile_token(key)}:start'))
     assert calls == [key]
     bot.process_update(message(100, '/user 400', 'admin'))
@@ -469,3 +471,35 @@ def test_old_index_toggle_does_not_disable_different_profile(bot):
     before = bot.adapter.profiles_path.read_bytes()
     bot.process_update(callback(100, 'act:profile:toggle:1'))
     assert bot.adapter.profiles_path.read_bytes() == before
+
+
+def test_telegram_launch_bypasses_only_this_run_without_changing_saved_timer(bot, monkeypatch):
+    key = add_recipient(bot, 200, 'target')
+    adapter = bot.adapter
+    state_dir = adapter._get_profile_state_dir(key)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    timer = state_dir / 'last_sent_target.txt'
+    timer.write_text('original-timestamp')
+    adapter.main_script_path.parent.mkdir(parents=True, exist_ok=True)
+    adapter.main_script_path.write_text('# fake worker')
+    launches = []
+    monkeypatch.setattr(adapter, '_launch_python_process', lambda **kw: launches.append(kw) or WorkerStatus(running=True, pid=123))
+    monkeypatch.setattr(adapter, 'reset_target_cooldown', lambda *_a: pytest.fail('timer reset'))
+    active = adapter.get_control_state()['active_profile']
+    bot.process_update(callback(200, f'p:{profile_token(key)}:start'))
+    assert launches[-1]['extra_args'] == [key, '--telegram-manual']
+    assert timer.read_text() == 'original-timestamp'
+    assert adapter.get_control_state()['active_profile'] == active
+    # The next normal launch must not inherit the one-run option.
+    adapter.start_profile_worker(key)
+    assert launches[-1]['extra_args'] == [key]
+
+
+@pytest.mark.parametrize('operation', ['toggle', 'restart'])
+def test_admin_global_telegram_launch_also_bypasses_cooldown(bot, monkeypatch, operation):
+    calls = []
+    monkeypatch.setattr(bot.adapter, 'get_worker_status', lambda: WorkerStatus(running=False, pid=None))
+    monkeypatch.setattr(bot.adapter, 'stop_worker', lambda: WorkerStatus(running=False, pid=None))
+    monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda key, **kw: calls.append((key, kw)) or WorkerStatus(running=True, pid=123))
+    bot.process_update(callback(100, f'act:worker:{operation}'))
+    assert calls == [(bot.adapter.get_control_state()['active_profile'], {'ignore_cooldown': True})]
