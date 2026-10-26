@@ -6,6 +6,7 @@ import re
 import secrets
 import time
 
+from yara_app.fileio import read_json
 from yara_app.native_login import LOGIN_PENDING
 from yara_app.telegram_setup import TelegramSetup
 
@@ -104,10 +105,14 @@ class PersonalProfileControls:
         lines = [notice, profile.label] if notice else [profile.label]
         status = self.adapter.get_profile_worker_status(profile.key)
         lines.append('▶ Отправка выполняется' if status.running else '⏹ Отправка не запущена')
-        pending_login = (self.adapter._bot_profile_root(profile.key) / 'browser' / LOGIN_PENDING).exists()
+        pending_file = self.adapter._bot_profile_root(profile.key) / 'browser' / LOGIN_PENDING
+        pending_login = pending_file.exists()
+        pending_flow = (read_json(pending_file, {}) or {}).get('flow')
+        remote_login = pending_flow in {'telegram', 'desktop'}
         confirmed = self.adapter.profile_login_confirmed(profile.key)
-        lines.append('🔐 Вход не завершён: закройте окно Chrome и нажмите «Я вошёл — проверить».' if pending_login else
-                     ('✅ Вход был подтверждён при последней проверке.' if confirmed else '🔐 Сначала войдите в TikTok.'))
+        lines.append(('🔐 Завершите вход в приложении.' if pending_flow == 'desktop' else
+                      '🔐 Завершите вход в чате.' if remote_login else '🔐 Завершите вход на компьютере.') if pending_login else
+                     ('✅ Вход выполнен.' if confirmed else '🔐 Нужно войти в TikTok.'))
         if not profile.enabled:
             lines.append('⏸ Профиль отключён администратором.')
         rows = []
@@ -128,11 +133,13 @@ class PersonalProfileControls:
         if not targets:
             lines.append('Адресат пока не настроен.')
             rows.append([('👤 Настроить адресата', f'p:{token}:target:0')])
-        if pending_login:
+        if remote_login:
+            rows.append([('Отменить вход', f'p:{token}:cancel_login')])
+        elif pending_login:
             rows += [[('✅ Я вошёл — проверить', f'p:{token}:verify')],
                      [('↩ Отменить вход', f'p:{token}:cancel_login')]]
         elif not confirmed:
-            rows.append([('🔐 Войти в TikTok', f'p:{token}:login_info')])
+            rows.append([('🔐 Войти', f'p:{token}:login_info')])
         else:
             rows.append([('🔐 Настройки входа', f'p:{token}:login_info')])
         rows += [
@@ -143,7 +150,6 @@ class PersonalProfileControls:
         if self._is_admin(chat_id):
             rows.insert(-1, [('⏸ Отключить профиль' if profile.enabled else '▶ Включить профиль', f'p:{token}:enabled'),
                              ('📅 Для расписания', f'p:{token}:activate')])
-        lines.append('Запуск из Telegram не ждёт окончания кулдауна. Таймер обновится только после подтверждённой отправки.')
         self._safe_edit_or_send(chat_id, '\n'.join(lines), keyboard(rows), message_id)
 
     def _handle_profile_callback(self, chat_id: int, message_id: int, data: str) -> None:
@@ -173,12 +179,15 @@ class PersonalProfileControls:
                                     keyboard([[('↩ Отмена', 'input:cancel')]]), message_id)
             return
         if action == 'login_info':
-            self._safe_edit_or_send(chat_id, profile.label + '\n\nВход в TikTok\n'
-                'Окно Chrome откроется на компьютере, где установлено приложение. '
-                'Войдите там в аккаунт этого профиля, закройте окно и нажмите «Я вошёл — проверить».\n'
-                'Если вход уже работает, повторять его не нужно.', keyboard([
-                    [('🔐 Открыть Chrome на компьютере', f'p:{parts[1]}:login')],
+            self._safe_edit_or_send(chat_id, 'Как войти в TikTok?', keyboard([
+                    [('📱 По QR-коду', f'p:{parts[1]}:login_qr')],
+                    [('🔑 По логину и паролю', f'p:{parts[1]}:login_password')],
+                    [('На компьютере', f'p:{parts[1]}:login')],
                     [('⬅ К профилю', f'p:{parts[1]}:open')]]), message_id)
+            return
+        if action in {'login_qr', 'login_password'}:
+            self.login.start(profile.key, chat_id, 'qr' if action == 'login_qr' else 'password')
+            self.api.send_message(chat_id, 'Открываем вход…')
             return
         if action == 'start':
             result = self.adapter.start_profile_worker(profile.key, ignore_cooldown=True)
@@ -187,14 +196,21 @@ class PersonalProfileControls:
             self.adapter.stop_profile_worker(profile.key)
             text = '⏹ Отправка этого профиля остановлена.'
         elif action == 'login':
+            self.login.cancel(chat_id)
+            if self.login.for_profile(profile.key):
+                raise ValueError('Вход ещё закрывается. Подождите немного и нажмите снова.')
             self.adapter.begin_dedicated_login(profile.key)
-            text = 'На компьютере открыто отдельное окно Chrome для этого профиля. Войдите в TikTok, закройте окно и нажмите «Проверить вход».'
+            text = 'На компьютере открылся TikTok. Войдите, закройте окно и нажмите «Я вошёл — проверить».'
         elif action == 'verify':
             result = self.adapter.finish_dedicated_login(profile.key)
             text = str(result.get('message') or ('✅ Вход подтверждён. Можно запускать отправку.' if result.get('verified') else
                                                'Проверка завершена. Обновите профиль, чтобы увидеть состояние входа.'))
         elif action == 'cancel_login':
-            self.adapter.cancel_dedicated_login(profile.key)
+            session = self.login.for_profile(profile.key)
+            if session:
+                self.login.cancel(session.owner)
+            else:
+                self.adapter.cancel_dedicated_login(profile.key)
             text = 'Незавершённый вход отменён.'
         elif action in {'enabled', 'activate'}:
             if not self._is_admin(chat_id):

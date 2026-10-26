@@ -407,7 +407,9 @@ def test_login_button_opens_instructions_before_any_chrome_window(bot, monkeypat
     labels = [item['text'] for item in buttons(bot)]
     assert '🔐 Войти в TikTok' not in labels
     bot.process_update(callback(200, f'p:{profile_token(key)}:login_info'))
-    assert 'компьютере' in bot.api.messages[-1][1]
+    assert 'Как войти' in bot.api.messages[-1][1]
+    assert any(item['callback_data'].endswith(':login_qr') for item in buttons(bot))
+    assert any(item['callback_data'].endswith(':login_password') for item in buttons(bot))
     assert any(item['callback_data'].endswith(':login') for item in buttons(bot))
 
 
@@ -503,3 +505,29 @@ def test_admin_global_telegram_launch_also_bypasses_cooldown(bot, monkeypatch, o
     monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda key, **kw: calls.append((key, kw)) or WorkerStatus(running=True, pid=123))
     bot.process_update(callback(100, f'act:worker:{operation}'))
     assert calls == [(bot.adapter.get_control_state()['active_profile'], {'ignore_cooldown': True})]
+
+
+@pytest.mark.parametrize('method', ['qr', 'password'])
+def test_telegram_login_choice_uses_exact_owned_profile_without_visible_window(bot, monkeypatch, method):
+    key = owned_key(bot, 200)
+    calls = []
+    monkeypatch.setattr(bot.login, 'start', lambda profile, owner, mode: calls.append((profile, owner, mode)))
+    monkeypatch.setattr(bot.adapter, 'begin_dedicated_login', lambda *_a: pytest.fail('visible window opened'))
+    bot.process_update(callback(200, f'p:{profile_token(key)}:login_{method}'))
+    assert calls == [(key, 200, method)]
+
+
+def test_telegram_password_is_deleted_and_not_written_to_profile_or_echoed(bot, monkeypatch):
+    before = bot.adapter.profiles_path.read_bytes()
+    calls = []
+    inputs = []
+    monkeypatch.setattr(bot.login, 'current', lambda owner: SimpleNamespace(stage='password'))
+    monkeypatch.setattr(bot.login, 'submit', lambda owner, value: inputs.append((owner, value)) or True)
+    monkeypatch.setattr(bot.api, 'call', lambda method, payload: calls.append((method, payload)), raising=False)
+    item = message(200, ' secret with spaces ')
+    item['message']['message_id'] = 7
+    bot.process_update(item)
+    assert calls == [('deleteMessage', {'chat_id': 200, 'message_id': 7})]
+    assert inputs == [(200, ' secret with spaces ')]
+    assert 'secret with spaces' not in str(bot.api.messages)
+    assert bot.adapter.profiles_path.read_bytes() == before

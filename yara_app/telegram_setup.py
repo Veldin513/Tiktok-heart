@@ -108,8 +108,10 @@ class TelegramSetup:
             boundary = 'TikTokHeart' + secrets.token_hex(16)
             chunks = []
             for key, value in payload.items():
-                if key not in {'chat_id', 'caption'}:
+                if key not in {'chat_id', 'caption', 'reply_markup'}:
                     raise ValueError('Неизвестный параметр вложения.')
+                if key == 'reply_markup':
+                    value = json.dumps(value, ensure_ascii=False)
                 chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
             chunks += [f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="error.png"\r\nContent-Type: image/png\r\n\r\n'.encode(),
                        image, f'\r\n--{boundary}--\r\n'.encode()]

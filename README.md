@@ -105,7 +105,7 @@ Use the Browser tab to:
 - compact profile storage;
 - create or delete authorization backups for the selected profile.
 
-Use **Browser → Open Chrome for login** to sign in manually in a separate Google Chrome profile. Close that window, then click **Verify login**. Routine runs reuse this profile in hidden Chrome; your regular Chrome session is not copied. If login expires, use the same buttons to reopen the saved profile. See [the login guide](docs/CHROME_SESSION_IMPORT.md). cURL transfer remains a secondary option; file copying cannot transfer Chrome `v20` cookies to Chromium.
+Use **Browser → QR code** or **Username and password**. Scan the QR in TikTok on your phone, or enter your username/email and password. If TikTok requests a confirmation code, enter it in the next field. The same steps are available in your Telegram profile. Passwords and codes are kept only in memory. A visible Chrome login remains available for checks that require your direct interaction.
 
 Authorization backup archives may contain cookies, browser session files, Telegram config, targets, and local state. Keep them private.
 
@@ -281,7 +281,7 @@ Telegram можно также настроить через `control/telegram_b
 - сжать профиль;
 - создать или удалить backup авторизации выбранного профиля.
 
-Используйте **«Браузер» → «Открыть Chrome для входа»**. Войдите в TikTok вручную в отдельном окне, закройте его и нажмите **«Проверить вход»**. Дальше worker использует этот же профиль в скрытом Google Chrome; основная сессия обычного Chrome не копируется. При потере входа те же кнопки откроют сохранённый профиль. Подробности: [инструкция входа](docs/CHROME_SESSION_IMPORT.md). Перенос cURL оставлен дополнительным способом; простое копирование папки не переносит cookies Chrome `v20` в Chromium.
+Откройте **Браузер** → **По QR-коду** или **По логину и паролю**. Отсканируйте QR в TikTok на телефоне либо введите логин/почту и пароль. Если понадобится код подтверждения, появится поле для него. Эти же способы доступны в Telegram: **Мой профиль → Войти**. Пароль и код в файлы не записываются. Если TikTok потребует проверку картинкой, используйте **Войти в окне TikTok**. [Пошаговая инструкция](INSTALL.md).
 
 Backup авторизации может содержать cookies, browser session, Telegram config, адресатов и локальное состояние. Его нельзя публиковать.
 

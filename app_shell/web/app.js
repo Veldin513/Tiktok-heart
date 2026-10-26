@@ -261,7 +261,7 @@ function applyUiMode(mode) {
 }
 
 function browserAuthStatus(browser = {}) {
-  if (browser.manual_login_pending) return { label: "Ручной вход", kind: "critical", details: "Закройте отдельный Chrome и нажмите «Проверить вход». Worker до проверки остановлен." };
+  if (browser.manual_login_pending) return { label: "Выполняется вход", kind: "critical", details: "Завершите или отмените вход в TikTok." };
   if (browser.session_import_required || browser.session_validation?.valid === false) return { label: "Нужен вход", kind: "critical", details: "Последняя проверка не подтвердила вход; откройте отдельный Chrome в разделе «Браузер»." };
   if (browser.needs_recovery) return { label: "Профиль не читается", kind: "critical", details: "Windows не может расшифровать данные профиля." };
   if (!browser.default_profile_exists || !browser.cookies_exists) return { label: "Профиль не готов", kind: "warning", details: "Проверьте профиль и перенос входа в разделе «Браузер»." };
@@ -320,7 +320,7 @@ function renderLiveStatus(diag, options = {}) {
 
   setPill(
     "#worker-pill",
-    worker.running ? `Worker запущен · PID ${worker.pid}` : (schedule.installed ? "Worker ждёт расписание" : "Worker ручной запуск"),
+    worker.running ? "Отправка выполняется" : (schedule.installed ? "Ожидаем расписание" : "Ручной запуск"),
     worker.running || schedule.installed ? "ok" : "info",
   );
   setPill(
@@ -335,7 +335,7 @@ function renderLiveStatus(diag, options = {}) {
   $("#dry-run-button").classList.toggle("danger", Boolean(appState.dry_run));
 
   setText("#worker-value", worker.running ? "Запущен" : "Стоп");
-  setText("#worker-meta", `PID: ${text(worker.pid)} · старт: ${formatDate(worker.started_at)}`);
+  setText("#worker-meta", worker.running ? `Начало: ${formatDate(worker.started_at)}` : "Можно запустить вручную или дождаться расписания");
   setText("#telegram-value", telegram.running ? "Запущен" : "Стоп");
   setText("#telegram-meta", `PID: ${text(telegram.pid)} · ready: ${diag.telegram_ready ? "да" : "нет"}`);
   setText("#profile-value", text(appState.active_profile));
@@ -353,7 +353,7 @@ function renderLiveStatus(diag, options = {}) {
   setText("#schedule-card-meta", scheduleMetaLabel(schedule));
   setText("#queue-value", queue.ready_count ? `${queue.ready_count} готово` : formatDuration(queue.next_send_in_s));
   setText("#queue-meta", queue.target_count
-    ? `${queue.cooldown_count || 0} cooldown · ${queue.next_target || "без очереди"}`
+    ? `${queue.cooldown_count || 0} ожидают · ${queue.next_target || "без очереди"}`
     : "адресатов нет");
   if (browser.size_bytes !== undefined) {
     setText("#browser-size-value", formatBytes(browser.size_bytes));
@@ -369,7 +369,7 @@ function renderLiveStatus(diag, options = {}) {
     `Успешно  : ${text(run.success_count, 0)}`,
     `Пропуск  : ${text(run.skipped_count, 0)}`,
     `Ошибок   : ${text(run.failed_count, 0)}`,
-    `Очередь   : ${queue.ready_count || 0} готово / ${queue.cooldown_count || 0} cooldown`,
+    `Очередь   : ${queue.ready_count || 0} готово / ${queue.cooldown_count || 0} ожидают`,
     `Ближайший : ${queue.next_target ? `${queue.next_target} через ${formatDuration(queue.next_send_in_s)}` : "—"}`,
   ].join("\n");
 
@@ -609,10 +609,8 @@ function renderProfiles(diag) {
     const nextSend = targetState.next_send_at_text || "";
     const cooldownText = unconfirmed ? "результат отправки неизвестен; проверьте чат перед новой попыткой" : (ready ? "можно отправить сейчас" : `отправка через ${cooldownLeft}`);
     const nextSendText = ready ? "" : ` · ${escapeHtml(nextSend)}`;
-    const badge = unconfirmed ? `<span class="badge warn">не подтверждено</span>` : (ready ? `<span class="badge ok">готов</span>` : `<span class="badge warn">cooldown</span>`);
+    const badge = unconfirmed ? `<span class="badge warn">не подтверждено</span>` : (ready ? `<span class="badge ok">готов</span>` : `<span class="badge warn">пауза</span>`);
     const streak = Number(targetState.streak_count || 0);
-    const stateFiles = targetState.state_files || {};
-    const fileCount = (stateFiles.last_send || []).length + (stateFiles.stats || []).length;
     const cooldownProgress = Math.max(0, Math.min(100, Number(targetState.cooldown_progress_percent || 0)));
     return `
       <div class="target-item">
@@ -623,12 +621,12 @@ function renderProfiles(diag) {
           </div>
           <div>${badge}</div>
         </div>
-        <div class="target-meta">серия: ${streak} · ${escapeHtml(cooldownText)}${nextSendText} · файлов состояния: ${fileCount}</div>
+        <div class="target-meta">серия: ${streak} · ${escapeHtml(cooldownText)}${nextSendText}</div>
         <div class="target-cooldown ${ready ? "ready" : ""}">
           <span style="width:${ready ? 100 : cooldownProgress}%"></span>
         </div>
         <div class="target-actions">
-          <button class="btn secondary" data-target-action="reset_cooldown" data-unconfirmed="${unconfirmed}" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">${unconfirmed ? "Разрешить новую попытку" : "Сброс cooldown"}</button>
+          <button class="btn secondary" data-target-action="reset_cooldown" data-unconfirmed="${unconfirmed}" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">${unconfirmed ? "Разрешить новую попытку" : "Сброс паузы"}</button>
           <button class="btn secondary" data-copy-text="${escapeHtml(target.url || target.name || "")}" data-copy-label="Ссылка на адресата">Скопировать ссылку</button>
           <input class="mini-input" type="number" min="0" step="1" value="${streak}" data-streak-input />
           <button class="btn secondary" data-target-action="set_streak" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">Серия</button>
@@ -711,14 +709,14 @@ function renderFocusPanel(diag = {}) {
     failed: "Запуск завершён с ошибкой",
     skipped: "Запуск пропущен",
     stopped: "Запуск остановлен",
-    paused: "Worker на паузе",
-    running: "Worker выполняет отправку",
-    starting: "Worker запускается",
-    idle: "Worker ожидает",
+    paused: "Отправка на паузе",
+    running: "Выполняется отправка",
+    starting: "Подготовка отправки",
+    idle: "Ожидание отправки",
     unknown: "Результата пока нет",
   };
   const reasonLabels = {
-    cooldown: "ожидание cooldown",
+    cooldown: "ожидание паузы",
     no_targets: "нет адресатов",
     offline: "нет подключения к интернету",
     auth_failed: "нужна авторизация",
@@ -747,7 +745,7 @@ function renderFocusPanel(diag = {}) {
       : (run.status && run.status !== "idle" ? run.status : "Ожидание расписания");
   const nextMeta = queue.next_target
     ? `${queue.next_target} · ${queue.next_send_at_text || "без точного времени"}`
-    : `${Number(queue.target_count || 0)} адресатов · ${Number(queue.cooldown_count || 0)} cooldown`;
+    : `${Number(queue.target_count || 0)} адресатов · ${Number(queue.cooldown_count || 0)} ожидают`;
 
   setText("#focus-next", nextTitle);
   setText("#focus-next-meta", nextMeta);
@@ -758,7 +756,7 @@ function renderFocusPanel(diag = {}) {
     "#focus-last-meta",
     runMeta || (last
       ? [last.time, reasonLabels[last.reason] || last.reason, last.duration_seconds ? `${last.duration_seconds} с` : ""].filter(Boolean).join(" · ")
-      : "Worker ещё не писал историю прогонов."),
+      : "Отправок пока не было."),
   );
 }
 
@@ -1508,6 +1506,126 @@ function activateView(view) {
   }
 }
 
+function bindSimpleLogin() {
+  let loginId = "";
+  try { loginId = sessionStorage.getItem("tiktok-heart-login") || ""; } catch {}
+  const remember = (id) => {
+    try {
+      if (id) sessionStorage.setItem("tiktok-heart-login", id);
+      else sessionStorage.removeItem("tiktok-heart-login");
+    } catch {}
+  };
+  let timer = null;
+  let currentField = null;
+  let revision = null;
+  const terminal = new Set(["done", "failed", "cancelled"]);
+  const show = (result) => {
+    if (result.id && result.id !== loginId) return;
+    $("#simple-login-status").textContent = result.message;
+    const active = !terminal.has(result.stage);
+    state.loginInProgress = active;
+    $("#bot-profile").disabled = active;
+    ["open", "verify", "cancel"].forEach((action) => { $(`#dedicated-login-${action}`).disabled = active; });
+    $$('[data-login-method]').forEach((button) => { button.disabled = active; });
+    $("#simple-login-actions").hidden = !active;
+    $("#simple-login-refresh").hidden = result.stage !== "qr";
+    $("#simple-login-request_code").hidden = result.stage !== "code" && result.stage !== "code_request";
+    $("#simple-login-check").hidden = result.stage !== "qr" && result.stage !== "waiting";
+    $("#simple-login-qr").hidden = !result.has_photo;
+    if (result.has_photo && result.revision !== revision) {
+      revision = result.revision;
+      $("#simple-login-qr").src = `/api/login/photo?id=${encodeURIComponent(loginId)}&v=${revision}`;
+    }
+    if (!result.has_photo) $("#simple-login-qr").removeAttribute("src");
+    $("#simple-login-form").hidden = !result.field;
+    if (result.field !== currentField) {
+      currentField = result.field;
+      const input = $("#simple-login-value");
+      input.value = "";
+      input.type = result.field === "password" ? "password" : "text";
+      input.autocomplete = result.field === "password" ? "new-password" : "off";
+      input.inputMode = result.field === "code" ? "numeric" : "text";
+      input.maxLength = result.field === "code" ? 10 : 200;
+      $("#simple-login-label").textContent = ({ identifier: "Логин или почта", password: "Пароль", code: "Код подтверждения" })[result.field] || "";
+      if (result.field) input.focus();
+    }
+    if (!active) {
+      clearTimeout(timer);
+      remember("");
+      loginId = "";
+      if (result.stage === "done") refresh().catch(() => {});
+    }
+  };
+  const poll = async () => {
+    clearTimeout(timer);
+    if (!loginId) return;
+    const requestedId = loginId;
+    try {
+      const result = await api(`/api/login/status?id=${encodeURIComponent(requestedId)}`);
+      if (loginId !== requestedId) return;
+      show(result);
+      if (loginId) timer = setTimeout(poll, 1500);
+    } catch (error) {
+      if (loginId !== requestedId) return;
+      if (!error.message.includes("Вход уже закрыт")) {
+        $("#simple-login-status").textContent = "Связь с приложением прервалась. Подождите…";
+        $("#simple-login-value").value = "";
+        $("#simple-login-form").hidden = true;
+        currentField = null;
+        timer = setTimeout(poll, 3000);
+        return;
+      }
+      $("#simple-login-status").textContent = error.message;
+      $("#simple-login-value").value = "";
+      remember("");
+      loginId = "";
+      state.loginInProgress = false;
+      $("#bot-profile").disabled = false;
+      $("#simple-login-form").hidden = true;
+      $("#simple-login-actions").hidden = true;
+      $("#simple-login-qr").hidden = true;
+      $("#simple-login-qr").removeAttribute("src");
+      ["open", "verify", "cancel"].forEach((action) => { $(`#dedicated-login-${action}`).disabled = false; });
+      $$('[data-login-method]').forEach((button) => { button.disabled = false; });
+    }
+  };
+  $$('[data-login-method]').forEach((button) => button.addEventListener("click", async () => {
+    try {
+      $$('[data-login-method]').forEach((item) => { item.disabled = true; });
+      $("#simple-login-status").textContent = "Открываем вход…";
+      const result = await api('/api/login/start', { method: 'POST', body: JSON.stringify({
+        profile: $("#bot-profile").value, method: button.dataset.loginMethod,
+      }) });
+      loginId = result.id;
+      revision = null;
+      remember(loginId);
+      show(result);
+      if (loginId) timer = setTimeout(poll, 500);
+    } catch (error) {
+      $("#simple-login-status").textContent = error.message;
+      $$('[data-login-method]').forEach((item) => { item.disabled = false; });
+    }
+  }));
+  $("#simple-login-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = $("#simple-login-value");
+    const value = input.value;
+    input.value = "";
+    try {
+      show(await api('/api/login/input', { method: 'POST', body: JSON.stringify({ id: loginId, value }) }));
+    } catch (error) { $("#simple-login-status").textContent = error.message; }
+  });
+  for (const action of ["check", "refresh", "cancel", "request_code"]) {
+    $(`#simple-login-${action}`).addEventListener("click", async () => {
+      try {
+        $("#simple-login-value").value = "";
+        show(await api(`/api/login/${action}`, { method: 'POST', body: JSON.stringify({ id: loginId }) }));
+      } catch (error) { $("#simple-login-status").textContent = error.message; }
+    });
+  }
+  if (loginId) poll();
+}
+
 function bindNavigation() {
   $$(".nav-item").forEach((button) => {
     button.addEventListener("click", () => activateView(button.dataset.view));
@@ -1515,6 +1633,7 @@ function bindNavigation() {
 }
 
 function bindActions() {
+  bindSimpleLogin();
   bindTelegramSettings();
   $("#create-profile-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1550,6 +1669,7 @@ function bindActions() {
   });
 
   $("#profile-import-shortcut").addEventListener("click", () => {
+    if (state.loginInProgress) { toast("Сначала завершите или отмените вход."); return; }
     if (!state.selectedProfileKey) { toast("Сначала выберите профиль"); return; }
     $("#bot-profile").value = state.selectedProfileKey;
     activateView("browser");
@@ -1950,17 +2070,17 @@ function bindActions() {
       const status = $("#dedicated-login-result");
       buttons.forEach((button) => { button.disabled = true; });
       status.textContent = action === "open"
-        ? "Открываем отдельный Chrome для ручного входа…"
-        : action === "verify" ? "Проверяем вход скрыто, без отправки сообщений…" : "Отменяем незавершённый вход…";
+        ? "Открываем TikTok…"
+        : action === "verify" ? "Проверяем вход…" : "Отменяем вход…";
       try {
         const result = await api(`/api/dedicated-login/${action}`, {
           method: "POST", body: JSON.stringify({ bot_profile_key: profileKey }),
         });
         status.textContent = action === "open"
-          ? `Окно входа профиля «${result.bot_profile_key}» ${result.already_open ? "уже открыто" : "открыто"}. Войдите в TikTok, закройте это окно Chrome и нажмите «Проверить вход». Worker до проверки приостановлен.`
+          ? "Войдите в открывшемся окне. Затем закройте его и нажмите «Я вошёл — проверить»."
           : action === "verify"
-            ? `Вход профиля «${result.bot_profile_key}» подтверждён. Последующие запуски будут скрытыми. Worker автоматически не запускался.`
-            : "Незавершённый вход отменён. Профили сохранены. Прежнее требование входа, если оно было, остаётся в силе.";
+            ? "Вы вошли. Можно отправлять сообщения."
+            : "Вход отменён.";
         await refresh();
       } catch (error) {
         status.textContent = error.message;

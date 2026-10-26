@@ -53,7 +53,7 @@
         </header>
 
         <section class="status-strip">
-          <div class="status-pill" id="worker-pill">Worker</div>
+          <div class="status-pill" id="worker-pill">Отправка</div>
           <div class="status-pill" id="telegram-pill">Telegram</div>
           <div class="status-pill" id="browser-pill">Browser</div>
           <div class="status-pill" id="schedule-pill">Schedule</div>
@@ -203,7 +203,7 @@
           <div class="content-grid">
             <article class="panel">
               <div class="panel-title">Профили</div>
-              <p class="hint">1. Создайте профиль для аккаунта TikTok. 2. Добавьте адресатов. 3. Перенесите вход из Chrome.</p>
+              <p class="hint">Создайте профиль, укажите получателя и войдите в TikTok.</p>
               <form id="create-profile-form" class="profile-form">
                 <label class="field-label" for="new-profile-key">Название нового профиля</label>
                 <input id="new-profile-key" class="input" placeholder="Например: main" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}">
@@ -253,20 +253,33 @@
             <article class="panel">
               <div class="panel-title">Вход в TikTok</div>
               <button class="btn secondary full" data-go-view="profiles">Создать профиль и добавить адресатов</button>
-              <label class="field-label" for="bot-profile">Куда сохранить авторизацию</label>
+              <label class="field-label" for="bot-profile">Выберите профиль</label>
               <select id="bot-profile" class="select"></select>
-              <p class="hint">Создайте отдельный вход приложения через обычный Google Chrome. При работе по расписанию браузер останется скрытым.</p>
-              <ol class="hint">
-                <li>Остановите worker и нажмите «Открыть Chrome для входа».</li>
-                <li>В открывшемся отдельном окне вручную войдите в TikTok. Входить в аккаунт Google или включать синхронизацию Chrome не требуется.</li>
-                <li>Убедитесь, что открываются ваши сообщения, и закройте это окно Chrome.</li>
-                <li>Нажмите «Проверить вход». Приложение выполнит одну скрытую проверку без отправки сообщений.</li>
-              </ol>
-              <button id="dedicated-login-open" class="btn primary full">Открыть Chrome для входа</button>
-              <button id="dedicated-login-verify" class="btn secondary full">Проверить вход</button>
-              <button id="dedicated-login-cancel" class="btn secondary full">Отменить незавершённый вход</button>
+              <div class="button-grid">
+                <button class="btn primary" data-login-method="qr">По QR-коду</button>
+                <button class="btn secondary" data-login-method="password">По логину и паролю</button>
+              </div>
+              <p id="simple-login-status" class="hint" role="status">Выберите, как войти.</p>
+              <img id="simple-login-qr" class="login-qr" alt="QR-код для входа в TikTok" hidden />
+              <form id="simple-login-form" class="profile-form" autocomplete="off" hidden>
+                <label id="simple-login-label" for="simple-login-value">Логин или почта</label>
+                <input id="simple-login-value" class="input" autocomplete="off" maxlength="200" required />
+                <button class="btn primary" type="submit">Продолжить</button>
+              </form>
+              <div id="simple-login-actions" class="button-grid" hidden>
+                <button id="simple-login-check" class="btn secondary">Проверить вход</button>
+                <button id="simple-login-refresh" class="btn secondary" hidden>Новый QR</button>
+                <button id="simple-login-request_code" class="btn secondary" hidden>Получить код</button>
+                <button id="simple-login-cancel" class="btn secondary">Отмена</button>
+              </div>
+              <details class="disclosure browser-disclosure">
+                <summary>Войти в окне TikTok</summary>
+                <p class="hint">Войдите в открывшемся окне по QR или паролю. Если попросят код — введите его там. Затем закройте окно.</p>
+              <button id="dedicated-login-open" class="btn primary full">Открыть TikTok</button>
+              <button id="dedicated-login-verify" class="btn secondary full">Я вошёл — проверить</button>
+              <button id="dedicated-login-cancel" class="btn secondary full">Отменить вход</button>
               <p id="dedicated-login-result" class="hint backup-status" role="status" aria-live="polite"></p>
-              <p class="hint">Основная сессия Chrome не копируется. При первом переходе прежний профиль приложения заменяется только после успешной проверки. Если вход позже завершится, используйте эти же кнопки: приложение откроет сохранённый отдельный профиль.</p>
+              </details>
               <details class="disclosure browser-disclosure">
                 <summary>Перенос существующей сессии через cURL</summary>
                 <div class="disclosure-content">
@@ -308,7 +321,7 @@
         <section class="view" id="view-services">
           <div class="content-grid">
             <article class="panel">
-              <div class="panel-title">Worker</div>
+              <div class="panel-title">Отправка</div>
               <div class="button-grid">
                 <button class="btn secondary" data-action="start_worker">Запустить</button>
                 <button class="btn secondary" data-action="stop_worker">Остановить</button>
@@ -382,7 +395,7 @@
             <article class="panel span-2">
               <div class="panel-title">Обслуживание</div>
               <div class="button-grid">
-                <button id="worker-self-test-button" class="btn secondary">Проверить worker</button>
+                <button id="worker-self-test-button" class="btn secondary">Проверить отправку</button>
                 <button id="project-backup-button" class="btn secondary">Создать копию исходников</button>
                 <button id="maintenance-button" class="btn secondary">Очистить кэш и старые копии</button>
                 <button class="btn secondary" data-open-kind="project">Открыть проект</button>

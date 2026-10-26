@@ -33,6 +33,7 @@ SECURITY_HEADERS = {
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from yara_app.local_login import LocalLogin  # noqa: E402
 from yara_app.project_adapter import ProjectAdapter  # noqa: E402
 from yara_app.redaction import redact_secrets, redact_value  # noqa: E402
 from yara_app.single_instance import SingleInstanceGuard  # noqa: E402
@@ -212,6 +213,17 @@ class AppShellHandler(BaseHTTPRequestHandler):
     _live_cache_at = 0.0
     _live_cache_ttl = 1.25
     _schedule_lock = threading.Lock()
+    _login_lock = threading.Lock()
+    _login_service = None
+
+    @classmethod
+    def _login(cls):
+        with cls._login_lock:
+            if cls._login_service is None or cls._login_service.adapter is not cls.adapter:
+                if cls._login_service is not None:
+                    cls._login_service.close()
+                cls._login_service = LocalLogin(cls.adapter)
+            return cls._login_service
 
     server_version = "TikTokHeartDesktop/2.1"
 
@@ -342,6 +354,20 @@ class AppShellHandler(BaseHTTPRequestHandler):
                     query = parse_qs(parsed.query)
                     self._send_json({"ok": True, "data": self._get_live_status(fresh=query.get("fresh") == ["1"])})
                     return
+                if parsed.path in {'/api/login/status', '/api/login/photo'}:
+                    sid = (parse_qs(parsed.query).get('id') or [''])[0]
+                    if parsed.path.endswith('/photo'):
+                        image = self._login().image(sid)
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'image/png')
+                        self.send_header('Content-Length', str(len(image)))
+                        self.send_header('Cache-Control', 'no-store')
+                        self._send_security_headers()
+                        self.end_headers()
+                        self.wfile.write(image)
+                    else:
+                        self._send_json({'ok': True, 'data': self._login().status(sid)})
+                    return
                 if parsed.path == "/api/chrome-profiles":
                     self._send_json({"ok": True, "data": self.adapter.list_google_chrome_profiles()})
                     return
@@ -389,6 +415,20 @@ class AppShellHandler(BaseHTTPRequestHandler):
             try:
                 payload = read_json_body(self)
                 self._clear_diagnostics_cache()
+                if parsed.path.startswith('/api/login/'):
+                    action = parsed.path.rsplit('/', 1)[-1]
+                    sid = str(payload.get('id') or '')
+                    service = self._login()
+                    if action == 'start':
+                        result = service.start(str(payload.get('profile') or ''), str(payload.get('method') or ''))
+                    elif action == 'input':
+                        result = service.submit(sid, str(payload.get('value') or ''))
+                    elif action in {'cancel', 'check', 'refresh'}:
+                        result = service.command(sid, action)
+                    else:
+                        raise ValueError('Неизвестный шаг входа.')
+                    self._send_json({'ok': True, 'data': result})
+                    return
                 if parsed.path.startswith('/api/telegram/'):
                     setup = TelegramSetup(self.adapter)
                     token = str(payload.get('token') or '')
@@ -842,6 +882,8 @@ def main() -> int:
         except KeyboardInterrupt:
             print("\nStopping...")
         finally:
+            if AppShellHandler._login_service is not None:
+                AppShellHandler._login_service.close()
             server.server_close()
     finally:
         guard.release()

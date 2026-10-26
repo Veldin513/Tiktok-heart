@@ -18,6 +18,7 @@ from yara_app.https import verified_context
 from yara_app.project_adapter import ProjectAdapter
 from yara_app.redaction import RedactingFormatter
 from yara_app.telegram_errors import TelegramAPIError
+from yara_app.telegram_login import TelegramLoginControls
 from yara_app.telegram_profiles import PersonalProfileControls
 from yara_app.telegram_setup import TelegramSetup, parse_chat_ids
 
@@ -149,7 +150,7 @@ class MenuBuilder:
         return cls.inline([[ ("⬅ Назад", "nav:main"), ("♻ Обновить", "nav:refresh") ]])
 
 
-class TelegramControlBot(PersonalProfileControls):
+class TelegramControlBot(TelegramLoginControls, PersonalProfileControls):
     def __init__(self, base_dir: Path | str | None = None) -> None:
         self.adapter = ProjectAdapter(base_dir)
         self.settings = self._load_settings()
@@ -164,6 +165,7 @@ class TelegramControlBot(PersonalProfileControls):
         self.pending_access_inputs = {}
         self.access_confirmations = {}
         self.logger = self._configure_logger()
+        self._init_login()
 
     def _configure_logger(self) -> logging.Logger:
         logger = logging.getLogger("telegram_control_bot_v2")
@@ -331,11 +333,7 @@ class TelegramControlBot(PersonalProfileControls):
 
     def _render_main_text(self, chat_id: int) -> str:
         role = 'Администратор: доступны все профили и общие настройки.' if self._is_admin(chat_id) else 'Вам доступны только ваши личные профили.'
-        return ('TikTok Heart\n' + role + '\n\n'
-                '1. Откройте профиль и укажите адресата.\n'
-                '2. Войдите в TikTok на компьютере с приложением.\n'
-                '3. Укажите серию и нажмите «Запустить отправку».\n\n'
-                'Итог отправки придёт сюда автоматически. Для работы кнопок включите «Бот управления» в приложении.')
+        return 'TikTok Heart\n' + role + '\n\nОткройте профиль, чтобы войти в TikTok, выбрать получателя или отправить сообщение.'
 
     def _send_main_entry(self, chat_id: int) -> None:
         self._remember_chat(chat_id)
@@ -383,6 +381,11 @@ class TelegramControlBot(PersonalProfileControls):
             return
         text = str(message.get('text') or '').strip()
         command = text.split(' ', 1)[0].split('@', 1)[0].lower()
+        if command in {'/cancel', '/start', '/menu', '/help', '/status', '/id', '/profiles', '/recipients',
+                       '/myprofile', '/control', '/diag', '/access', '/user', '/admin', '/revoke'}:
+            self.login.cancel(chat_id)
+        elif self._handle_login_input(message):
+            return
         if command == '/id' or text == '🆔 Мой ID':
             self._send_id(chat_id)
             return
@@ -425,19 +428,14 @@ class TelegramControlBot(PersonalProfileControls):
     def _handle_navigation(self, chat_id: int, message_id: int, command: str) -> None:
         parts = command.split(":")
         route = parts[1]
+        self.login.cancel(chat_id)
         self._clear_pending(chat_id)
 
         if route == 'help':
             self._safe_edit_or_send(chat_id,
-                'Как пользоваться\n\n👤 Профиль — ваш аккаунт TikTok.\n'
-                '👥 Адресат — кому отправлять сообщения.\n🔥 Серия — сколько дней уже накоплено.\n'
-                '🔐 Вход — откроет Chrome на компьютере, где установлено приложение. '
-                'Войдите, закройте это окно и нажмите «Я вошёл — проверить».\n'
-                '▶ Запустить отправку — выполнить один запуск для выбранного профиля без ожидания кулдауна. '
-                'Сбрасывать таймер вручную не нужно: он обновится после подтверждённой отправки. '
-                'Итог придёт отдельным сообщением.\n\n'
-                'Кнопки отвечают, пока бот управления включён в приложении. '
-                'Отчёты приходят и при выключенном управлении.', MenuBuilder.secondary(), message_id)
+                '1. Откройте свой профиль.\n2. Нажмите «Войти» и выберите QR или пароль.\n'
+                '3. Укажите получателя и нажмите «Запустить отправку».\n\n'
+                'Если TikTok попросит код, пришлите его в этот чат.', MenuBuilder.secondary(), message_id)
             return
 
         if route == 'myid':
@@ -530,7 +528,7 @@ class TelegramControlBot(PersonalProfileControls):
 
         self._remember_chat(chat_id)
         fresh = self._answer_callback(query_id)
-        if not fresh and (data.startswith(('act:', 'access:')) or
+        if not fresh and (data.startswith(('act:', 'access:', 'auth:')) or
                           (data.startswith('p:') and data.split(':')[2] != 'open')):
             self._safe_edit_or_send(chat_id, 'Эта кнопка нажата слишком давно. Выберите действие ещё раз.',
                                     MenuBuilder.main_inline(admin=self._is_admin(chat_id)), message_id)
@@ -539,11 +537,15 @@ class TelegramControlBot(PersonalProfileControls):
         if data == "noop":
             return
         if data == 'input:cancel':
+            self.login.cancel(chat_id)
             self._clear_pending(chat_id)
             self._safe_edit_or_send(chat_id, 'Изменение отменено.', MenuBuilder.main_inline(admin=self._is_admin(chat_id)), message_id)
             return
         if data.startswith('access:'):
             self._handle_access_callback(chat_id, message_id, data)
+            return
+        if data.startswith('auth:'):
+            self._handle_login_callback(chat_id, data)
             return
         if data.startswith('p:'):
             self._handle_profile_callback(chat_id, message_id, data)
@@ -672,6 +674,7 @@ class TelegramControlBot(PersonalProfileControls):
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 60)
         finally:
+            self.login.close()
             self._release_instance_lock()
 
 
