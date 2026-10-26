@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import copy
 import hashlib
 import json
 import logging
@@ -16,6 +17,7 @@ from yara_app.fileio import atomic_write_text, file_lock, read_json
 from yara_app.https import verified_context
 from yara_app.project_adapter import ProjectAdapter
 from yara_app.redaction import RedactingFormatter
+from yara_app.telegram_errors import TelegramAPIError
 from yara_app.telegram_profiles import PersonalProfileControls
 from yara_app.telegram_setup import TelegramSetup, parse_chat_ids
 
@@ -49,10 +51,20 @@ class TelegramAPI:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout or self.timeout, context=verified_context()) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout or self.timeout, context=verified_context()) as response:
+                data = json.loads(response.read(1024 * 1024).decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                error = json.loads(exc.read(65536))
+                description = str(error.get('description') or exc.reason)
+            except (ValueError, OSError, AttributeError):
+                description = str(exc.reason)
+            if method == 'getUpdates':
+                raise  # Keep polling's conflict/backoff handling.
+            raise TelegramAPIError(method, exc.code, description) from None
         if not data.get("ok"):
-            raise RuntimeError(f"Telegram API error: {data}")
+            raise TelegramAPIError(method, int(data.get('error_code') or 400), str(data.get('description') or 'Request rejected'))
         return data["result"]
 
     def send_message(self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -94,12 +106,13 @@ class MenuBuilder:
 
     @classmethod
     def main_inline(cls, *, admin: bool = True) -> dict[str, Any]:
-        rows = [[("📊 Статус", "nav:status"), ("🆔 Мой ID", "nav:myid")],
-                [("👤 Профили пользователей" if admin else "👤 Мой профиль", "nav:recipients")]]
+        rows = [[("👤 Все профили" if admin else "👤 Мой профиль", "nav:recipients")],
+                [("📊 Статус", "nav:status"), ("🆔 Мой ID", "nav:myid")]]
         if admin:
-            rows += [[("🎛 Все профили", "nav:profiles:0"), ("🛠 Управление", "nav:control")],
+            rows += [[("🛠 Общее управление", "nav:control")],
                      [("💬 Сообщения", "nav:messages"), ("🧪 Диагностика", "nav:diag")],
-                     [("🔑 Доступ и ID", "nav:access")]]
+                     [("🔑 Пользователи и права", "nav:access")]]
+        rows.append([('❔ Как пользоваться', 'nav:help')])
         return cls.inline(rows)
 
     @classmethod
@@ -148,6 +161,8 @@ class TelegramControlBot(PersonalProfileControls):
         self._instance_lease = None
         self.offset, self.known_chat_ids = self._load_state()
         self.pending_profile_inputs = {}
+        self.pending_access_inputs = {}
+        self.access_confirmations = {}
         self.logger = self._configure_logger()
 
     def _configure_logger(self) -> logging.Logger:
@@ -294,35 +309,48 @@ class TelegramControlBot(PersonalProfileControls):
         reply_markup: dict[str, Any],
         message_id: int | None = None,
     ) -> None:
+        reply_markup = copy.deepcopy(reply_markup)
+        rows = reply_markup.get('inline_keyboard', [])
+        if rows and rows[-1] != [{'text': '🏠 Главное меню', 'callback_data': 'nav:main'}]:
+            rows.append([{'text': '🏠 Главное меню', 'callback_data': 'nav:main'}])
         if message_id is None:
             self.api.send_message(chat_id, text, reply_markup)
             return
         try:
             self.api.edit_message_text(chat_id, message_id, text, reply_markup)
-        except Exception:  # noqa: BLE001
+        except TelegramAPIError as exc:
+            if exc.unchanged:
+                return
+            if exc.code != 400:
+                raise
+            self.api.send_message(chat_id, text, reply_markup)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 400:
+                raise
             self.api.send_message(chat_id, text, reply_markup)
 
     def _render_main_text(self, chat_id: int) -> str:
         role = 'Администратор: доступны все профили и общие настройки.' if self._is_admin(chat_id) else 'Вам доступны только ваши личные профили.'
-        return ('TikTok Heart\n' + role + '\nВыберите кнопку под этим сообщением.\n'
-                'Кнопки работают, пока в приложении запущен бот управления. Итоговые уведомления приходят и без него.')
+        return ('TikTok Heart\n' + role + '\n\n'
+                '1. Откройте профиль и укажите адресата.\n'
+                '2. Войдите в TikTok на компьютере с приложением.\n'
+                '3. Укажите серию и нажмите «Запустить отправку».\n\n'
+                'Итог отправки придёт сюда автоматически. Для работы кнопок включите «Бот управления» в приложении.')
 
     def _send_main_entry(self, chat_id: int) -> None:
         self._remember_chat(chat_id)
+        self._clear_pending(chat_id)
         self.api.send_message(chat_id, self._render_main_text(chat_id), MenuBuilder.main_inline(admin=self._is_admin(chat_id)))
 
     def _send_profiles(self, chat_id: int, message_id: int | None = None, page: int = 0) -> None:
-        body, chunk, total_pages = self.adapter.render_profiles_page(page, self.settings.page_size)
-        start = page * self.settings.page_size
-        keyboard_chunk = [(start + idx, profile.label, profile.enabled) for idx, profile in enumerate(chunk)]
-        self._safe_edit_or_send(chat_id, body, MenuBuilder.profiles(keyboard_chunk, page, total_pages), message_id)
+        self._send_profile_list(chat_id, message_id, page)
 
     def _send_control(self, chat_id: int, message_id: int | None = None) -> None:
         state = self.adapter.get_control_state()
         worker = self.adapter.get_worker_status()
         self._safe_edit_or_send(
             chat_id,
-            self.adapter.render_status_text(),
+            self._view_status(chat_id),
             MenuBuilder.control(worker.running, bool(state.get("paused"))),
             message_id,
         )
@@ -330,6 +358,8 @@ class TelegramControlBot(PersonalProfileControls):
     def _handle_text_action(self, chat_id: int, text: str) -> bool:
         """Handle slash commands only — reply keyboard removed, inline only."""
         normalized = text.strip()
+        if normalized in {'/start', '/menu', '/help', '/status', '/profiles', '/control', '/diag'}:
+            self._clear_pending(chat_id)
         if normalized in {"/start", "/menu", "/help"}:
             self._send_main_entry(chat_id)
             return True
@@ -362,8 +392,10 @@ class TelegramControlBot(PersonalProfileControls):
         self._ensure_user_profile(message)
         self._remember_chat(chat_id)
         if command == '/cancel':
-            self.pending_profile_inputs.pop(chat_id, None)
-            self.api.send_message(chat_id, 'Изменение отменено.')
+            self._clear_pending(chat_id)
+            self._safe_edit_or_send(chat_id, 'Изменение отменено.', MenuBuilder.main_inline(admin=self._is_admin(chat_id)))
+            return
+        if not text.startswith('/') and self._handle_access_input(chat_id, text):
             return
         if not text.startswith('/') and self._handle_profile_input(chat_id, text):
             return
@@ -386,22 +418,35 @@ class TelegramControlBot(PersonalProfileControls):
         if not self._is_admin(chat_id) and command not in {'/start', '/menu', '/help', '/status'}:
             self._send_profile_list(chat_id)
             return
-        if self._handle_text_action(chat_id, text):
+        if self._handle_text_action(chat_id, command):
             return
         self._send_main_entry(chat_id)
 
     def _handle_navigation(self, chat_id: int, message_id: int, command: str) -> None:
         parts = command.split(":")
         route = parts[1]
+        self._clear_pending(chat_id)
+
+        if route == 'help':
+            self._safe_edit_or_send(chat_id,
+                'Как пользоваться\n\n👤 Профиль — ваш аккаунт TikTok.\n'
+                '👥 Адресат — кому отправлять сообщения.\n🔥 Серия — сколько дней уже накоплено.\n'
+                '🔐 Вход — откроет Chrome на компьютере, где установлено приложение. '
+                'Войдите, закройте это окно и нажмите «Я вошёл — проверить».\n'
+                '▶ Запустить отправку — выполнить один запуск для выбранного профиля. '
+                'Итог придёт отдельным сообщением.\n\n'
+                'Кнопки отвечают, пока бот управления включён в приложении. '
+                'Отчёты приходят и при выключенном управлении.', MenuBuilder.secondary(), message_id)
+            return
 
         if route == 'myid':
             self._send_id(chat_id)
             return
         if route == 'recipients':
-            self._send_profile_list(chat_id, message_id)
+            self._send_profile_list(chat_id, message_id, int(parts[2]) if len(parts) > 2 else 0)
             return
         if route == 'access':
-            self._send_access(chat_id)
+            self._send_access(chat_id, message_id)
             return
         if not self._is_admin(chat_id) and route not in {'main', 'status', 'refresh'}:
             raise PermissionError('Общие настройки доступны только администратору.')
@@ -452,35 +497,51 @@ class TelegramControlBot(PersonalProfileControls):
             return
 
         if target == "profile":
-            index = int(parts[3])
-            self.adapter.toggle_profile(index)
-            page = index // self.settings.page_size
-            self._send_profiles(chat_id, message_id, page)
+            # Legacy buttons use list indexes, which can now point to another
+            # profile. Ask the administrator to select a stable profile button.
+            self._send_profile_list(chat_id, message_id)
             return
 
     def _handle_callback(self, callback: dict[str, Any]) -> None:
         query_id = callback["id"]
         message = callback.get("message") or {}
         chat = message.get("chat") or {}
-        chat_id = int(chat["id"])
-        message_id = int(message["message_id"])
+        if not chat.get('id') or not message.get('message_id'):
+            return
+        chat_id = int(chat['id'])
+        message_id = int(message['message_id'])
         data = str(callback.get("data") or "")
+        actor_id = (callback.get('from') or {}).get('id')
+        if actor_id is not None and int(actor_id) != chat_id:
+            return
         if chat.get('type', 'private') != 'private':
-            self.api.answer_callback(query_id, 'Откройте личный чат с ботом.')
+            self._answer_callback(query_id, 'Откройте личный чат с ботом.')
             return
         if data == 'nav:myid':
-            self.api.answer_callback(query_id)
+            self._answer_callback(query_id)
             self._send_id(chat_id)
             return
 
         if not self._authorized(chat_id):
-            self.api.answer_callback(query_id, "Доступ запрещён")
+            self._answer_callback(query_id, "Доступ запрещён")
             return
 
         self._remember_chat(chat_id)
-        self.api.answer_callback(query_id)
+        fresh = self._answer_callback(query_id)
+        if not fresh and (data.startswith(('act:', 'access:')) or
+                          (data.startswith('p:') and data.split(':')[2] != 'open')):
+            self._safe_edit_or_send(chat_id, 'Эта кнопка нажата слишком давно. Выберите действие ещё раз.',
+                                    MenuBuilder.main_inline(admin=self._is_admin(chat_id)), message_id)
+            return
 
         if data == "noop":
+            return
+        if data == 'input:cancel':
+            self._clear_pending(chat_id)
+            self._safe_edit_or_send(chat_id, 'Изменение отменено.', MenuBuilder.main_inline(admin=self._is_admin(chat_id)), message_id)
+            return
+        if data.startswith('access:'):
+            self._handle_access_callback(chat_id, message_id, data)
             return
         if data.startswith('p:'):
             self._handle_profile_callback(chat_id, message_id, data)
@@ -491,6 +552,17 @@ class TelegramControlBot(PersonalProfileControls):
         if data.startswith("act:"):
             self._handle_action(chat_id, message_id, data)
             return
+        self._safe_edit_or_send(chat_id, 'Меню обновилось. Выберите нужный пункт.',
+                                MenuBuilder.main_inline(admin=self._is_admin(chat_id)), message_id)
+
+    def _answer_callback(self, query_id: str, text: str | None = None) -> bool:
+        try:
+            self.api.answer_callback(query_id, text)
+            return True
+        except (TelegramAPIError, urllib.error.URLError, OSError) as exc:
+            # Telegram's spinner acknowledgement must not break navigation.
+            self.logger.warning('Callback acknowledgement failed: %s', exc)
+            return False
 
     def process_update(self, update: dict[str, Any]) -> None:
         self.settings = self._load_settings()
@@ -501,10 +573,24 @@ class TelegramControlBot(PersonalProfileControls):
                 self._handle_command(message)
             elif isinstance(update.get('callback_query'), dict):
                 self._handle_callback(update['callback_query'])
-        except (ValueError, PermissionError, RuntimeError) as exc:
-            if chat_id is not None:
-                self.api.send_message(int(chat_id), str(exc))
+        except (ValueError, PermissionError, RuntimeError, OSError, KeyError, IndexError) as exc:
             self.logger.warning('Telegram action rejected: %s', exc)
+            private = (message.get('chat') or {}).get('type', 'private') == 'private'
+            if chat_id is not None and private:
+                if isinstance(exc, TelegramAPIError):
+                    text = exc.user_message()
+                elif isinstance(exc, (KeyError, IndexError)):
+                    text = 'Этот пункт уже изменился. Откройте профиль заново.'
+                elif isinstance(exc, OSError) and not isinstance(exc, PermissionError):
+                    text = 'Не удалось выполнить действие. Проверьте интернет и доступность приложения на компьютере.'
+                else:
+                    from yara_app.redaction import redact_secrets
+                    text = redact_secrets(str(exc)).replace('worker', 'отправку').replace('Worker', 'Отправка')
+                try:
+                    self.api.send_message(int(chat_id), '⚠ ' + text, MenuBuilder.inline([
+                        [('↩ Отменить ввод', 'input:cancel'), ('🏠 Главное меню', 'nav:main')]]))
+                except (RuntimeError, OSError) as send_error:
+                    self.logger.warning('Unable to deliver error explanation: %s', send_error)
 
     def _consume_startup_updates(self, updates: list[dict]) -> None:
         """Coalesce old menu requests; never execute commands queued while offline."""
@@ -530,6 +616,16 @@ class TelegramControlBot(PersonalProfileControls):
             except Exception:
                 self.logger.exception('Unable to restore a single startup menu')
 
+    def _drain_startup_updates(self, first: list[dict]) -> list[dict]:
+        """Telegram returns at most 100 updates: later backlog pages are stale too."""
+        updates = list(first)
+        batch = first
+        while len(batch) >= 100:
+            offset = max(int(item['update_id']) for item in batch) + 1
+            batch = self.api.get_updates(offset, 0)
+            updates.extend(batch)
+        return updates
+
     def run_forever(self) -> None:
         if not self._acquire_instance_lock():
             return
@@ -542,6 +638,7 @@ class TelegramControlBot(PersonalProfileControls):
                 try:
                     updates = self.api.get_updates(self.offset, 0 if startup else self.settings.poll_timeout)
                     if startup:
+                        updates = self._drain_startup_updates(updates)
                         startup = False
                         self._consume_startup_updates(updates)
                         continue

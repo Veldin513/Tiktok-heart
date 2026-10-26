@@ -316,11 +316,12 @@
               </div>
             </article>
             <article class="panel">
-              <div class="panel-title">Telegram</div>
+              <div class="panel-title">Бот управления в Telegram</div>
+              <p class="hint">Включите, чтобы кнопки в Telegram отвечали. Итоги отправки приходят автоматически даже при выключенном управлении.</p>
               <div class="button-grid">
-                <button class="btn secondary" data-action="start_telegram">Запустить</button>
-                <button class="btn secondary" data-action="stop_telegram">Остановить</button>
-                <button class="btn secondary" data-action="clear_telegram_lock">Очистить lock</button>
+                <button class="btn secondary" data-action="start_telegram">Включить кнопки Telegram</button>
+                <button class="btn secondary" data-action="stop_telegram">Выключить управление</button>
+                <button class="btn secondary" data-action="clear_telegram_lock">Снять зависшую блокировку</button>
               </div>
             </article>
             <article class="panel span-2">
@@ -329,7 +330,7 @@
                 <li>Нажмите «Открыть BotFather», отправьте ему <code>/newbot</code>.</li>
                 <li>Укажите название и свободный username с окончанием <code>bot</code>. Вставьте выданный токен ниже.</li>
                 <li>Откройте своего нового бота в Telegram, нажмите «Начать» или отправьте <code>/start</code>.</li>
-                <li>Нажмите «Найти мой ID», выберите свой аккаунт, сохраните настройки и нажмите «Запустить» выше.</li>
+                <li>Нажмите «Найти мой ID», выберите свой аккаунт как администратора, сохраните настройки и нажмите «Включить кнопки Telegram» выше.</li>
               </ol>
               <p class="muted">Для изменения токена или доступа сначала остановите бота. Пустое поле токена сохраняет прежний токен. Название, описание и фото бота меняются в BotFather командой <code>/mybots</code>.</p>
               <form id="telegram-settings-form" class="profile-form" autocomplete="off">
@@ -341,7 +342,7 @@
                 <input id="telegram-admin-ids" class="input" placeholder="Ваш личный Telegram ID" required />
                 <label class="field-label" for="telegram-ids">Telegram ID пользователей — только свой профиль</label>
                 <textarea id="telegram-ids" class="text-editor" rows="2" placeholder="Можно оставить пустым. Несколько ID — через запятую"></textarea>
-                <p class="muted">При /start разрешённый пользователь получает личный профиль с ником и ID. Он может менять своего адресата и серию, входить в свой TikTok и запускать/останавливать только свой worker. Общие настройки и чужие профили доступны администратору.</p>
+                <p class="muted">Когда разрешённый пользователь нажмёт «Начать» в боте, создастся его профиль с ником и ID. В нём можно менять адресата и серию, входить в TikTok и запускать/останавливать отправку. Вход выполняется на этом компьютере. В боте администратор добавляет пользователей через «Пользователи и права» — команды писать не нужно.</p>
                 <div class="button-grid">
                   <button type="button" id="telegram-botfather" class="btn secondary">Открыть BotFather</button>
                   <button type="button" id="telegram-check" class="btn secondary">Проверить токен</button>
@@ -351,7 +352,7 @@
                 </div>
                 <div id="telegram-chat-choices" class="button-grid"></div>
                 <p id="telegram-settings-status" class="muted" role="status"></p>
-                <p class="muted">Итог отправки в TikTok придёт автоматически. Для этого постоянно включать бота не нужно. Кнопка «Запустить» выше включает постоянное управление из Telegram; вручную запущенный бот останется работать.</p>
+                <p class="muted">Итог отправки в TikTok придёт автоматически. Если вы включили кнопки Telegram вручную, после отчёта управление останется включено до вашей команды.</p>
               </form>
             </article>
             <article class="panel span-2 schedule-panel">

@@ -1329,9 +1329,9 @@ const ACTION_CONFIRMATIONS = {
     confirmLabel: "Остановить",
   },
   stop_telegram: {
-    title: "Остановить Telegram?",
-    message: "Команды из Telegram временно станут недоступны, пока сервис не будет запущен снова.",
-    confirmLabel: "Остановить",
+    title: "Выключить управление из Telegram?",
+    message: "Кнопки бота перестанут отвечать до включения. Итоги отправки продолжат приходить автоматически.",
+    confirmLabel: "Выключить управление",
   },
   reset_runtime_flags: {
     title: "Сбросить служебные флаги?",
@@ -1479,7 +1479,7 @@ function bindTelegramSettings() {
       $('#telegram-token').value = '';
       $('#telegram-chat-choices').replaceChildren();
       await loadTelegramSettings();
-      status.textContent = 'Сохранено. Нажмите «Запустить» в блоке Telegram выше.';
+      status.textContent = 'Сохранено. Нажмите «Включить кнопки Telegram» выше, затем «Начать» в чате с ботом.';
       await refresh({ full: true });
     });
   });

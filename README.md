@@ -93,6 +93,8 @@ Telegram setup is available in **Advanced mode → Management**: open BotFather,
 
 Administrators can manage all profiles. Approved users get personal profiles with their Telegram nickname and ID, and can configure their own recipient, streak, login and worker. Worker reports use a one-shot Telegram connection; the interactive bot only needs to stay running while you use its buttons.
 
+Telegram has button-based user and role management with confirmation, profile setup instructions, Cancel and Home buttons. Enable interactive controls in the desktop app, then send `/start` to open the current menu. Login opens Chrome on the computer running the app. Automatic reports still arrive when interactive controls are off.
+
 ### Browser Authorization
 
 Use the Browser tab to:
@@ -263,7 +265,9 @@ scripts\windows\start_app_shell.bat
 
 Telegram можно также настроить через `control/telegram_bot_v2.json`. Это локальный файл, его нельзя коммитить.
 
-В **Расширенном режиме → Управление** есть мастер настройки Telegram: переход к BotFather, проверка токена, поиск своего ID после `/start`, выбор пользователей и сохранение или редактирование настроек. Перед изменением остановите бота, после сохранения запустите снова. [Пошаговая инструкция](INSTALL.md#14-создайте-telegram-бота--по-желанию).
+В **Расширенном режиме → Управление** есть мастер настройки Telegram: переход к BotFather, проверка токена, поиск своего ID после `/start`, выбор пользователей и сохранение или редактирование настроек. Перед изменением остановите бота, после сохранения нажмите **Включить кнопки Telegram**. [Пошаговая инструкция](INSTALL.md#14-создайте-telegram-бота--по-желанию).
+
+В боте пользователи и права настраиваются кнопками с подтверждением, без обязательных команд. Есть подсказки по профилю, **Отмена**, **Главное меню** и **Как пользоваться**. После обновления откройте новое меню через `/start`. Вход в TikTok открывает Chrome на компьютере с приложением. Если управление Telegram выключено, кнопки не отвечают; итоговые отчёты продолжают приходить.
 
 Администратор управляет всеми профилями. Разрешённый пользователь получает личный профиль с ником и Telegram ID: свой адресат, серия, вход и worker. Для итогового уведомления постоянный бот не нужен; для кнопок управления он должен работать.
 

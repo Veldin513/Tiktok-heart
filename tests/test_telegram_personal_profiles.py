@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import io
 import json
 import os
+import urllib.error
 from types import SimpleNamespace
 
 import pytest
 
 from yara_app.notifications import notify_worker_result
 from yara_app.project_adapter import ProjectAdapter, WorkerStatus
-from yara_app.telegram_control_bot import TelegramControlBot
+from yara_app.telegram_control_bot import TelegramAPI, TelegramControlBot
+from yara_app.telegram_errors import TelegramAPIError
 from yara_app.telegram_profiles import profile_token
 from yara_app.telegram_setup import TelegramSetup
 from yara_app.ttbot import models
@@ -285,3 +288,184 @@ def test_disabled_personal_profile_has_no_worker_targets(bot, monkeypatch):
     assert object.__new__(models.ControlStore).load_profiles()[key] == []
     with pytest.raises(ValueError):
         adapter.start_profile_worker(key)
+
+
+def buttons(bot):
+    return [button for row in bot.api.messages[-1][2]['inline_keyboard'] for button in row]
+
+
+def test_expired_callback_does_not_break_profile_navigation(bot, monkeypatch):
+    def expired(*_args):
+        raise TelegramAPIError('answerCallbackQuery', 400, 'Bad Request: query is too old and response timeout expired')
+    monkeypatch.setattr(bot.api, 'answer_callback', expired)
+    key = owned_key(bot, 200)
+    bot.process_update(callback(200, f'p:{profile_token(key)}:open'))
+    assert any(item['callback_data'].endswith(':target:0') for item in buttons(bot))
+    monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda *_a: pytest.fail('stale action executed'))
+    bot.process_update(callback(200, f'p:{profile_token(key)}:start'))
+    assert 'слишком давно' in bot.api.messages[-1][1]
+
+
+def test_same_menu_refresh_does_not_create_another_message(bot, monkeypatch):
+    def unchanged(*_args):
+        raise TelegramAPIError('editMessageText', 400, 'Bad Request: message is not modified')
+    monkeypatch.setattr(bot.api, 'edit_message_text', unchanged)
+    before = len(bot.api.messages)
+    bot.process_update(callback(200, 'nav:main'))
+    assert len(bot.api.messages) == before
+
+
+def test_real_http_400_is_parsed_and_secret_is_redacted(monkeypatch):
+    def rejected(*_args, **_kwargs):
+        body = io.BytesIO(json.dumps({'description': 'Bad Request: query is too old sessionid=private'}).encode())
+        raise urllib.error.HTTPError('https://api.telegram.org', 400, 'Bad Request', {}, body)
+    monkeypatch.setattr('urllib.request.urlopen', rejected)
+    with pytest.raises(TelegramAPIError) as caught:
+        TelegramAPI(TOKEN, 5).answer_callback('query')
+    assert caught.value.expired_callback
+    assert 'private' not in str(caught.value)
+    assert 'query is too old' in str(caught.value)
+
+
+def test_polling_conflict_is_preserved_for_existing_shutdown_handler(monkeypatch):
+    def rejected(*_args, **_kwargs):
+        raise urllib.error.HTTPError('https://api.telegram.org', 409, 'Conflict', {}, io.BytesIO(b'{}'))
+    monkeypatch.setattr('urllib.request.urlopen', rejected)
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        TelegramAPI(TOKEN, 5).get_updates(None, 0)
+    assert caught.value.code == 409
+
+
+def test_admin_can_add_user_with_buttons_and_confirmation_only(bot):
+    bot.process_update(callback(100, 'nav:access'))
+    assert any(item['callback_data'] == 'access:add' for item in buttons(bot))
+    bot.process_update(callback(100, 'access:add'))
+    bot.process_update(message(100, '400', 'admin'))
+    assert 400 not in bot.settings.allowed_chat_ids
+    confirm = next(item['callback_data'] for item in buttons(bot) if item['callback_data'].startswith('access:confirm:'))
+    bot.process_update(callback(100, confirm))
+    assert 400 in bot.settings.allowed_chat_ids
+    bot.process_update(message(400, '/start', 'new_user'))
+    assert owned_key(bot, 400)
+    bot.process_update(callback(100, confirm))
+    assert 'устарело' in bot.api.messages[-1][1]
+
+
+def test_access_confirmation_rechecks_admin_role(bot):
+    bot.process_update(message(100, '/admin 300', 'admin'))
+    bot.process_update(callback(300, 'access:role:200:admin'))
+    confirm = next(item['callback_data'] for item in buttons(bot) if item['callback_data'].startswith('access:confirm:'))
+    bot.process_update(message(100, '/user 300', 'admin'))
+    bot.process_update(callback(300, confirm))
+    assert not bot._is_admin(200)
+
+
+def test_last_admin_is_protected_through_buttons_too(bot):
+    bot.process_update(callback(100, 'access:role:100:revoke'))
+    confirm = next(item['callback_data'] for item in buttons(bot) if item['callback_data'].startswith('access:confirm:'))
+    bot.process_update(callback(100, confirm))
+    assert bot._is_admin(100)
+    assert 'последнего' in bot.api.messages[-1][1]
+
+
+@pytest.mark.parametrize('data', ['access:add', 'access:role:300:admin', 'access:user:300', 'access:confirm:fake'])
+def test_regular_user_cannot_manage_access_via_buttons(bot, data):
+    before = bot.adapter.telegram_config_path.read_bytes()
+    bot.process_update(callback(200, data))
+    assert before == bot.adapter.telegram_config_path.read_bytes()
+    assert 'администратор' in bot.api.messages[-1][1]
+
+
+def test_cancel_or_navigation_stops_old_recipient_input(bot):
+    key = owned_key(bot, 200)
+    for route in ['input:cancel', 'nav:main', 'nav:help']:
+        bot.process_update(callback(200, f'p:{profile_token(key)}:target:0'))
+        assert 200 in bot.pending_profile_inputs
+        bot.process_update(callback(200, route))
+        assert 200 not in bot.pending_profile_inputs
+        bot.process_update(message(200, '@not_a_new_recipient'))
+        assert not next(p for p in bot.adapter.get_profiles() if p.key == key).raw['targets']
+
+
+def test_failed_input_can_be_corrected_without_reopening_form(bot):
+    key = add_recipient(bot, 200, 'target')
+    bot.process_update(callback(200, f'p:{profile_token(key)}:streak:0'))
+    bot.process_update(message(200, 'not a number'))
+    assert 200 in bot.pending_profile_inputs
+    assert any(item['callback_data'] == 'input:cancel' for item in buttons(bot))
+    bot.process_update(message(200, '318'))
+    assert bot.adapter.get_target_state('target', key)['streak_count'] == 318
+
+
+def test_login_button_opens_instructions_before_any_chrome_window(bot, monkeypatch):
+    key = owned_key(bot, 200)
+    monkeypatch.setattr(bot.adapter, 'begin_dedicated_login', lambda *_a: pytest.fail('Chrome opened by navigation'))
+    monkeypatch.setattr(bot.adapter, 'profile_login_confirmed', lambda *_a: True)
+    bot.process_update(callback(200, f'p:{profile_token(key)}:open'))
+    labels = [item['text'] for item in buttons(bot)]
+    assert '🔐 Войти в TikTok' not in labels
+    bot.process_update(callback(200, f'p:{profile_token(key)}:login_info'))
+    assert 'компьютере' in bot.api.messages[-1][1]
+    assert any(item['callback_data'].endswith(':login') for item in buttons(bot))
+
+
+def test_pending_login_has_clear_finish_and_cancel_buttons(bot):
+    from yara_app.native_login import LOGIN_PENDING
+    key = owned_key(bot, 200)
+    pending = bot.adapter._bot_profile_root(key) / 'browser' / LOGIN_PENDING
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.write_text('{}')
+    bot.process_update(callback(200, f'p:{profile_token(key)}:open'))
+    assert any(item['callback_data'].endswith(':verify') for item in buttons(bot))
+    assert any(item['callback_data'].endswith(':cancel_login') for item in buttons(bot))
+
+
+def test_many_profiles_and_recipients_are_reachable_through_pages(bot):
+    for index in range(9):
+        bot.adapter.create_profile(f'extra_{index}')
+    bot.process_update(callback(100, 'nav:recipients'))
+    assert any(item['callback_data'] == 'nav:recipients:1' for item in buttons(bot))
+    bot.process_update(callback(100, 'nav:recipients:1'))
+    assert '2/2' in bot.api.messages[-1][1]
+    key = owned_key(bot, 200)
+    for index in range(9):
+        bot.adapter.add_target(key, f'target{index}', '@target' + str(index))
+    bot.process_update(callback(200, f'p:{profile_token(key)}:open:1'))
+    assert any(item['callback_data'].endswith(':target:8') for item in buttons(bot))
+    assert all(len(item['callback_data'].encode()) <= 64 for item in buttons(bot))
+
+
+def test_telegram_command_with_bot_suffix_opens_correct_menu(bot):
+    bot.process_update(message(200, '/status@some_bot'))
+    assert 'Адресатов:' in bot.api.messages[-1][1]
+
+
+def test_foreign_actor_or_group_cannot_trigger_private_action(bot, monkeypatch):
+    key = owned_key(bot, 200)
+    monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda *_a: pytest.fail('wrong actor started sending'))
+    item = callback(200, f'p:{profile_token(key)}:start')
+    item['callback_query']['from'] = {'id': 300}
+    bot.process_update(item)
+    item['callback_query']['from']['id'] = 200
+    item['callback_query']['message']['chat']['type'] = 'group'
+    bot.process_update(item)
+
+
+def test_backlog_beyond_first_hundred_is_coalesced_without_running_actions(bot, monkeypatch):
+    key = owned_key(bot, 200)
+    monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda *_a: pytest.fail('backlog started sending'))
+    first = [{**callback(200, 'nav:main'), 'update_id': i} for i in range(100)]
+    last = [{**callback(200, f'p:{profile_token(key)}:start'), 'update_id': 100}]
+    calls = []
+    monkeypatch.setattr(bot.api, 'get_updates', lambda offset, timeout: calls.append((offset, timeout)) or last, raising=False)
+    before = len(bot.api.messages)
+    bot._consume_startup_updates(bot._drain_startup_updates(first))
+    assert calls == [(100, 0)]
+    assert bot.offset == 101
+    assert len(bot.api.messages) == before + 1
+
+
+def test_old_index_toggle_does_not_disable_different_profile(bot):
+    before = bot.adapter.profiles_path.read_bytes()
+    bot.process_update(callback(100, 'act:profile:toggle:1'))
+    assert bot.adapter.profiles_path.read_bytes() == before
