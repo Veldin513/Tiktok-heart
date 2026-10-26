@@ -152,6 +152,16 @@ def test_qr_success_is_checked_before_session_is_saved(login):
     assert any(p.name == 'old-session' for p in login.active.parent.rglob('old-session'))
 
 
+def test_existing_login_that_finishes_loading_does_not_request_password_again(login, monkeypatch):
+    def opened(view, _method):
+        view.page.logged = True
+    monkeypatch.setattr(login.view, 'open', opened)
+    session = login.manager.start('alpha', 200, 'password')
+    session.thread.join(timeout=3)
+    assert any(event[0] == 'done' for event in login.events)
+    assert not any(event[0] in {'identifier', 'password', 'qr'} for event in login.events)
+
+
 def test_password_in_playwright_exception_is_never_logged_or_sent(login, caplog):
     login.view.fail = True
     session = login.manager.start('alpha', 200, 'password')
@@ -197,6 +207,16 @@ def test_expiration_and_cancel_of_existing_chrome_profile(login):
     state = json.loads((login.active.parent.parent / 'state/session_validation.json').read_text())
     assert state['valid'] is None
     assert not (login.active.parent / LOGIN_PENDING).exists()
+
+
+def test_restarting_interrupted_login_resumes_without_deleting_profile(login):
+    pending = login.active.parent / LOGIN_PENDING
+    pending.write_text(json.dumps({'mode': 'staged', 'flow': 'desktop', 'id': 'old-process'}))
+    session = login.manager.start('alpha', 200, 'qr')
+    wait_until(lambda: session.stage == 'qr')
+    assert json.loads(pending.read_text())['id'] == session.id
+    login.manager.cancel(200)
+    assert (login.active / 'old-session').read_text() == 'keep'
 
 
 def test_local_status_never_returns_password_or_identifier(login):

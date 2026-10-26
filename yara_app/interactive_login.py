@@ -50,6 +50,8 @@ class LoginPage:
             locator.first.wait_for(state='visible', timeout=10000 if required else 1500)
         except Exception:
             if required:
+                if self.authenticated():
+                    return False
                 raise RuntimeError('Не удалось открыть способ входа. Попробуйте вход на компьютере.') from None
             return False
         if locator.count():
@@ -63,13 +65,17 @@ class LoginPage:
         self.page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=30000)
         # TikTok paints these choices before registering their click handlers.
         self.page.wait_for_timeout(1600)
+        if self.authenticated():
+            return
         if method == 'qr':
-            self.click_text(r'^(Use QR code|Использовать QR-код|Вход по QR-коду|QR-код)$', required=True)
+            if not self.click_text(r'^(Use QR code|Использовать QR-код|Вход по QR-коду|QR-код)$', required=True):
+                return
             self.page.locator(QR_SELECTOR).first.wait_for(
                 state='visible', timeout=12000)
             self.page.wait_for_timeout(500)
         else:
-            self.click_text(r'^(Use phone / email / username|Использовать телефон / почту / имя пользователя|Телефон / почта / имя пользователя)$', required=True)
+            if not self.click_text(r'^(Use phone / email / username|Использовать телефон / почту / имя пользователя|Телефон / почта / имя пользователя)$', required=True):
+                return
             self.page.wait_for_timeout(500)
             self.click_text(r'^(Log in with email or username|Войти по почте или имени пользователя|Почта / имя пользователя)$')
             self.click_text(r'^(Log in with password|Войти с паролем)$')
@@ -273,7 +279,11 @@ class InteractiveLogin:
                 if chrome_profile_running(target):
                     raise RuntimeError('Закройте окно входа на компьютере и попробуйте снова.')
                 if pending.exists():
-                    raise RuntimeError('Завершите или отмените предыдущий вход на компьютере.')
+                    previous = read_json(pending, {}) or {}
+                    # An abandoned in-app/Telegram flow has no browser lease.
+                    # A fresh explicit login can resume the same saved profile.
+                    if previous.get('flow') not in {'telegram', 'desktop'}:
+                        raise RuntimeError('Завершите или отмените предыдущий вход на компьютере.')
                 if mode == 'active':
                     self.adapter.create_auth_backup(session.profile)
                 mark_google_chrome(target)
@@ -285,21 +295,22 @@ class InteractiveLogin:
                         page.set_default_timeout(4000)
                         page.goto(MESSAGES_URL, wait_until='domcontentloaded', timeout=30000)
                         view = LoginPage(page)
-                        success = wait_for_authenticated_page(page, timeout_ms=1500)
+                        success = wait_for_authenticated_page(page, timeout_ms=10000)
                         if not success:
                             view.open(session.method)
+                            success = view.authenticated()
                             if view.challenge():
                                 raise RuntimeError('TikTok просит проверку на картинке. Продолжите вход на компьютере.')
                             photo = root / 'artifacts' / f'login_qr_{session.id}.png'
                             photo.parent.mkdir(parents=True, exist_ok=True)
-                            if session.method == 'qr':
+                            if not success and session.method == 'qr':
                                 view.qr_photo(photo)
                                 self._emit(session, 'qr', 'Откройте TikTok на телефоне, отсканируйте QR и подтвердите вход.', photo)
-                            else:
+                            elif not success:
                                 self._emit(session, 'identifier', 'Пришлите логин или почту TikTok.')
                             deadline = time.monotonic() + self.timeout_seconds
                             code_requested = False
-                            while not session.stop.is_set() and time.monotonic() < deadline:
+                            while not success and not session.stop.is_set() and time.monotonic() < deadline:
                                 if not self.allowed(session.owner, session.profile):
                                     break
                                 if view.authenticated():
