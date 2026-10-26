@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 from yara_app.redaction import redact_secrets
 from yara_app.telegram_setup import TelegramSetup, parse_chat_ids
@@ -16,7 +17,7 @@ REASONS = {
     'offline': 'Нет соединения с интернетом.',
     'delivery_unconfirmed': 'TikTok не подтвердил доставку. Проверьте чат; повтор заблокирован.',
     'chat_not_confirmed': 'Не удалось подтвердить чат адресата.',
-    'chat_blocked': 'TikTok заблокировал открытие чата.',
+    'chat_blocked': 'Открытию чата мешает окно или ограничение TikTok.',
     'send_failed': 'Во время отправки произошла ошибка. Проверьте чат перед повтором.',
     'send_rejected': 'TikTok отклонил отправку.',
     'send_not_attempted': 'Отправка не выполнялась: чат недоступен.',
@@ -34,6 +35,11 @@ REASONS = {
     'dry_run': 'Проверочный запуск: отправка отключена.',
     'cooldown': 'Ещё не прошла пауза до следующей отправки.',
 }
+
+
+def _telegram_text(text: str, limit: int) -> str:
+    # Telegram counts UTF-16 units; emoji can occupy two units.
+    return redact_secrets(text).encode('utf-16-le')[:limit * 2].decode('utf-16-le', errors='ignore')
 
 
 def report_text(summary: dict, *, status: str, reason: str = '', dry_run: bool = False) -> str:
@@ -59,6 +65,8 @@ def report_text(summary: dict, *, status: str, reason: str = '', dry_run: bool =
     for item in results[:12]:
         name = str(item.get('target') or '')
         if name == '__run__':
+            if item.get('error'):
+                lines.append('Причина: ' + redact_secrets(str(item['error']))[:1500])
             continue
         if item.get('success') and item.get('confirmation') == 'server_ack':
             detail = 'отправлено; TikTok подтвердил'
@@ -67,9 +75,38 @@ def report_text(summary: dict, *, status: str, reason: str = '', dry_run: bool =
         else:
             detail = REASONS.get(item.get('reason'), 'Отправка не подтверждена.')
         lines.append(f'• {name[:100]}: {detail}')
+        if item.get('error'):
+            lines.append('  Причина: ' + redact_secrets(str(item['error']))[:1500])
     if len(results) > 12:
         lines.append('Остальные адресаты — в журнале приложения.')
-    return redact_secrets('\n'.join(lines))[:4000]
+    return _telegram_text('\n'.join(lines), 4000)
+
+
+def error_photos(adapter, summary: dict) -> list[tuple[Path, str]]:
+    """Only this run's referenced screenshots inside this profile's artifacts."""
+    photos = []
+    seen = set()
+    for item in summary.get('results') or []:
+        raw = item.get('screenshot_path')
+        if not raw or item.get('success'):
+            continue
+        try:
+            folder = adapter._bot_profile_root(summary.get('profile_name')).resolve() / 'artifacts'
+            path = Path(raw).resolve(strict=True)
+            if (not path.is_relative_to(folder) or path.suffix.lower() != '.png' or not path.name.startswith('error_')
+                    or not path.is_file() or path.stat().st_size > 8 * 1024 * 1024 or path in seen):
+                continue
+            caption = f'Скриншот ошибки · {summary.get("profile_name") or "default"}'
+            if item.get('target') != '__run__':
+                caption += f'\nАдресат: {item.get("target") or "—"}'
+            caption += '\n' + str(item.get('error') or REASONS.get(item.get('reason'), 'Ошибка обработки страницы.'))
+            photos.append((path, _telegram_text(caption, 900)))
+            seen.add(path)
+            if len(photos) == 3:
+                break
+        except (AttributeError, OSError, ValueError):
+            logger.warning('Скриншот ошибки недоступен; текстовый отчёт сохранён.')
+    return photos
 
 
 def notify_worker_result(adapter, summary: dict, *, status: str, reason: str = '', dry_run: bool = False) -> dict:
@@ -84,12 +121,20 @@ def notify_worker_result(adapter, summary: dict, *, status: str, reason: str = '
         owners = parse_chat_ids((config.get('profile_owners') or {}).get(summary.get('profile_name'), []))
         ids = sorted(set(admins) | set(owners))
         text = report_text(summary, status=status, reason=reason, dry_run=dry_run)
+        photos = error_photos(adapter, summary)
         sent = 0
         for chat_id in ids:
             try:
                 result = setup._call('sendMessage', {'chat_id': chat_id, 'text': text})
                 if isinstance(result, dict) and result.get('message_id'):
                     sent += 1
+                    for path, caption in photos:
+                        try:
+                            attachment = setup._call('sendPhoto', {'chat_id': chat_id, 'caption': caption}, photo_path=path)
+                            if not isinstance(attachment, dict) or not attachment.get('message_id'):
+                                raise ValueError('Telegram не подтвердил получение фото.')
+                        except Exception as exc:
+                            logger.warning('Фото ошибки не доставлено; текст отправлен: %s', redact_secrets(str(exc)))
                 else:
                     logger.warning('Telegram не подтвердил получение итогового уведомления')
             except Exception as exc:

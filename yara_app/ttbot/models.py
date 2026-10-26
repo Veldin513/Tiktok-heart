@@ -61,6 +61,7 @@ class TargetResult:
     reason: str | None = None
     screenshot_path: Path | None = None
     confirmation: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -94,6 +95,8 @@ class RunSummary:
         skipped: bool = False,
         reason: str | None = None,
         confirmation: str | None = None,
+        error: str | None = None,
+        screenshot_path: Path | None = None,
     ) -> None:
         """Backward-compatible API kept for legacy tiktok_checker.py.
 
@@ -113,6 +116,8 @@ class RunSummary:
                 streak_count=streak_count,
                 reason=effective_reason,
                 confirmation=confirmation,
+                error=error,
+                screenshot_path=screenshot_path,
             )
         )
 
@@ -136,6 +141,7 @@ class RunSummary:
                     'confirmation': r.confirmation,
                     'skipped': r.skipped or r.reason == 'cooldown',
                     'screenshot_path': str(r.screenshot_path) if r.screenshot_path else None,
+                    'error': r.error,
                 }
                 for r in self.results
             ],

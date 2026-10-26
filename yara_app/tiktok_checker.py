@@ -9,7 +9,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,7 +37,7 @@ from yara_app.delivery import (
 from yara_app.fileio import atomic_write_text
 from yara_app.notifications import notify_worker_result
 from yara_app.project_adapter import ProjectAdapter
-from yara_app.redaction import redact_value
+from yara_app.redaction import redact_secrets, redact_value
 from yara_app.runtime_paths import (
     RunLock,
     browser_profile_needs_recovery,
@@ -491,6 +491,35 @@ def stop_or_pause_reason() -> str | None:
     return None
 
 
+def capture_error_screenshot(page) -> Path | None:
+    """Best effort viewport capture while the failing page is still open."""
+    if page is None or not callable(getattr(page, 'screenshot', None)):
+        return None
+    folder = getattr(PATHS, 'artifacts_dir', None)
+    if folder is None:
+        return None
+    path = folder / f'error_{time.time_ns()}.png'
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(path), type='png', full_page=False, timeout=3000)
+        if path.is_file() and 0 < path.stat().st_size <= 8 * 1024 * 1024:
+            return path
+        logger.warning('Скриншот ошибки пустой или слишком большой; будет отправлен только текст.')
+    except Exception as exc:
+        logger.warning('Не удалось сделать скриншот ошибки: %s', redact_secrets(str(exc)))
+    with suppress(OSError):
+        path.unlink(missing_ok=True)
+    return None
+
+
+def record_target_failure(summary: RunSummary, page, target: str, reason: str, error: str) -> None:
+    detail = redact_secrets(str(error))[:1500]
+    screenshot = capture_error_screenshot(page)
+    summary.add_result(target=target, success=False, reason=reason, error=detail, screenshot_path=screenshot)
+    _append_run_history('target_result', target=target, success=False, reason=reason, error=detail,
+                        screenshot_path=str(screenshot) if screenshot else None)
+
+
 def process_target(page, target: Target, summary: RunSummary) -> None:
     _write_run_state(status='running', current_target=target.name)
     logger.info('Начало обработки адресата: %s | profile=%s', target.name, target.profile_url)
@@ -524,17 +553,16 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
                 chat_opened = open_chat_by_profile(page, target.profile_url)
     except SendNotAttempted as exc:
         logger.warning('Чат недоступен: %s', exc)
-        summary.add_result(target=target.name, success=False, reason='chat_blocked')
-        _append_run_history('target_result', target=target.name, success=False, reason='chat_blocked', error=str(exc))
+        record_target_failure(summary, page, target.name, 'chat_blocked', str(exc))
         return
     except (AuthSessionUnavailable, AuthCheckInconclusive):
         raise
-    except Exception:
-        chat_opened = False
+    except Exception as exc:
+        record_target_failure(summary, page, target.name, 'chat_not_confirmed', str(exc))
+        return
     if not chat_opened:
         logger.warning('Не удалось подтвердить чат адресата. Отправка пропущена.')
-        summary.add_result(target=target.name, success=False, reason='chat_not_confirmed')
-        _append_run_history('target_result', target=target.name, success=False, reason='chat_not_confirmed')
+        record_target_failure(summary, page, target.name, 'chat_not_confirmed', 'Не удалось подтвердить чат адресата. Отправка не начиналась.')
         return
 
     require_work_session(page)
@@ -568,8 +596,7 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
         else:
             target_guard_path(target.name).unlink(missing_ok=True)
         logger.warning('Отправка не подтверждена: %s', exc)
-        summary.add_result(target=target.name, success=False, reason=reason)
-        _append_run_history('target_result', target=target.name, success=False, reason=reason)
+        record_target_failure(summary, page, target.name, reason, str(exc))
         if explicitly_logged_out(page):
             mark_session_import_required('session_lost_during_send')
             raise AuthSessionUnavailable('Вход потерян во время отправки.') from None
@@ -578,8 +605,7 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
         raise
     except Exception as exc:
         logger.error('Не удалось отправить сообщение для %s: %s', target.name, exc)
-        summary.add_result(target=target.name, success=False, reason='send_failed')
-        _append_run_history('target_result', target=target.name, success=False, reason='send_failed', error=str(exc))
+        record_target_failure(summary, page, target.name, 'send_failed', str(exc))
         return
 
     with timed_phase('target_save_state', target=target.name):
@@ -785,6 +811,7 @@ def check_tiktok_streak() -> None:
     notify_run_finished = True
     terminal_status = 'idle'
     terminal_reason = ''
+    run_error_screenshot = None
     _write_run_state(status='starting', total_targets=len(targets), current_target=None)
     _append_run_history('run_started', total_targets=len(targets), dry_run=runtime_state.dry_run)
     try:
@@ -859,26 +886,32 @@ def check_tiktok_streak() -> None:
                         raise
                     except Exception as exc:
                         logger.exception('Ошибка адресата %s', target.name)
-                        summary.add_result(target=target.name, success=False, reason='target_error')
-                        _append_run_history('target_result', target=target.name, success=False,
-                                            reason='target_error', error=str(exc))
+                        record_target_failure(summary, work_page, target.name, 'target_error', str(exc))
                 logger.info('Выход из check_tiktok_streak(). success_count=%s, targets=%s', summary.success_count, len(targets))
+            except Exception:
+                run_error_screenshot = capture_error_screenshot(work_page)
+                raise
             finally:
                 logger.info('Закрытие браузера.')
                 safe_close_context(work_context, work_page)
-    except AuthCheckInconclusive:
+    except AuthCheckInconclusive as exc:
         terminal_status = 'failed'
         terminal_reason = 'auth_check_inconclusive'
-        summary.add_result(target='__run__', success=False, reason=terminal_reason)
+        summary.add_result(target='__run__', success=False, reason=terminal_reason,
+                           error=redact_secrets(str(exc))[:1500], screenshot_path=run_error_screenshot)
         _append_run_history('run_failed', reason=terminal_reason)
         logger.warning('Не удалось проверить страницу TikTok. Вход не признан потерянным; отправка не выполняется.')
-    except AuthSessionUnavailable:
+    except AuthSessionUnavailable as exc:
         terminal_status = 'failed'
         terminal_reason = 'session_import_required'
+        summary.add_result(target='__run__', success=False, reason=terminal_reason,
+                           error=redact_secrets(str(exc))[:1500], screenshot_path=run_error_screenshot)
         _append_run_history('run_failed', reason=terminal_reason)
     except Exception as exc:
         terminal_status = 'failed'
         terminal_reason = 'unhandled_exception'
+        summary.add_result(target='__run__', success=False, reason=terminal_reason,
+                           error=redact_secrets(str(exc))[:1500], screenshot_path=run_error_screenshot)
         _append_run_history('run_failed', reason=terminal_reason, error=str(exc)[:300])
         raise
     finally:

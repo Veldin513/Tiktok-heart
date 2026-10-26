@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import ssl
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from yara_app.fileio import atomic_write_text, file_lock, read_json
@@ -90,13 +92,31 @@ class TelegramSetup:
             atomic_write_text(self.path, json.dumps(data, ensure_ascii=False, indent=2) + '\n')
         return self.public_settings()
 
-    def _call(self, method: str, payload: dict, token: str = ''):
+    def _call(self, method: str, payload: dict, token: str = '', *, photo_path: Path | None = None):
         token = (token or str(self._read().get('token') or '')).strip()
         if not TOKEN_PATTERN.fullmatch(token):
             raise ValueError('Сначала вставьте токен BotFather.')
-        request = urllib.request.Request(
-            f'https://api.telegram.org/bot{token}/{method}',
-            data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
+        body = json.dumps(payload).encode()
+        content_type = 'application/json'
+        if photo_path is not None:
+            if method != 'sendPhoto':
+                raise ValueError('Вложение поддерживается только для отправки фото.')
+            with Path(photo_path).open('rb') as photo:
+                image = photo.read(8 * 1024 * 1024 + 1)
+            if not image.startswith(b'\x89PNG\r\n\x1a\n') or len(image) > 8 * 1024 * 1024:
+                raise ValueError('Скриншот должен быть PNG размером до 8 МБ.')
+            boundary = 'TikTokHeart' + secrets.token_hex(16)
+            chunks = []
+            for key, value in payload.items():
+                if key not in {'chat_id', 'caption'}:
+                    raise ValueError('Неизвестный параметр вложения.')
+                chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+            chunks += [f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="error.png"\r\nContent-Type: image/png\r\n\r\n'.encode(),
+                       image, f'\r\n--{boundary}--\r\n'.encode()]
+            body = b''.join(chunks)
+            content_type = f'multipart/form-data; boundary={boundary}'
+        request = urllib.request.Request(f'https://api.telegram.org/bot{token}/{method}',
+                                         data=body, headers={'Content-Type': content_type})
         try:
             with urllib.request.urlopen(request, timeout=10, context=verified_context()) as response:
                 data = json.loads(response.read(1024 * 1024))

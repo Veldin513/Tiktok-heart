@@ -103,6 +103,32 @@ def test_telegram_manual_send_cannot_repeat_recent_confirmed_send(dispatch, monk
     assert dispatch[0] == []
 
 
+@pytest.mark.parametrize('screenshot_fails', [False, True])
+def test_modal_error_is_preserved_with_optional_screenshot(dispatch, tmp_path, monkeypatch, screenshot_fails):
+    artifacts = tmp_path / 'artifacts'
+    monkeypatch.setattr(checker.PATHS, 'artifacts_dir', artifacts, raising=False)
+    original = 'Всплывающее окно перекрывает чат. Отправка не начиналась. sessionid=secret'
+    def blocked(*_a):
+        raise SendNotAttempted(original)
+    monkeypatch.setattr(checker, 'open_chat_by_list', blocked)
+    monkeypatch.setattr(checker, 'send_message', lambda *_a: pytest.fail('message sent despite modal'))
+    class Page:
+        def screenshot(self, *, path, **kwargs):
+            assert kwargs['timeout'] <= 3000
+            if screenshot_fails:
+                raise RuntimeError('page closed')
+            from pathlib import Path
+            Path(path).write_bytes(b'\x89PNG\r\n\x1a\nimage')
+    summary = RunSummary('test', 1)
+    checker.process_target(Page(), Target('alice'), summary)
+    result = summary.to_dict()['results'][0]
+    assert result['reason'] == 'chat_blocked'
+    assert 'Всплывающее окно' in result['error']
+    assert 'secret' not in result['error']
+    assert bool(result['screenshot_path']) is not screenshot_fails
+    assert dispatch[0] == []
+
+
 def test_unknown_send_stays_blocked_after_guard_ttl_and_can_be_reviewed(dispatch, tmp_path, monkeypatch):
     monkeypatch.setattr(checker, 'send_message', lambda *_a: None)
     checker.process_target(object(), Target('alice'), RunSummary('test', 1))
