@@ -379,6 +379,9 @@ class AppShellHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/profiles":
                     self._send_json({"ok": True, "data": self.adapter.get_profiles()})
                     return
+                if parsed.path == '/api/worker-queue':
+                    self._send_json({'ok': True, 'data': self.adapter.worker_queue().snapshot()})
+                    return
                 if parsed.path == "/api/schedule":
                     self._send_json({"ok": True, "data": self.adapter.get_worker_schedule_status()})
                     return
@@ -449,6 +452,17 @@ class AppShellHandler(BaseHTTPRequestHandler):
                     return
                 if parsed.path == "/api/action":
                     self._handle_action(payload)
+                    return
+                if parsed.path == '/api/worker-queue/cancel':
+                    removed = self.adapter.worker_queue().cancel(str(payload.get('profile') or '') or None)
+                    self._send_json({'ok': True, 'data': {'removed': removed}})
+                    return
+                if parsed.path == '/api/worker-queue/resume':
+                    if self.adapter.get_control_state().get('paused'):
+                        raise ValueError('Сначала снимите общую паузу.')
+                    if not self.adapter.resume_worker_queue():
+                        raise ValueError('Не удалось запустить очередь. Обновите приложение.')
+                    self._send_json({'ok': True, 'data': {'resumed': True}})
                     return
                 if parsed.path == "/api/schedule":
                     self._handle_schedule(payload)
@@ -871,6 +885,12 @@ def main() -> int:
         server = ThreadingHTTPServer(("127.0.0.1", port), AppShellHandler)
         url = f"http://127.0.0.1:{port}/"
         write_server_state(port, url)
+        state = AppShellHandler.adapter.get_control_state()
+        if not state.get('paused') and not state.get('stop_requested'):
+            try:
+                AppShellHandler.adapter.resume_worker_queue()
+            except Exception:
+                print('Очередь сохранена, но не запущена. Проверьте её в приложении.', flush=True)
         print(f"TikTok Heart Desktop: {url}", flush=True)
         print("Press Ctrl+C to stop.", flush=True)
 

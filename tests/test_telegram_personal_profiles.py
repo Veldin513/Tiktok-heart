@@ -125,7 +125,7 @@ def test_own_profile_operations_keep_exact_profile_key(bot, monkeypatch, operati
     def action(profile, **options):
         calls.append(profile)
         if operation == 'start':
-            assert options == {'ignore_cooldown': True}
+            assert options == {'ignore_cooldown': True, 'requester_id': 200}
         return SimpleNamespace(running=True) if operation in {'start', 'stop'} else {'ok': True}
     monkeypatch.setattr(bot.adapter, method, action)
     bot.process_update(callback(200, f'p:{profile_token(key)}:{operation}'))
@@ -198,8 +198,36 @@ def test_profile_worker_does_not_switch_global_profile_or_stop_other_worker(bot,
     monkeypatch.setattr(adapter, 'stop_worker', lambda: pytest.fail('foreign worker stopped'))
     with pytest.raises(RuntimeError):
         adapter.stop_profile_worker(key)
-    with pytest.raises(RuntimeError):
-        adapter.start_profile_worker(key)
+    monkeypatch.setattr('yara_app.worker_queue.WorkerQueue.kick', lambda _self: True)
+    queued = adapter.start_profile_worker(key, requester_id=200)
+    assert queued.queued and queued.queue_position == 1
+    assert not adapter.stop_profile_worker(key).running
+    assert not adapter.worker_queue().snapshot()['waiting']
+
+
+def test_queue_menu_hides_other_profiles_and_scopes_cancel(bot, monkeypatch):
+    alice = add_recipient(bot, 200, 'alice_target')
+    bob = add_recipient(bot, 300, 'bob_target')
+    monkeypatch.setattr('yara_app.worker_queue.WorkerQueue.kick', lambda _self: True)
+    monkeypatch.setattr(bot.adapter, 'get_worker_status', lambda: WorkerStatus(running=True, pid=456))
+    monkeypatch.setattr(bot.adapter, '_running_worker_profile', lambda _s: 'default')
+    for user, profile in [(200, alice), (300, bob)]:
+        bot.process_update(callback(user, f'p:{profile_token(profile)}:start'))
+        assert 'Ваше место:' in bot.api.messages[-1][1]
+    bot.process_update(callback(200, 'nav:queue'))
+    assert '200' in bot.api.messages[-1][1] and '300' not in bot.api.messages[-1][1]
+    bot.process_update(callback(200, f'q:{profile_token(bob)}:cancel'))
+    assert 'недоступен' in bot.api.messages[-1][1]
+    assert len(bot.adapter.worker_queue().read()['waiting']) == 2
+    bot.process_update(callback(200, 'q:all:cancel'))
+    assert 'администратор' in bot.api.messages[-1][1]
+    assert len(bot.adapter.worker_queue().read()['waiting']) == 2
+    bot.process_update(callback(200, f'q:{profile_token(alice)}:cancel'))
+    assert [j['profile'] for j in bot.adapter.worker_queue().read()['waiting']] == [bob]
+    bot.process_update(callback(100, 'nav:queue'))
+    assert '300' in bot.api.messages[-1][1]
+    bot.process_update(callback(100, 'q:all:cancel'))
+    assert not bot.adapter.worker_queue().read()['waiting']
 
 
 def test_reports_go_to_admin_and_own_user_only(bot, monkeypatch):
@@ -504,7 +532,7 @@ def test_admin_global_telegram_launch_also_bypasses_cooldown(bot, monkeypatch, o
     monkeypatch.setattr(bot.adapter, 'stop_worker', lambda: WorkerStatus(running=False, pid=None))
     monkeypatch.setattr(bot.adapter, 'start_profile_worker', lambda key, **kw: calls.append((key, kw)) or WorkerStatus(running=True, pid=123))
     bot.process_update(callback(100, f'act:worker:{operation}'))
-    assert calls == [(bot.adapter.get_control_state()['active_profile'], {'ignore_cooldown': True})]
+    assert calls == [(bot.adapter.get_control_state()['active_profile'], {'ignore_cooldown': True, 'requester_id': 100})]
 
 
 @pytest.mark.parametrize('method', ['qr', 'password'])

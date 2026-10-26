@@ -302,6 +302,7 @@ function renderDiagnostics(diag) {
 }
 
 function renderLiveStatus(diag, options = {}) {
+  renderWorkerQueue(diag.worker_queue || {});
   renderProfileLoginShortcut(diag);
   const worker = diag.worker || {};
   const telegram = diag.telegram_bot || {};
@@ -1341,11 +1342,12 @@ const ACTION_CONFIRMATIONS = {
 async function runAction(action) {
   const confirmation = ACTION_CONFIRMATIONS[action];
   if (confirmation && !(await confirmAction(confirmation))) return false;
-  await api("/api/action", {
+  const result = await api("/api/action", {
     method: "POST",
     body: JSON.stringify({ action }),
   });
-  toast("Действие выполнено");
+  const worker = result?.worker || result;
+  toast(worker?.queued ? `Добавлено в очередь. Место: ${worker.queue_position}. Запуск начнётся автоматически.` : "Действие выполнено");
   await refresh();
   return true;
 }
@@ -1506,6 +1508,40 @@ function activateView(view) {
   }
 }
 
+function renderWorkerQueue(queue) {
+  const box = $("#worker-queue-list");
+  if (!box) return;
+  box.replaceChildren();
+  if (queue.error || queue.paused) {
+    const note = document.createElement("p");
+    note.textContent = queue.error || "Очередь на общей паузе.";
+    box.append(note);
+  }
+  const entries = queue.waiting || [];
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.textContent = "Ожидающих запусков нет.";
+    box.append(empty);
+  }
+  for (const item of entries) {
+    const row = document.createElement("div");
+    row.className = "worker-queue-row";
+    const title = document.createElement("span");
+    title.textContent = `${item.position}. ${item.label}`;
+    const cancel = document.createElement("button");
+    cancel.className = "btn secondary mini";
+    cancel.textContent = "Отменить";
+    cancel.addEventListener("click", async () => {
+      try {
+        await api('/api/worker-queue/cancel', { method: 'POST', body: JSON.stringify({ profile: item.profile }) });
+        await refresh();
+      } catch (error) { toast(error.message); }
+    });
+    row.append(title, cancel);
+    box.append(row);
+  }
+}
+
 function bindSimpleLogin() {
   let loginId = "";
   try { loginId = sessionStorage.getItem("tiktok-heart-login") || ""; } catch {}
@@ -1633,6 +1669,20 @@ function bindNavigation() {
 }
 
 function bindActions() {
+  $("#worker-queue-clear").addEventListener("click", async () => {
+    try {
+      await api('/api/worker-queue/cancel', { method: 'POST', body: JSON.stringify({}) });
+      toast("Ожидающие запуски отменены. Текущая отправка продолжается.");
+      await refresh();
+    } catch (error) { toast(error.message); }
+  });
+  $("#worker-queue-resume").addEventListener("click", async () => {
+    try {
+      await api('/api/worker-queue/resume', { method: 'POST', body: JSON.stringify({}) });
+      toast("Очередь продолжена.");
+      await refresh();
+    } catch (error) { toast(error.message); }
+  });
   bindSimpleLogin();
   bindTelegramSettings();
   $("#create-profile-form").addEventListener("submit", async (event) => {

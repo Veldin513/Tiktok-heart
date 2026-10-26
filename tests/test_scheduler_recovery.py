@@ -101,6 +101,14 @@ def test_overdue_after_sleep_can_start_and_active_worker_is_not_duplicated(runti
     assert starts == [True]
 
 
+def test_schedule_submits_active_profile_when_another_is_busy(runtime, monkeypatch):
+    adapter, starts, _updates = runtime
+    monkeypatch.setattr(adapter, 'get_worker_status', lambda: WorkerStatus(running=True, pid=123))
+    monkeypatch.setattr(adapter, '_running_worker_profile', lambda _s: 'different_profile')
+    assert starter.main() == 0
+    assert starts == [True]  # start_worker handles persistence and FIFO.
+
+
 def test_failed_time_adjustment_returns_failure_instead_of_success(runtime, monkeypatch):
     adapter, starts, _updates = runtime
     state_dir = adapter._get_profile_state_dir()

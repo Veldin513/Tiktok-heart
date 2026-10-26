@@ -11,6 +11,7 @@ from yara_app.telegram_setup import TelegramSetup, parse_chat_ids
 logger = logging.getLogger(__name__)
 
 REASONS = {
+    'queue_blocked': 'Запуск из очереди отменён. Причина указана ниже.',
     'session_import_required': 'Нужно снова войти в TikTok в разделе «Браузер».',
     'auth_failed': 'Не удалось подтвердить вход в TikTok.',
     'auth_check_inconclusive': 'TikTok не удалось проверить. Сообщения не отправлялись.',

@@ -358,7 +358,8 @@ def send_start_message(targets: list[Target], *, dry_run: bool) -> None:
 
 
 def force_send_on_boot() -> bool:
-    return str(os.getenv('WORKER_FORCE_SEND_ON_BOOT') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    return ('--startup-cooldown' in sys.argv[2:] or
+            str(os.getenv('WORKER_FORCE_SEND_ON_BOOT') or '').strip().lower() in {'1', 'true', 'yes', 'on'})
 
 
 def cooldown_bypass_reason() -> str | None:
@@ -951,9 +952,15 @@ def check_tiktok_streak() -> None:
             try:
                 release_worker_run()
             finally:
-                if notify_run_finished:
-                    notify_worker_result(auth_coord_adapter, summary.to_dict(), status=terminal_status,
-                                         reason=terminal_reason, dry_run=runtime_state.dry_run)
+                try:
+                    if notify_run_finished:
+                        notify_worker_result(auth_coord_adapter, summary.to_dict(), status=terminal_status,
+                                             reason=terminal_reason, dry_run=runtime_state.dry_run)
+                finally:
+                    try:
+                        auth_coord_adapter.resume_worker_queue()
+                    except Exception:
+                        logger.warning('Не удалось продолжить очередь. Она сохранена; повторите запуск очереди в приложении.')
         # Anchor to completed sends, including manual launches. No resident
         # timer or extra queue checks are created by this adjustment.
         try:

@@ -19,6 +19,7 @@ TikTok Heart is a Windows desktop control app for a local TikTok worker. It keep
 - Worker controls: start, stop, restart, pause, reset flags, self-test.
 - Windows Task Scheduler integration for startup and 12-hour runs.
 - Optional Telegram control bot.
+- Persistent queue for profile runs: one profile at a time, duplicate requests combined, scoped cancellation in Telegram and desktop controls. No periodic queue polling.
 - Authorization backups for the selected profile.
 - Public-safe source backups that exclude private runtime data.
 - Diagnostics, logs, launch readiness checks, and maintenance tools.
@@ -192,6 +193,7 @@ TikTok Heart - Windows-приложение для локального TikTok w
 - Управление Chromium-профилем worker.
 - Импорт авторизации TikTok из Google Chrome.
 - Профили, адресаты, пул сообщений, cooldown и streak-состояние.
+- Очередь запусков профилей с сохранением и отменой ожидания в приложении и Telegram. Следующий профиль запускается после завершения предыдущего, без частых фоновых проверок.
 - Управление worker: запуск, остановка, перезапуск, пауза, сброс флагов, self-test.
 - Автозапуск Windows и запуск каждые 12 часов через Task Scheduler.
 - Опциональный Telegram-бот для управления.

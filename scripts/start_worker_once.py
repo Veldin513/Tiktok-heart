@@ -209,20 +209,27 @@ def main() -> int:
         return 0 if result.get("ok") else 2
 
     status = adapter.get_worker_status()
-    if status.running:
+    state = adapter.get_control_state()
+    def resume_queue():
+        resume = getattr(adapter, 'resume_worker_queue', None)
+        if resume:
+            resume()
+    running_profile = adapter._running_worker_profile(status) if status.running else None
+    if status.running and running_profile in (None, state.get('active_profile')):
+        resume_queue()
         print_lifecycle("skip_worker_running", pid=status.pid)
         return 0
-
-    state = adapter.get_control_state()
     def report_blocked(reason: str) -> None:
         notify_worker_result(adapter, {'profile_name': state.get('active_profile'), 'results': []},
                              status='failed', reason=reason)
+        resume_queue()
 
     if state.get('paused') or state.get('stop_requested'):
         print_lifecycle('skip_control_flag', paused=bool(state.get('paused')), stop_requested=bool(state.get('stop_requested')))
         return 0
     active = next((profile for profile in adapter.get_profiles() if profile.key == state.get('active_profile')), None)
     if active is not None and not active.enabled:
+        resume_queue()
         print_lifecycle('skip_profile_disabled')
         return 0
     profile_root = adapter._bot_profile_root()
@@ -254,6 +261,7 @@ def main() -> int:
     if not boot_force:
         queue, _waited_for_cooldown = wait_for_near_cooldown(adapter, queue)
     if not boot_force and int(queue.get("target_count") or 0) > 0 and int(queue.get("ready_count") or 0) == 0:
+        resume_queue()
         if int(queue.get('cooldown_count') or 0) < int(queue.get('target_count') or 0):
             report_blocked('delivery_unconfirmed')
         wait_seconds = int(queue.get("next_send_in_s") or 0)

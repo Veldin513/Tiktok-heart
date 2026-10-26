@@ -136,6 +136,8 @@ class WorkerStatus:
     pid: int | None
     started_at: float | None = None
     command: list[str] | None = None
+    queued: bool = False
+    queue_position: int | None = None
 
 
 class ProjectAdapter:
@@ -2075,7 +2077,10 @@ class ProjectAdapter:
         }
 
     def set_paused(self, value: bool) -> dict[str, Any]:
-        return self.update_control_state({"paused": bool(value)})
+        result = self.update_control_state({"paused": bool(value)})
+        if not value:
+            self.resume_worker_queue()
+        return result
 
     def set_dry_run(self, value: bool) -> dict[str, Any]:
         return self.update_control_state({"dry_run": bool(value)})
@@ -2529,10 +2534,14 @@ class ProjectAdapter:
             return self._start_worker_locked()
 
     def _start_worker_locked(self) -> WorkerStatus:
-        status = self.get_worker_status()
-        if status.running:
-            return status
-        return self._start_worker_profile(self._active_profile_name())
+        return self._start_profile_worker_locked(self._active_profile_name())
+
+    def worker_queue(self):
+        from yara_app.worker_queue import WorkerQueue
+        return WorkerQueue(self)
+
+    def resume_worker_queue(self):
+        return self.worker_queue().kick()
 
     def _running_worker_profile(self, status: WorkerStatus) -> str | None:
         if not status.running or not status.pid or psutil is None:
@@ -2551,11 +2560,11 @@ class ProjectAdapter:
         status = self.get_worker_status()
         return status if self._running_worker_profile(status) == profile_key else WorkerStatus(running=False, pid=None)
 
-    def start_profile_worker(self, profile_key: str, *, ignore_cooldown: bool = False) -> WorkerStatus:
+    def start_profile_worker(self, profile_key: str, *, ignore_cooldown: bool = False, requester_id: int | None = None) -> WorkerStatus:
         with file_lock(self.control_dir / 'worker_launch'):
-            return self._start_profile_worker_locked(profile_key, ignore_cooldown=ignore_cooldown)
+            return self._start_profile_worker_locked(profile_key, ignore_cooldown=ignore_cooldown, requester_id=requester_id)
 
-    def _start_profile_worker_locked(self, profile_key: str, *, ignore_cooldown: bool = False) -> WorkerStatus:
+    def _start_profile_worker_locked(self, profile_key: str, *, ignore_cooldown: bool = False, requester_id: int | None = None) -> WorkerStatus:
         profile = next((item for item in self.get_profiles() if item.key == profile_key), None)
         if profile is None:
             raise ValueError('Профиль не найден.')
@@ -2563,11 +2572,17 @@ class ProjectAdapter:
             raise ValueError('Администратор отключил этот профиль.')
         if self.get_control_state().get('paused'):
             raise ValueError('Администратор включил общую паузу. Запуск сейчас недоступен.')
+        queue = self.worker_queue()
+        queue.authorize(profile_key, requester_id)
         status = self.get_worker_status()
-        if status.running:
-            if self._running_worker_profile(status) == profile_key:
-                return status
-            raise RuntimeError('Сейчас работает другой профиль. Дождитесь завершения; чужой запуск не остановлен.')
+        if status.running and self._running_worker_profile(status) == profile_key:
+            return status
+        queue_data = queue.read()
+        if status.running or queue_data['waiting'] or queue_data.get('current'):
+            position = queue.enqueue_locked(profile, ignore_cooldown=ignore_cooldown, requester=requester_id)
+            if not queue.kick():
+                raise RuntimeError('Заявка сохранена, но очередь не запустилась. Обновите приложение.')
+            return WorkerStatus(running=False, pid=None, queued=True, queue_position=position)
         return self._start_worker_profile(profile_key, ignore_cooldown=ignore_cooldown)
 
     def stop_profile_worker(self, profile_key: str) -> WorkerStatus:
@@ -2575,19 +2590,22 @@ class ProjectAdapter:
             return self._stop_profile_worker_locked(profile_key)
 
     def _stop_profile_worker_locked(self, profile_key: str) -> WorkerStatus:
+        removed = self.worker_queue().cancel(profile_key)
         status = self.get_worker_status()
         if not status.running:
             return status
         if self._running_worker_profile(status) != profile_key:
+            if removed:
+                return WorkerStatus(running=False, pid=None)
             raise RuntimeError('Работает другой профиль. Его запуск не остановлен.')
         return self.stop_worker()
 
-    def _start_worker_profile(self, active_profile: str, *, ignore_cooldown: bool = False) -> WorkerStatus:
+    def _start_worker_profile(self, active_profile: str, *, ignore_cooldown: bool = False, boot_force: bool = False) -> WorkerStatus:
         if not self.main_script_path.exists():
             raise FileNotFoundError(f"Main script not found: {self.main_script_path}")
 
         if (self._bot_profile_root(active_profile) / 'browser' / LOGIN_PENDING).exists():
-            raise RuntimeError('Завершите ручной вход: закройте отдельный Chrome и нажмите «Проверить вход».')
+            raise RuntimeError('Завершите ручной вход в TikTok и нажмите запуск ещё раз.')
         profile = next((item for item in self.get_profiles() if item.key == active_profile), None)
         if profile is None or not profile.enabled:
             raise ValueError('Профиль не найден или отключён администратором.')
@@ -2596,6 +2614,8 @@ class ProjectAdapter:
         extra_args = [active_profile] if active_profile else []
         if ignore_cooldown:
             extra_args.append('--telegram-manual')
+        if boot_force:
+            extra_args.append('--startup-cooldown')
         started = self._launch_python_process(
             script_path=self.main_script_path,
             stdout_path=self.worker_stdout_path,
@@ -2675,8 +2695,10 @@ class ProjectAdapter:
         return {"worker": worker, "telegram": telegram}
 
     def stop_all(self) -> dict[str, WorkerStatus]:
-        telegram = self.stop_telegram_bot()
-        worker = self.stop_worker()
+        with file_lock(self.control_dir / 'worker_launch'):
+            self.worker_queue().cancel()
+            telegram = self.stop_telegram_bot()
+            worker = self.stop_worker()
         return {"worker": worker, "telegram": telegram}
 
     def restart_all(self) -> dict[str, WorkerStatus | None]:
@@ -2822,7 +2844,9 @@ class ProjectAdapter:
         self._clear_pid_file(self.telegram_lock_path)
 
     def reset_runtime_flags(self) -> dict[str, Any]:
-        return self.update_control_state({"stop_requested": False, "paused": False})
+        result = self.update_control_state({"stop_requested": False, "paused": False})
+        self.resume_worker_queue()
+        return result
 
     def app_metadata(self) -> dict[str, Any]:
         build_info = self._read_json(self.base_dir / "BUILD_INFO.json", {})
@@ -2849,6 +2873,7 @@ class ProjectAdapter:
         return {
             "app": self.app_metadata(),
             "mode": "live",
+            "worker_queue": self.worker_queue().snapshot(),
             "profile_login_confirmed": {profile.key: self.profile_login_confirmed(profile.key) for profile in profiles},
             "updated_at": time.time(),
             "base_dir": str(self.base_dir),
@@ -3486,6 +3511,7 @@ class ProjectAdapter:
             },
             "profile_login_confirmed": {profile.key: self.profile_login_confirmed(profile.key) for profile in profiles},
             "worker_schedule": worker_schedule,
+            "worker_queue": self.worker_queue().snapshot(),
             "profiles": {
                 "total": len(profiles),
                 "enabled": sum(1 for profile in profiles if profile.enabled),

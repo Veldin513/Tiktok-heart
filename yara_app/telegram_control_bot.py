@@ -114,6 +114,7 @@ class MenuBuilder:
                      [("💬 Сообщения", "nav:messages"), ("🧪 Диагностика", "nav:diag")],
                      [("🔑 Пользователи и права", "nav:access")]]
         rows.append([('❔ Как пользоваться', 'nav:help')])
+        rows.append([('📋 Очередь отправки', 'nav:queue')])
         return cls.inline(rows)
 
     @classmethod
@@ -430,6 +431,9 @@ class TelegramControlBot(TelegramLoginControls, PersonalProfileControls):
         route = parts[1]
         self.login.cancel(chat_id)
         self._clear_pending(chat_id)
+        if route == 'queue':
+            self._send_worker_queue(chat_id, message_id)
+            return
 
         if route == 'help':
             self._safe_edit_or_send(chat_id,
@@ -482,17 +486,17 @@ class TelegramControlBot(TelegramLoginControls, PersonalProfileControls):
                 if worker.running:
                     self.adapter.stop_worker()
                 else:
-                    self.adapter.start_profile_worker(self.adapter.get_control_state()['active_profile'], ignore_cooldown=True)
+                    self.adapter.start_profile_worker(self.adapter.get_control_state()['active_profile'], ignore_cooldown=True, requester_id=chat_id)
             elif op == "restart":
                 self.adapter.stop_worker()
-                self.adapter.start_profile_worker(self.adapter.get_control_state()['active_profile'], ignore_cooldown=True)
+                self.adapter.start_profile_worker(self.adapter.get_control_state()['active_profile'], ignore_cooldown=True, requester_id=chat_id)
             self._send_control(chat_id, message_id)
             return
 
         if target == "pause":
             state = self.adapter.get_control_state()
             paused = not bool(state.get("paused"))
-            self.adapter.update_control_state({"paused": paused})
+            self.adapter.set_paused(paused)
             self._send_control(chat_id, message_id)
             return
 
@@ -528,7 +532,7 @@ class TelegramControlBot(TelegramLoginControls, PersonalProfileControls):
 
         self._remember_chat(chat_id)
         fresh = self._answer_callback(query_id)
-        if not fresh and (data.startswith(('act:', 'access:', 'auth:')) or
+        if not fresh and (data.startswith(('act:', 'access:', 'auth:', 'q:')) or
                           (data.startswith('p:') and data.split(':')[2] != 'open')):
             self._safe_edit_or_send(chat_id, 'Эта кнопка нажата слишком давно. Выберите действие ещё раз.',
                                     MenuBuilder.main_inline(admin=self._is_admin(chat_id)), message_id)
@@ -546,6 +550,9 @@ class TelegramControlBot(TelegramLoginControls, PersonalProfileControls):
             return
         if data.startswith('auth:'):
             self._handle_login_callback(chat_id, data)
+            return
+        if data.startswith('q:'):
+            self._handle_worker_queue_callback(chat_id, message_id, data)
             return
         if data.startswith('p:'):
             self._handle_profile_callback(chat_id, message_id, data)

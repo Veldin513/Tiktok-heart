@@ -2077,3 +2077,4 @@ h1 {
     grid-template-columns: 1fr;
   }
 }
+.worker-queue-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; }

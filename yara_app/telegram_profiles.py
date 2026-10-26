@@ -104,7 +104,10 @@ class PersonalProfileControls:
         targets = targets or []
         lines = [notice, profile.label] if notice else [profile.label]
         status = self.adapter.get_profile_worker_status(profile.key)
+        position = self.adapter.worker_queue().position(profile.key)
         lines.append('▶ Отправка выполняется' if status.running else '⏹ Отправка не запущена')
+        if position:
+            lines.append(f'📋 Место в очереди: {position}')
         pending_file = self.adapter._bot_profile_root(profile.key) / 'browser' / LOGIN_PENDING
         pending_login = pending_file.exists()
         pending_flow = (read_json(pending_file, {}) or {}).get('flow')
@@ -143,6 +146,7 @@ class PersonalProfileControls:
         else:
             rows.append([('🔐 Настройки входа', f'p:{token}:login_info')])
         rows += [
+            [('Убрать из очереди', f'p:{token}:stop')] if position and not status.running else
             [('⏹ Остановить отправку', f'p:{token}:stop')] if status.running else
             [('▶ Запустить отправку', f'p:{token}:start')],
             [('♻ Обновить профиль', f'p:{token}:open'), ('⬅ Профили', 'nav:recipients')],
@@ -190,11 +194,13 @@ class PersonalProfileControls:
             self.api.send_message(chat_id, 'Открываем вход…')
             return
         if action == 'start':
-            result = self.adapter.start_profile_worker(profile.key, ignore_cooldown=True)
-            text = '▶ Отправка запущена. Итог придёт сюда после завершения.' if result.running else '⚠ Отправка не запущена. Проверьте журнал в приложении.'
+            result = self.adapter.start_profile_worker(profile.key, ignore_cooldown=True, requester_id=chat_id)
+            text = (f'📋 Добавлено в очередь. Ваше место: {result.queue_position}. Запуск начнётся автоматически.'
+                    if getattr(result, 'queued', False) else '▶ Отправка запущена. Итог придёт сюда после завершения.'
+                    if result.running else '⚠ Отправка не запущена. Проверьте журнал в приложении.')
         elif action == 'stop':
             self.adapter.stop_profile_worker(profile.key)
-            text = '⏹ Отправка этого профиля остановлена.'
+            text = '⏹ Отправка этого профиля остановлена или убрана из очереди.'
         elif action == 'login':
             self.login.cancel(chat_id)
             if self.login.for_profile(profile.key):
@@ -225,6 +231,52 @@ class PersonalProfileControls:
             raise ValueError('Неизвестная кнопка. Обновите профиль.')
         profile = next(item for item in self.adapter.get_profiles() if item.key == profile.key)
         self._send_profile_panel(chat_id, profile, message_id, notice=text)
+
+    def _send_worker_queue(self, chat_id: int, message_id=None, notice=''):
+        snapshot = self.adapter.worker_queue().snapshot()
+        lines = [notice, '📋 Очередь отправки'] if notice else ['📋 Очередь отправки']
+        rows = []
+        if snapshot.get('error'):
+            lines.append(snapshot['error'])
+        if snapshot.get('paused'):
+            lines.append('Очередь на общей паузе.')
+        visible = [item for item in snapshot['waiting'] if self._can_access_profile(chat_id, item['profile'])]
+        for item in visible[:30]:
+            lines.append(f'{item["position"]}. {item["label"]}')
+            rows.append([(f'Отменить: {item["label"][:35]}', f'q:{profile_token(item["profile"])}:cancel')])
+        if not visible:
+            lines.append('Ваших ожидающих запусков нет.' if not self._is_admin(chat_id) else 'Ожидающих запусков нет.')
+        lines.append('Профили запускаются по очереди. Повторные нажатия не добавляют копий.')
+        if self._is_admin(chat_id):
+            rows += [[('Отменить все ожидающие', 'q:all:cancel')], [('Продолжить очередь', 'q:resume:run')]]
+        rows.append([('Обновить', 'nav:queue'), ('Главное меню', 'nav:main')])
+        self._safe_edit_or_send(chat_id, '\n'.join(lines), keyboard(rows), message_id)
+
+    def _handle_worker_queue_callback(self, chat_id, message_id, data):
+        parts = data.split(':')
+        if len(parts) != 3:
+            raise ValueError('Кнопка устарела. Откройте очередь заново.')
+        if parts[1] in {'all', 'resume'}:
+            if not self._is_admin(chat_id):
+                raise PermissionError('Это действие доступно только администратору.')
+            if parts[1] == 'all' and parts[2] == 'cancel':
+                self.adapter.worker_queue().cancel()
+                text = 'Ожидающие запуски отменены. Текущая отправка продолжается.'
+            elif parts[1] == 'resume' and parts[2] == 'run':
+                if self.adapter.get_control_state().get('paused'):
+                    raise ValueError('Сначала снимите общую паузу в управлении.')
+                if not self.adapter.resume_worker_queue():
+                    raise ValueError('Не удалось запустить очередь. Обновите приложение на компьютере.')
+                text = 'Очередь продолжена.'
+            else:
+                raise ValueError('Кнопка устарела.')
+        else:
+            profile = self._profile_by_token(chat_id, parts[1])
+            if parts[2] != 'cancel':
+                raise ValueError('Кнопка устарела.')
+            self.adapter.worker_queue().cancel(profile.key)
+            text = 'Ожидающий запуск отменён.'
+        self._send_worker_queue(chat_id, message_id, text)
 
     def _handle_profile_input(self, chat_id: int, text: str) -> bool:
         pending = self.pending_profile_inputs.get(chat_id)

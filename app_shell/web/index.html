@@ -324,7 +324,7 @@
               <div class="panel-title">Отправка</div>
               <div class="button-grid">
                 <button class="btn secondary" data-action="start_worker">Запустить</button>
-                <button class="btn secondary" data-action="stop_worker">Остановить</button>
+                <button class="btn secondary" data-action="stop_worker">Остановить текущую</button>
                 <button class="btn secondary" data-action="restart_worker">Перезапустить</button>
               </div>
             </article>
@@ -335,6 +335,15 @@
                 <button class="btn secondary" data-action="start_telegram">Включить кнопки Telegram</button>
                 <button class="btn secondary" data-action="stop_telegram">Выключить управление</button>
                 <button class="btn secondary" data-action="clear_telegram_lock">Снять зависшую блокировку</button>
+              </div>
+            </article>
+            <article class="panel span-2">
+              <div class="panel-title">Очередь отправки</div>
+              <p class="hint">Следующий профиль запустится сам после завершения предыдущего.</p>
+              <div id="worker-queue-list" class="list-block"></div>
+              <div class="button-grid">
+                <button id="worker-queue-resume" class="btn secondary">Продолжить очередь</button>
+                <button id="worker-queue-clear" class="btn secondary">Убрать все ожидающие</button>
               </div>
             </article>
             <article class="panel span-2">

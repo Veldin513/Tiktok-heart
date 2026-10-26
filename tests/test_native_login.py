@@ -17,6 +17,7 @@ from yara_app.project_adapter import ProjectAdapter, WorkerStatus
 @pytest.fixture
 def setup_login(tmp_path, monkeypatch):
     adapter = ProjectAdapter(tmp_path)
+    adapter.create_profile('main')
     adapter.update_control_state({'active_profile': 'main'})
     adapter.main_script_path.parent.mkdir(parents=True, exist_ok=True)
     adapter.main_script_path.touch()
@@ -121,7 +122,9 @@ def test_browser_lease_is_released_by_os_after_process_crash(tmp_path):
         'import sys; from pathlib import Path; from yara_app.native_login import acquire_browser_lease; '
         'lease=acquire_browser_lease(Path(sys.argv[1])); print("ready",flush=True); sys.stdin.readline()'
     )
-    child = subprocess.Popen([sys.executable, '-c', code, str(tmp_path)],
+    # Kill the actual interpreter, not the venv launcher which can leave its
+    # runtime child alive on Windows and does not simulate a holder crash.
+    child = subprocess.Popen([sys._base_executable, '-c', code, str(tmp_path)],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
         assert child.stdout.readline().strip() == 'ready'
