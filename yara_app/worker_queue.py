@@ -61,10 +61,18 @@ class WorkerQueue:
             return {'waiting': [], 'current': None, 'paused': True,
                     'error': 'Очередь не удалось прочитать. Данные сохранены; нужен администратор.'}
         labels = {p.key: p.label for p in self.adapter.get_profiles()}
+        state = self.adapter.get_control_state()
+        worker = self.adapter.get_worker_status()
+        current = None
+        if worker.running:
+            profile = self.adapter._running_worker_profile(worker) or state.get('last_run_profile')
+            if profile:
+                current = {'profile': profile, 'label': labels.get(profile, profile),
+                           'pid': worker.pid, 'started_at': worker.started_at}
         return {'waiting': [{'profile': item['profile'], 'label': labels.get(item['profile'], item['profile']),
                              'position': index + 1, 'created_at': item.get('created_at')}
                             for index, item in enumerate(data['waiting'])],
-                'current': data.get('current'), 'paused': bool(self.adapter.get_control_state().get('paused'))}
+                'current': current, 'paused': bool(state.get('paused') or state.get('stop_requested'))}
 
     def position(self, profile):
         return next((item['position'] for item in self.snapshot()['waiting'] if item['profile'] == profile), None)

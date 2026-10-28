@@ -6,7 +6,7 @@ import re
 
 _TOKEN = re.compile(r'(?i)(?:/bot)?\d{5,16}:[A-Za-z0-9_-]{20,}')
 _COOKIE = re.compile(r'(?i)\b(sessionid(?:_ss)?|sid_tt|sid_guard|ssid_ucp_v1|sid_ucp_v1|uid_tt(?:_ss)?|tt_csrf_token|access_key|msToken|ttwid)=([^\s;\"\x27&]+)')
-_SECRET_KEYS = {'token', 'tg_token', 'cookies', 'cookie', 'authorization', 'password', 'sessionid',
+_SECRET_KEYS = {'token', 'tg_token', 'cookies', 'cookie', 'authorization', 'password', 'sessionid', 'phrase', 'recovery_phrase', 'master_key',
                 'sessionid_ss', 'access_key', 'mstoken', 'tt_csrf_token', 'sid_tt'}
 
 

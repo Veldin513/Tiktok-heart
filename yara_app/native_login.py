@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,11 +30,22 @@ def mark_google_chrome(user_data_dir: Path) -> None:
 @dataclass
 class BrowserLease:
     fd: int | None
+    browser_dir: Path | None = None
 
     def release(self) -> None:
         if self.fd is not None:
-            os.close(self.fd)  # The OS releases the lock on normal exit or a crash.
-            self.fd = None
+            try:
+                if self.browser_dir is not None:
+                    from yara_app.profile_vault import seal_browser
+                    seal_browser(self.browser_dir)
+            except Exception:
+                logging.getLogger(__name__).error('Не удалось зашифровать профиль после закрытия. Исходные файлы сохранены.')
+                from yara_app.fileio import atomic_write_text
+                with suppress(OSError):
+                    atomic_write_text(self.browser_dir / '.vault-error.json', json.dumps({'error': 'Не удалось завершить защиту. Исходные файлы сохранены.'}))
+            finally:
+                os.close(self.fd)  # The OS also releases the lock on a crash.
+                self.fd = None
 
 
 def acquire_browser_lease(browser_dir: Path) -> BrowserLease:
@@ -54,7 +66,13 @@ def acquire_browser_lease(browser_dir: Path) -> BrowserLease:
     except OSError:
         os.close(fd)
         raise RuntimeError('Профиль браузера занят входом, проверкой или worker. Дождитесь завершения.') from None
-    return BrowserLease(fd)
+    try:
+        from yara_app.profile_vault import unseal_browser
+        unseal_browser(browser_dir)
+    except BaseException:
+        os.close(fd)
+        raise
+    return BrowserLease(fd, browser_dir)
 
 
 @contextmanager

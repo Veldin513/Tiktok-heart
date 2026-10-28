@@ -1377,6 +1377,22 @@ h1 {
   min-width: 0;
 }
 
+.profile-queue-panel { margin-bottom: 14px; }
+.section-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.section-heading .panel-title { margin-bottom: 4px; }
+.section-heading .hint { margin: 0; }
+.queue-actions, .profile-run-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.queue-help { margin-bottom: 0; }
+.profile-create-disclosure { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.profile-create-disclosure .profile-form { margin: 12px 0 0; }
+.profile-options { margin: 0; padding: 0; border: 0; font-size: 12px; align-self: center; }
+.profile-options > summary { padding: 8px 0; gap: 8px; }
+.profile-options[open] { flex-basis: 100%; }
+.profile-run-status { flex-shrink: 0; }
+.profile-top { flex-wrap: wrap; }
+.profile-queue-panel .worker-queue-row { border-top: 1px solid var(--line); }
+.profile-queue-panel .worker-queue-row.current { color: var(--green); }
+
 .profile-item,
 .target-item,
 .dependency-item,
@@ -1510,6 +1526,8 @@ h1 {
   background: var(--green-soft);
   color: var(--green);
 }
+
+.badge.info { background: var(--blue-soft); color: var(--blue); }
 
 .badge.warn {
   background: var(--amber-soft);

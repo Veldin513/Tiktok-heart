@@ -20,7 +20,8 @@
           <button class="nav-item active" data-view="overview">Обзор</button>
           <button class="nav-item" data-view="browser">Браузер</button>
           <button class="nav-item" data-view="messages">Сообщения</button>
-          <button class="nav-item" data-view="profiles">Профили</button>
+          <button class="nav-item" data-view="profiles">Профили и очередь</button>
+          <button class="nav-item" data-view="protection">Защита</button>
           <button class="nav-item" data-view="services" data-advanced-nav>Управление</button>
           <button class="nav-item" data-view="diagnostics" data-advanced-nav>Проверка</button>
           <button class="nav-item" data-view="logs" data-advanced-nav>Журнал</button>
@@ -76,7 +77,7 @@
             <article class="quick-card">
               <div class="panel-title">Быстрые действия</div>
               <div class="button-grid">
-                <button class="btn secondary" data-action="start_all">Запустить всё</button>
+                <button class="btn primary" data-go-view="profiles">Профили и очередь</button>
                 <button class="btn secondary" data-action="toggle_pause">Пауза</button>
                 <button class="btn danger" data-action="stop_all">Остановить всё</button>
               </div>
@@ -102,7 +103,7 @@
               <div class="metric-meta" id="schedule-card-meta">--</div>
             </article>
             <article class="metric-card">
-              <div class="metric-label">Очередь</div>
+              <div class="metric-label">Готовность адресатов</div>
               <div class="metric-value" id="queue-value">--</div>
               <div class="metric-meta" id="queue-meta">--</div>
             </article>
@@ -200,10 +201,24 @@
         </section>
 
         <section class="view" id="view-profiles">
+          <article class="panel profile-queue-panel">
+            <div class="section-heading">
+              <div><div class="panel-title">Очередь отправки</div><p id="worker-queue-status" class="hint" role="status">Загрузка…</p></div>
+              <div class="queue-actions">
+                <button id="worker-queue-pause" class="btn secondary" data-action="toggle_pause" hidden>Пауза отправки</button>
+                <button id="worker-queue-clear" class="btn secondary" hidden>Отменить ожидающие</button>
+              </div>
+            </div>
+            <div id="worker-queue-list" class="list-block"></div>
+            <p class="hint queue-help">Нажмите «Запустить» у профиля. Если другой уже работает, появится место в очереди. Следующий начнёт сам.</p>
+            <details id="worker-queue-recovery" class="inline-disclosure" hidden><summary>Очередь не продолжается?</summary><button id="worker-queue-resume" class="btn secondary">Повторить запуск очереди</button></details>
+          </article>
           <div class="content-grid">
             <article class="panel">
               <div class="panel-title">Профили</div>
-              <p class="hint">Создайте профиль, укажите получателя и войдите в TikTok.</p>
+              <div id="profiles-list" class="profile-list"></div>
+              <details id="create-profile-details" class="inline-disclosure profile-create-disclosure">
+              <summary>Новый профиль</summary>
               <form id="create-profile-form" class="profile-form">
                 <label class="field-label" for="new-profile-key">Название нового профиля</label>
                 <input id="new-profile-key" class="input" placeholder="Например: main" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}">
@@ -211,11 +226,15 @@
                 <button class="btn primary" type="submit">Создать профиль</button>
                 <p id="profile-create-status" class="hint" role="status" aria-live="polite"></p>
               </form>
-              <div id="profiles-list" class="profile-list"></div>
+              </details>
             </article>
             <article class="panel">
               <div class="panel-title">Адресаты</div>
               <p id="target-profile-caption" class="hint"></p>
+              <button id="profile-import-shortcut" class="btn secondary full" hidden>Войти в TikTok для этого профиля</button>
+              <div id="targets-list" class="target-list"></div>
+              <details id="add-target-details" class="inline-disclosure profile-create-disclosure">
+              <summary>Добавить адресата</summary>
               <form id="add-target-form" class="profile-form">
                 <label class="field-label" for="new-target-name">Имя в списке чатов TikTok</label>
                 <input id="new-target-name" class="input" placeholder="Имя собеседника, как в сообщениях" required maxlength="80">
@@ -224,8 +243,39 @@
                 <button class="btn primary" type="submit">Добавить адресата</button>
                 <p id="target-create-status" class="hint" role="status" aria-live="polite"></p>
               </form>
-              <button id="profile-import-shortcut" class="btn secondary full" hidden>Войти в TikTok для этого профиля</button>
-              <div id="targets-list" class="target-list"></div>
+              </details>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-protection">
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Защита профилей</div>
+              <p id="protection-status" class="hint" role="status">Загрузка…</p>
+              <p class="hint">Файлы браузера, список адресатов и копии входа хранятся зашифрованными. Для работы браузера профиль временно открывается, после закрытия защищается снова.</p>
+              <button id="protection-enable" class="btn primary">Включить защиту</button>
+              <button id="protection-recovery" class="btn secondary" hidden>Файл восстановления и фраза</button>
+              <div id="protection-recovery-result" hidden>
+                <p id="protection-recovery-path" class="hint"></p>
+                <label class="field-label" for="protection-phrase">Секретная фраза — сохраните отдельно от файла</label>
+                <textarea id="protection-phrase" class="input full" readonly rows="3" autocomplete="off" spellcheck="false"></textarea>
+                <p class="hint">Перенесите файл на флешку, а фразу — в менеджер паролей или на бумагу. После переустановки потребуются оба. Один адрес почты не открывает профили.</p>
+                <button id="protection-hide-phrase" class="btn secondary">Скрыть фразу</button>
+              </div>
+              <p class="hint">Ключ создаётся один раз для вашей учётной записи Windows. Обновление приложения его не меняет. Защита не скрывает открытый профиль от программ с полным доступом к вашему ПК.</p>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Восстановить прежний ключ</div>
+              <p class="hint">Выберите сохранённый файл и введите секретную фразу. Интернет и почта не нужны.</p>
+              <form id="protection-restore-form" class="profile-form" autocomplete="off">
+                <label class="field-label" for="protection-file">Файл восстановления</label>
+                <input id="protection-file" type="file" accept=".heart-recovery" required>
+                <label class="field-label" for="protection-restore-phrase">Секретная фраза</label>
+                <input id="protection-restore-phrase" class="input" type="password" required autocomplete="off" spellcheck="false">
+                <button class="btn secondary" type="submit">Восстановить доступ</button>
+              </form>
+              <p class="hint">Если приложение не открывается из-за потери ключа, запустите <strong>recover_profiles.vbs</strong> в папке проекта. Восстановление ключа не гарантирует, что TikTok сохранит вход после переустановки Windows.</p>
             </article>
           </div>
         </section>
@@ -323,7 +373,7 @@
             <article class="panel">
               <div class="panel-title">Отправка</div>
               <div class="button-grid">
-                <button class="btn secondary" data-action="start_worker">Запустить</button>
+                <button class="btn secondary" data-go-view="profiles">Открыть профили и очередь</button>
                 <button class="btn secondary" data-action="stop_worker">Остановить текущую</button>
                 <button class="btn secondary" data-action="restart_worker">Перезапустить</button>
               </div>
@@ -335,15 +385,6 @@
                 <button class="btn secondary" data-action="start_telegram">Включить кнопки Telegram</button>
                 <button class="btn secondary" data-action="stop_telegram">Выключить управление</button>
                 <button class="btn secondary" data-action="clear_telegram_lock">Снять зависшую блокировку</button>
-              </div>
-            </article>
-            <article class="panel span-2">
-              <div class="panel-title">Очередь отправки</div>
-              <p class="hint">Следующий профиль запустится сам после завершения предыдущего.</p>
-              <div id="worker-queue-list" class="list-block"></div>
-              <div class="button-grid">
-                <button id="worker-queue-resume" class="btn secondary">Продолжить очередь</button>
-                <button id="worker-queue-clear" class="btn secondary">Убрать все ожидающие</button>
               </div>
             </article>
             <article class="panel span-2">

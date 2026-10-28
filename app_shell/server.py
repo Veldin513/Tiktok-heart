@@ -259,8 +259,13 @@ class AppShellHandler(BaseHTTPRequestHandler):
         timestamp = time.strftime("%H:%M:%S")
         print(f"[{timestamp}] {self.address_string()} {fmt % args}")
 
-    def _send_json(self, payload: Any, status: int = 200) -> None:
-        body = json.dumps(redact_value(json_ready(payload)), ensure_ascii=False, indent=2).encode("utf-8")
+    def _send_json(self, payload: Any, status: int = 200, *, recovery_phrase: bool = False) -> None:
+        safe = redact_value(json_ready(payload))
+        if recovery_phrase:
+            # Only the explicit, origin-checked local recovery POST may reveal
+            # this field. Diagnostics and ordinary JSON keep redacting it.
+            safe['data']['phrase'] = payload['data']['phrase']
+        body = json.dumps(safe, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -382,6 +387,13 @@ class AppShellHandler(BaseHTTPRequestHandler):
                 if parsed.path == '/api/worker-queue':
                     self._send_json({'ok': True, 'data': self.adapter.worker_queue().snapshot()})
                     return
+                if parsed.path == '/api/protection':
+                    from yara_app.profile_keys import ProfileProtection
+                    self._send_json({'ok': True, 'data': ProfileProtection(self.adapter.base_dir).status()})
+                    return
+                if parsed.path.startswith('/api/protection/'):
+                    self._send_json({'ok': False, 'error': 'Используйте кнопки в разделе «Защита».'}, status=405)
+                    return
                 if parsed.path == "/api/schedule":
                     self._send_json({"ok": True, "data": self.adapter.get_worker_schedule_status()})
                     return
@@ -418,6 +430,23 @@ class AppShellHandler(BaseHTTPRequestHandler):
             try:
                 payload = read_json_body(self)
                 self._clear_diagnostics_cache()
+                if parsed.path.startswith('/api/protection/'):
+                    from yara_app.profile_keys import ProfileProtection
+                    from yara_app.profile_vault import enable_protection
+                    protection = ProfileProtection(self.adapter.base_dir)
+                    if parsed.path == '/api/protection/enable':
+                        result = enable_protection(self.adapter)
+                    elif parsed.path == '/api/protection/recovery':
+                        self._send_json({'ok': True, 'data': protection.recovery()}, recovery_phrase=True)
+                        return
+                    elif parsed.path == '/api/protection/restore':
+                        if self.adapter.get_worker_status().running or self.adapter.get_telegram_bot_status().running:
+                            raise ValueError('Сначала остановите отправку и управление Telegram.')
+                        result = protection.restore(payload.get('package') or {}, str(payload.get('phrase') or ''))
+                    else:
+                        raise ValueError('Неизвестное действие защиты.')
+                    self._send_json({'ok': True, 'data': result})
+                    return
                 if parsed.path.startswith('/api/login/'):
                     action = parsed.path.rsplit('/', 1)[-1]
                     sid = str(payload.get('id') or '')
@@ -704,6 +733,18 @@ class AppShellHandler(BaseHTTPRequestHandler):
             result = self.adapter.set_active_profile_key(profile_key) if profile_key else self.adapter.set_active_profile(index)
         elif action == "toggle":
             result = self.adapter.toggle_profile_key(profile_key) if profile_key else self.adapter.toggle_profile(index)
+        elif action == 'start':
+            if not profile_key:
+                raise ValueError('Выберите профиль для отправки.')
+            result = self.adapter.start_profile_worker(profile_key)
+        elif action == 'stop':
+            if not profile_key:
+                raise ValueError('Выберите профиль для остановки.')
+            result = self.adapter.stop_profile_worker(profile_key)
+        elif action == 'cancel_queue':
+            if not profile_key:
+                raise ValueError('Выберите профиль для отмены ожидания.')
+            result = {'removed': self.adapter.worker_queue().cancel(profile_key)}
         else:
             raise ValueError(f"Unknown profile action: {action}")
         self._send_json({"ok": True, "data": result})
@@ -885,6 +926,8 @@ def main() -> int:
         server = ThreadingHTTPServer(("127.0.0.1", port), AppShellHandler)
         url = f"http://127.0.0.1:{port}/"
         write_server_state(port, url)
+        from yara_app.profile_vault import seal_idle_profiles
+        seal_idle_profiles(AppShellHandler.adapter)
         state = AppShellHandler.adapter.get_control_state()
         if not state.get('paused') and not state.get('stop_requested'):
             try:

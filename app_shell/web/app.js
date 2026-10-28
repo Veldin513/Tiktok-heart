@@ -303,6 +303,7 @@ function renderDiagnostics(diag) {
 
 function renderLiveStatus(diag, options = {}) {
   renderWorkerQueue(diag.worker_queue || {});
+  renderProfileRunControls(diag);
   renderProfileLoginShortcut(diag);
   const worker = diag.worker || {};
   const telegram = diag.telegram_bot || {};
@@ -561,41 +562,42 @@ function renderProfiles(diag) {
   }
   const selectedProfile = profiles.find((profile) => profile.key === state.selectedProfileKey) || activeProfile;
   renderProfileLoginShortcut(diag);
-  $("#target-profile-caption").textContent = `Адресаты профиля: ${selectedProfile.label || selectedProfile.key}. Для работы нажмите «Использовать» у нужного профиля.`;
+  $("#target-profile-caption").textContent = `Профиль: ${selectedProfile.label || selectedProfile.key}`;
 
   profilesBox.innerHTML = profiles.map((profile) => {
     const selected = profile.key === selectedProfile.key;
     const targetCount = Number(profile.target_count || (profile.targets || []).length || 0);
-    const flags = [
-      profile.active ? `<span class="badge ok">активен</span>` : "",
-      profile.supports_enabled ? (profile.enabled ? `<span class="badge ok">включён</span>` : `<span class="badge warn">выключен</span>`) : "",
-    ].filter(Boolean).join(" ");
-    const selectLabel = selected ? "Открыт" : "Открыть";
     const activateControl = profile.active
-      ? `<span class="badge ok">текущий профиль</span>`
-      : `<button class="btn secondary" data-profile-action="set_active" data-profile-key="${escapeHtml(profile.key)}" data-index="${Number(profile.index || 0)}">Использовать</button>`;
+      ? `<span class="badge">Выбран для расписания</span>`
+      : `<button class="btn secondary" data-profile-action="set_active" data-profile-key="${escapeHtml(profile.key)}">Выбрать для расписания</button>`;
     const toggleControl = !profile.active && profile.supports_enabled
       ? `<button class="btn secondary" data-profile-action="toggle" data-profile-key="${escapeHtml(profile.key)}" data-index="${Number(profile.index || 0)}">${profile.enabled ? "Выключить" : "Включить"}</button>`
       : "";
     return `
-      <div class="profile-item ${profile.active ? "active" : ""} ${selected ? "selected" : ""}">
+      <div class="profile-item ${selected ? "selected" : ""}" data-profile-key="${escapeHtml(profile.key)}">
         <div class="profile-top">
           <div>
             <div class="profile-name">${escapeHtml(profile.label || profile.key)}</div>
-            <div class="profile-meta">${escapeHtml(profile.key)} · ${targetCount} адресатов</div>
+            <div class="profile-meta">Адресатов: ${targetCount}${profile.active ? " · По расписанию" : ""}</div>
           </div>
-          <div>${flags}</div>
+          <span class="badge profile-run-status"></span>
         </div>
         <div class="profile-actions">
-          <button class="btn secondary" data-profile-select="${escapeHtml(profile.key)}" ${selected ? "disabled" : ""}>${selectLabel}</button>
-          ${activateControl}
-          ${toggleControl}
+          <div class="profile-run-actions"></div>
+          <button class="btn secondary" data-profile-select="${escapeHtml(profile.key)}" ${selected ? "disabled" : ""}>Адресаты</button>
+          <details class="inline-disclosure profile-options"><summary>Настройки</summary><div class="profile-actions">${activateControl}${toggleControl}</div></details>
         </div>
       </div>
     `;
   }).join("");
+  renderProfileRunControls(diag);
 
   const targets = Array.isArray(selectedProfile.targets) ? selectedProfile.targets : [];
+  const addDetails = $("#add-target-details");
+  if (addDetails && addDetails.dataset.profile !== selectedProfile.key) {
+    addDetails.dataset.profile = selectedProfile.key;
+    addDetails.open = !targets.length;
+  }
   if (!targets.length) {
     targetsBox.innerHTML = `<div class="list-item">В профиле нет адресатов</div>`;
     return;
@@ -626,15 +628,39 @@ function renderProfiles(diag) {
         <div class="target-cooldown ${ready ? "ready" : ""}">
           <span style="width:${ready ? 100 : cooldownProgress}%"></span>
         </div>
-        <div class="target-actions">
+        <details class="inline-disclosure"><summary>Изменить серию или паузу</summary><div class="target-actions">
           <button class="btn secondary" data-target-action="reset_cooldown" data-unconfirmed="${unconfirmed}" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">${unconfirmed ? "Разрешить новую попытку" : "Сброс паузы"}</button>
           <button class="btn secondary" data-copy-text="${escapeHtml(target.url || target.name || "")}" data-copy-label="Ссылка на адресата">Скопировать ссылку</button>
           <input class="mini-input" type="number" min="0" step="1" value="${streak}" data-streak-input />
           <button class="btn secondary" data-target-action="set_streak" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">Серия</button>
-        </div>
+        </div></details>
       </div>
     `;
   }).join("");
+}
+
+function renderProfileRunControls(diag) {
+  const queue = diag.worker_queue || {};
+  const profiles = diag.profiles?.items || [];
+  for (const item of $$("#profiles-list .profile-item")) {
+    const key = item.dataset.profileKey;
+    const profile = profiles.find((p) => p.key === key);
+    if (!profile) continue;
+    const waiting = (queue.waiting || []).find((p) => p.profile === key);
+    const running = queue.current?.profile === key;
+    const empty = !Number(profile.target_count || profile.targets?.length || 0);
+    const label = running ? "Выполняется" : waiting ? `В очереди · №${waiting.position}` : !profile.enabled ? "Отключён" : empty ? "Нет адресата" : "Не запущен";
+    const badge = item.querySelector(".profile-run-status");
+    badge.textContent = label;
+    badge.className = `badge profile-run-status ${running ? "ok" : waiting ? "info" : ""}`;
+    const action = running ? "stop" : waiting ? "cancel_queue" : "start";
+    const buttonText = running ? "Остановить" : waiting ? "Отменить ожидание" : queue.current || queue.waiting?.length ? "В очередь" : "Запустить";
+    const disabled = action === "start" && (!profile.enabled || empty || queue.paused || queue.error);
+    const reason = empty ? "Добавьте адресата" : queue.paused ? "Снимите общую паузу" : !profile.enabled ? "Включите профиль в его настройках" : "";
+    const html = `<button class="btn ${action === "start" ? "primary" : "secondary"}" data-profile-action="${action}" data-profile-key="${escapeHtml(key)}" title="${escapeHtml(disabled ? reason : buttonText)}" ${disabled ? "disabled" : ""}>${buttonText}</button>`;
+    const actions = item.querySelector(".profile-run-actions");
+    if (actions.dataset.content !== html) { actions.innerHTML = html; actions.dataset.content = html; }
+  }
 }
 
 function renderDiagnosticsPanel(diag) {
@@ -1486,6 +1512,11 @@ function bindTelegramSettings() {
 }
 
 function activateView(view) {
+  if (view !== "protection") {
+    $("#protection-phrase").value = "";
+    $("#protection-restore-phrase").value = "";
+    $("#protection-recovery-result").hidden = true;
+  }
   if (state.uiMode === "simple" && isAdvancedView(view)) {
     view = "overview";
   }
@@ -1500,6 +1531,7 @@ function activateView(view) {
   if (view === "messages") {
     loadMessages().catch((error) => toast(error.message));
   }
+  if (view === "protection") loadProtection().catch((error) => toast(error.message));
   if (view === "services" && !state.telegramLoaded) {
     loadTelegramSettings().catch((error) => toast(error.message));
   }
@@ -1512,16 +1544,24 @@ function renderWorkerQueue(queue) {
   const box = $("#worker-queue-list");
   if (!box) return;
   box.replaceChildren();
-  if (queue.error || queue.paused) {
-    const note = document.createElement("p");
-    note.textContent = queue.error || "Очередь на общей паузе.";
-    box.append(note);
-  }
+  const current = queue.current;
   const entries = queue.waiting || [];
-  if (!entries.length) {
-    const empty = document.createElement("p");
-    empty.textContent = "Ожидающих запусков нет.";
-    box.append(empty);
+  $(".queue-help").hidden = Boolean(current || entries.length);
+  $("#worker-queue-status").textContent = queue.error || (queue.paused ? "Отправка на паузе. Ожидающие профили сохранены." : current ? `Сейчас: ${current.label || current.profile}. Ожидают: ${entries.length}.` : entries.length ? `Ожидают запуска: ${entries.length}.` : "Очередь пуста. Выберите профиль ниже и нажмите «Запустить».");
+  $("#worker-queue-clear").hidden = !entries.length;
+  $("#worker-queue-pause").hidden = !entries.length && !current && !queue.paused;
+  $("#worker-queue-pause").textContent = queue.paused ? "Продолжить отправку" : "Пауза отправки";
+  $("#worker-queue-recovery").hidden = !entries.length || Boolean(current) || queue.paused;
+  if (current) {
+    const row = document.createElement("div");
+    row.className = "worker-queue-row current";
+    const name = document.createElement("strong");
+    name.textContent = current.label || current.profile;
+    const status = document.createElement("span");
+    status.className = "badge ok";
+    status.textContent = "Выполняется";
+    row.append(name, status);
+    box.append(row);
   }
   for (const item of entries) {
     const row = document.createElement("div");
@@ -1669,6 +1709,7 @@ function bindNavigation() {
 }
 
 function bindActions() {
+  bindProtection();
   $("#worker-queue-clear").addEventListener("click", async () => {
     try {
       await api('/api/worker-queue/cancel', { method: 'POST', body: JSON.stringify({}) });
@@ -1696,7 +1737,8 @@ function bindActions() {
       state.selectedProfileKey = result.key;
       form.reset();
       await refresh({ full: true });
-      status.textContent = `Профиль ${result.key} создан. Добавьте адресата справа, затем перенесите вход.`;
+      $("#create-profile-details").open = false;
+      toast(`Профиль ${result.key} создан. Добавьте адресата и войдите в TikTok.`);
     } catch (error) { status.textContent = error.message; }
     finally { button.disabled = false; }
   });
@@ -1714,6 +1756,8 @@ function bindActions() {
       form.reset();
       await refresh({ full: true });
       status.textContent = `Адресат добавлен в профиль ${profileKey}.`;
+      $("#add-target-details").open = false;
+      toast("Адресат добавлен.");
     } catch (error) { status.textContent = error.message; }
     finally { button.disabled = false; }
   });
@@ -1844,7 +1888,8 @@ function bindActions() {
       if (result && result.key) {
         state.selectedProfileKey = result.key;
       }
-      toast(button.dataset.profileAction === "set_active" ? "Активный профиль изменён" : "Профиль обновлён");
+      const op = button.dataset.profileAction;
+      toast(op === "start" ? (result?.queued ? `Профиль в очереди. Место: ${result.queue_position}` : "Запуск начат. Результат появится в журнале.") : op === "stop" ? "Отправка профиля остановлена" : op === "cancel_queue" ? "Ожидание отменено" : op === "set_active" ? "Профиль выбран для расписания" : "Профиль обновлён");
       await refresh({ full: true });
     } catch (error) {
       toast(error.message);
@@ -2320,6 +2365,58 @@ function bindActions() {
       toast(error.message);
       updateSelectedBackupButton();
     }
+  });
+}
+
+async function loadProtection() {
+  const data = await api('/api/protection');
+  $("#protection-status").textContent = data.error || (data.enabled ? (data.problem_profiles ? `Защита требует внимания у ${data.problem_profiles} профилей. Исходные файлы сохранены.` : `Защита включена. Код ключа: ${data.key_id || "—"}.`) : "Защита пока выключена. Сначала остановите отправку и управление Telegram.");
+  $("#protection-enable").hidden = data.enabled && (!data.problem_profiles || !data.key_available);
+  $("#protection-enable").textContent = data.enabled ? "Повторить защиту" : "Включить защиту";
+  $("#protection-recovery").hidden = !data.enabled || !data.key_available;
+}
+
+function bindProtection() {
+  const showRecovery = async () => {
+    const data = await api('/api/protection/recovery', { method: 'POST', body: '{}' });
+    $("#protection-recovery-path").textContent = `Файл сохранён: ${data.path}`;
+    $("#protection-phrase").value = data.phrase;
+    $("#protection-recovery-result").hidden = false;
+  };
+  $("#protection-enable").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const result = await api('/api/protection/enable', { method: 'POST', body: '{}' });
+      await loadProtection();
+      await showRecovery();
+      toast(result.errors?.length ? "Не все профили защищены. Проверьте журнал. Исходные файлы сохранены." : "Защита включена. Сохраните файл восстановления и секретную фразу.");
+      await refresh({ full: true });
+    } catch (error) { toast(error.message); }
+    finally { button.disabled = false; }
+  });
+  $("#protection-recovery").addEventListener("click", () => showRecovery().catch((error) => toast(error.message)));
+  $("#protection-hide-phrase").addEventListener("click", () => {
+    $("#protection-phrase").value = "";
+    $("#protection-recovery-result").hidden = true;
+  });
+  $("#protection-restore-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const input = $("#protection-restore-phrase");
+    const phrase = input.value;
+    input.value = "";
+    const button = event.currentTarget.querySelector('button');
+    button.disabled = true;
+    try {
+      const file = $("#protection-file").files[0];
+      if (!file || file.size > 65536) throw new Error('Выберите небольшой файл восстановления .heart-recovery.');
+      const packageData = JSON.parse(await file.text());
+      await api('/api/protection/restore', { method: 'POST', body: JSON.stringify({ package: packageData, phrase }) });
+      await loadProtection();
+      await refresh({ full: true });
+      toast("Прежний ключ восстановлен.");
+    } catch (error) { toast(error.message); }
+    finally { button.disabled = false; }
   });
 }
 

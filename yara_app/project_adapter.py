@@ -1444,6 +1444,9 @@ class ProjectAdapter:
         if (root / 'state' / 'session_import_required.json').exists() or (root / 'browser' / LOGIN_PENDING).exists():
             return False
         data = root / 'browser' / 'user_data'
+        from yara_app.profile_vault import browser_vault_status
+        if browser_vault_status(data.parent).get('sealed'):
+            return browser_vault_status(data.parent).get('cookies_exists', False)
         return (
             any((data / 'Default' / rel).is_file() for rel in ('Network/Cookies', 'Cookies'))
             and not browser_profile_needs_recovery(data)
@@ -1542,6 +1545,7 @@ class ProjectAdapter:
             "auth_backup_count": len(auth_backup_files),
             "latest_backups": backups,
             "latest_auth_backups": auth_backups,
+            **self._browser_vault_status(browser_dir),
         }
 
     def browser_profile_live_status(self, profile_key: str | None = None) -> dict[str, Any]:
@@ -1580,7 +1584,13 @@ class ProjectAdapter:
             "auth_backoff_left": self._auth_backoff_seconds_left(auth_backoff_path) if auth_backoff_path.exists() else 0,
             "backup_count": len(self._browser_backup_dirs(browser_dir)),
             "auth_backup_count": len(self._auth_backup_files(profile_root.name)),
+            **self._browser_vault_status(browser_dir),
         }
+
+    @staticmethod
+    def _browser_vault_status(browser_dir):
+        from yara_app.profile_vault import browser_vault_status
+        return browser_vault_status(browser_dir)
 
     def queue_snapshot(self, profile_key: str | None = None) -> dict[str, Any]:
         profiles = self.get_profiles()
@@ -2796,7 +2806,8 @@ class ProjectAdapter:
 
         modules = [
             ("playwright", True, "Нужен для браузера TikTok и авторизации."),
-            ("psutil", False, "Даёт тихое управление процессами без вспышек cmd."),
+            ("psutil", True, "Управляет процессами и очередью без вспышек cmd."),
+            ("cryptography", True, "Шифрует профили и восстанавливает прежний ключ."),
             ("requests", False, "Опционально: старый HTTP-клиент, рантайм умеет работать и без него."),
         ]
         items: list[dict[str, Any]] = []

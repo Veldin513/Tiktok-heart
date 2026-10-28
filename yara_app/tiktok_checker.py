@@ -949,6 +949,8 @@ def check_tiktok_streak() -> None:
                 duration_seconds=round(summary.duration_seconds, 2),
             )
         finally:
+            from yara_app.profile_vault import seal_idle_profiles
+            seal_idle_profiles(auth_coord_adapter, ACTIVE_PROFILE)
             try:
                 release_worker_run()
             finally:

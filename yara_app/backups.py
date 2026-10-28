@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from yara_app.project_adapter import ProjectAdapter
 
+from yara_app.profile_vault import MAGIC, is_encrypted, protect_backup, protected_zip, vault_path
+
 
 @contextmanager
 def restore_staging(base: Path):
@@ -123,12 +125,20 @@ class BackupService:
             }
 
         manifest: dict[str, Any] = {}
+        if not deep and is_encrypted(backup):
+            # Rendering the browser card must not decrypt multi-gigabyte
+            # backups. Full authentication/CRC checks happen before restore.
+            with backup.open('rb') as stream:
+                header = stream.read(len(MAGIC) + 32 + 12)
+            return {'ok': len(header) == len(MAGIC) + 44 and backup.stat().st_size >= len(header) + 16,
+                    'encrypted': True, 'verification': 'checked_before_restore', 'entry_count': 0,
+                    'blocked_count': 0, 'manifest_profile': profile_root.name}
         entries: list[dict[str, Any]] = []
         blocked: list[str] = []
         profile_entries = 0
         global_entries = 0
         try:
-            with zipfile.ZipFile(backup) as archive:
+            with protected_zip(self.adapter.base_dir, backup) as archive:
                 infos = archive.infolist()
                 if (len(infos) > 50000 or sum(info.file_size for info in infos) > 4 * 1024**3
                         or any(info.file_size > 1024**3 for info in infos)):
@@ -232,7 +242,7 @@ class BackupService:
         # replace each directory/file, retaining originals for rollback.
         with restore_staging(adapter.base_dir) as staging:
             replacements: dict[Path, Path] = {}
-            with zipfile.ZipFile(backup) as archive:
+            with protected_zip(self.adapter.base_dir, backup) as archive:
                 for info in archive.infolist():
                     name = info.filename
                     if info.is_dir() or name == 'BACKUP_MANIFEST.json':
@@ -636,6 +646,18 @@ class BackupService:
             }
             archive.writestr("BACKUP_MANIFEST.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             included_count += 1
+            browser = profile_root / 'browser'
+            if vault_path(browser).exists() and not (browser / 'user_data/Default').exists():
+                with protected_zip(adapter.base_dir, vault_path(browser), 'browser:' + profile_root.name) as source:
+                    for info in source.infolist():
+                        if info.is_dir() or not info.filename.startswith('user_data/'):
+                            continue
+                        if any(part in cache_dir_names for part in PurePosixPath(info.filename).parts):
+                            continue
+                        name = f'profiles/{profile_root.name}/browser/{info.filename}'
+                        with source.open(info) as inp, archive.open(name, 'w') as out:
+                            shutil.copyfileobj(inp, out, 1024 * 1024)
+                        included_count += 1
             for root in roots:
                 if not root.exists():
                     continue
@@ -650,6 +672,7 @@ class BackupService:
                 if add_file(archive, path):
                     included_count += 1
 
+        protect_backup(adapter.base_dir, target)
         return {
             "path": str(target),
             "name": target.name,

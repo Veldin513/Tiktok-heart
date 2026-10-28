@@ -96,8 +96,7 @@ def test_queue_panel_shows_order_and_cancel_does_not_launch_worker(login_server,
         page.on('pageerror', lambda error: errors.append(str(error)))
         try:
             page.goto(f'http://127.0.0.1:{port}/')
-            page.locator('#mode-toggle').click()
-            page.locator('[data-view="services"]').click()
+            page.locator('[data-view="profiles"]').click()
             box = page.locator('#worker-queue-list')
             box.get_by_text('1. alpha', exact=True).wait_for()
             assert box.get_by_text('2. beta', exact=True).is_visible()
@@ -105,9 +104,59 @@ def test_queue_panel_shows_order_and_cancel_does_not_launch_worker(login_server,
             box.get_by_text('1. beta', exact=True).wait_for()
             assert [j['profile'] for j in adapter.worker_queue().read()['waiting']] == ['beta']
             page.locator('#worker-queue-clear').click()
-            box.get_by_text('Ожидающих запусков нет.', exact=True).wait_for()
+            page.locator('#worker-queue-status').get_by_text('Отправка на паузе. Ожидающие профили сохранены.', exact=True).wait_for()
             assert not adapter.worker_queue().read()['waiting']
             assert not errors
+        finally:
+            browser.close()
+
+
+def test_profile_buttons_start_and_queue_exact_profiles_in_simple_mode(login_server, monkeypatch):
+    from playwright.sync_api import sync_playwright
+
+    from yara_app.project_adapter import WorkerStatus
+    from yara_app.worker_queue import WorkerQueue
+    port, _service = login_server
+    adapter = AppShellHandler.adapter
+    adapter.create_profile('beta')
+    for key in ['alpha', 'beta']:
+        adapter.add_target(key, key + '_friend', '@' + key + '_friend')
+    running = {'profile': None, 'starts': []}
+    initial_active = adapter.get_control_state()['active_profile']
+    monkeypatch.setattr(adapter, 'get_worker_status', lambda: WorkerStatus(bool(running['profile']), 123 if running['profile'] else None))
+    monkeypatch.setattr(adapter, '_running_worker_profile', lambda _s: running['profile'])
+    monkeypatch.setattr(WorkerQueue, 'kick', lambda _self: True)
+    def start(profile, **_options):
+        running['profile'] = profile
+        running['starts'].append(profile)
+        return adapter.get_worker_status()
+    monkeypatch.setattr(adapter, '_start_worker_profile', start)
+    with sync_playwright() as runtime:
+        browser = runtime.chromium.launch(channel='chrome', headless=True)
+        page = browser.new_page(viewport={'width': 1280, 'height': 850})
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        try:
+            page.goto(f'http://127.0.0.1:{port}/')
+            page.locator('[data-view="profiles"]').click()
+            alpha = page.locator('.profile-item[data-profile-key="alpha"]')
+            beta = page.locator('.profile-item[data-profile-key="beta"]')
+            alpha.get_by_role('button', name='Запустить', exact=True).click()
+            alpha.locator('.profile-run-status').get_by_text('Выполняется', exact=True).wait_for()
+            beta.get_by_role('button', name='В очередь', exact=True).click()
+            beta.locator('.profile-run-status').get_by_text('В очереди · №1', exact=True).wait_for()
+            assert 'beta' in page.locator('#worker-queue-list').inner_text()
+            assert 'alpha' in page.locator('#worker-queue-status').inner_text()
+            assert running['starts'] == ['alpha']
+            assert adapter.worker_queue().read()['waiting'][0]['profile'] == 'beta'
+            assert adapter.get_control_state()['active_profile'] == initial_active
+            assert page.locator('#create-profile-form').is_hidden()
+            assert page.locator('#worker-queue-status').bounding_box()['y'] < 300
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            beta.get_by_role('button', name='Отменить ожидание', exact=True).click()
+            beta.get_by_role('button', name='В очередь', exact=True).wait_for()
+            assert not adapter.worker_queue().read()['waiting']
+            assert running['profile'] == 'alpha' and not errors
         finally:
             browser.close()
 

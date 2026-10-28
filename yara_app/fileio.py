@@ -28,12 +28,19 @@ def read_text(path: Path, *, encoding: str = 'utf-8-sig') -> str:
 
 def read_json(path: Path, default=None):
     try:
-        return json.loads(read_text(path))
+        data = json.loads(read_text(path))
+        if path.name == 'profiles.json' and path.parent.name == 'control':
+            from yara_app.profile_keys import decode_profile_config
+            return decode_profile_config(path, data)
+        return data
     except FileNotFoundError:
         return default
 
 
 def atomic_write_text(path: Path, text: str, *, encoding: str = 'utf-8') -> None:
+    if path.name == 'profiles.json' and path.parent.name == 'control':
+        from yara_app.profile_keys import encode_profile_config
+        text = encode_profile_config(path, text)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(dir=str(path.parent), prefix='.' + path.name + '.', suffix='.tmp')
     temporary = path.with_name(os.path.basename(name))

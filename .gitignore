@@ -60,6 +60,8 @@ control/*.json
 
 # Runtime profile data
 profiles/*/browser/
+profiles/*/browser.heart-vault
+profiles/*/.vault_restore_*/
 profiles/*/artifacts/
 profiles/*/logs/
 profiles/*/state/
