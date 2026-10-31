@@ -102,25 +102,51 @@ class KeyStore:
     def __init__(self):
         custom = os.getenv('HEART_KEYS_DIR')
         local = os.getenv('LOCALAPPDATA')
-        if not custom and not local:
-            raise ProtectionError('Не найдена личная папка Windows для ключа.')
-        self.folder = Path(custom) if custom else Path(local) / 'TikTokHeart' / 'Keys'
+        # MSIX redirects LocalAppData for packaged parents. A key saved by an
+        # editor can therefore be invisible to the same user's scheduled task.
+        # Keep the canonical user store outside redirected AppData folders.
+        home = Path(os.getenv('USERPROFILE') or Path.home())
+        self.folder = Path(custom) if custom else home / '.tiktok-heart' / 'keys'
+        self.legacy_folders = [] if custom or not local else [Path(local) / 'TikTokHeart' / 'Keys']
 
     def _path(self, identity):
         if not isinstance(identity, str) or len(identity) != 32 or any(c not in '0123456789abcdef' for c in identity):
             raise ProtectionError('Идентификатор ключа повреждён. Используйте восстановление.')
         return self.folder / (identity + '.dpapi')
 
+    @staticmethod
+    def _read_record(path, identity):
+        if path.stat().st_size > 65536:
+            raise ValueError('size')
+        data = json.loads(dpapi(base64.b64decode(path.read_bytes(), validate=True), decrypt=True))
+        key = _unb64(data['key'], 32)
+        if key_id(key) != identity:
+            raise ValueError('identity')
+        return key, data
+
+    def _import_legacy(self, identity):
+        path = self._path(identity)
+        if path.exists():
+            return
+        with file_lock(self.folder / 'key_store'):
+            if path.exists():
+                return
+            for folder in self.legacy_folders:
+                previous = folder / path.name
+                if previous.is_file():
+                    # Check the original user-bound blob before copying it.
+                    # No new key, recovery phrase or ciphertext is generated.
+                    self._read_record(previous, identity)
+                    atomic_write_text(path, previous.read_text(encoding='ascii'))
+                    if not (self.folder / 'active.json').exists():
+                        atomic_write_text(self.folder / 'active.json', json.dumps({'key_id': identity}))
+                    return
+
     def load(self, identity):
         try:
             path = self._path(identity)
-            if path.stat().st_size > 65536:
-                raise ValueError('size')
-            data = json.loads(dpapi(base64.b64decode(path.read_bytes(), validate=True), decrypt=True))
-            key = _unb64(data['key'], 32)
-            if key_id(key) != identity:
-                raise ValueError('identity')
-            return key, data
+            self._import_legacy(identity)
+            return self._read_record(path, identity)
         except Exception:
             raise ProtectionError('Ключ недоступен. Он не будет заменён новым. Откройте восстановление профилей.') from None
 
@@ -136,6 +162,18 @@ class KeyStore:
     def ensure(self, identity=None):
         with file_lock(self.folder / 'key_store'):
             active = self.folder / 'active.json'
+            if identity is None and not active.exists():
+                for folder in self.legacy_folders:
+                    previous = folder / 'active.json'
+                    if previous.exists():
+                        try:
+                            identity = json.loads(previous.read_text(encoding='utf-8'))['key_id']
+                        except Exception:
+                            raise ProtectionError('Запись прежнего ключа повреждена. Новый ключ не создаётся.') from None
+                        break
+                if identity is None and (any(self.folder.glob('*.dpapi')) or any(
+                        any(folder.glob('*.dpapi')) for folder in self.legacy_folders)):
+                    raise ProtectionError('Найден прежний ключ без записи выбора. Используйте восстановление; новый ключ не создаётся.')
             if identity is None and active.exists():
                 try:
                     identity = json.loads(active.read_text())['key_id']
