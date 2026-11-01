@@ -16,6 +16,8 @@ TikTok Heart is a Windows desktop control app for a local TikTok worker. It keep
 - Chromium profile management for the worker session.
 - Import TikTok authorization from an existing Google Chrome profile.
 - Per-profile targets, message pool, cooldowns, and streak state.
+- Personal message lists in desktop and Telegram, with an explicit shared-list fallback. A one-off profile selection leaves the scheduled profile unchanged.
+- Delivery results distinguish TikTok confirmation, failure, and uncertainty; Telegram notification delivery is recorded separately.
 - Worker controls: start, stop, restart, pause, reset flags, self-test.
 - Windows Task Scheduler integration for startup and 12-hour runs.
 - Optional Telegram control bot.

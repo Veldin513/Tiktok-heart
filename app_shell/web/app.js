@@ -18,6 +18,10 @@ const state = {
   activeQueue: null,
   activeView: "overview",
   selectedProfileKey: null,
+  launchProfileKey: null,
+  messageScope: "",
+  messageRevision: null,
+  homeRequest: 0,
   messageLoaded: false,
   messageDirty: false,
   currentLogPath: "",
@@ -293,7 +297,7 @@ function renderDiagnostics(diag) {
   if (selectedBotProfile && browser.profile_key && selectedBotProfile !== browser.profile_key) {
     loadSelectedBrowserProfile().catch((error) => toast(error.message));
   }
-  if (!state.messageDirty) {
+  if (!state.messageDirty && !state.messageScope) {
     renderMessagesStats(diag.message_pool_details || {});
   }
   renderProfiles(diag);
@@ -528,12 +532,91 @@ async function loadMessages(force = false) {
   if (state.messageDirty && !force) return;
   const editor = $("#message-editor");
   if (!editor) return;
-  const data = await api("/api/message-pool");
+  const scope = state.messageScope;
+  const data = await api(scope ? `/api/profile-messages?profile_key=${encodeURIComponent(scope)}` : "/api/message-pool");
+  if (scope !== state.messageScope) return;
   editor.value = data.text || "";
   state.messageLoaded = true;
   state.messageDirty = false;
-  renderMessagesStats(data.stats || {});
+  $("#message-save").disabled = false;
+  state.messageRevision = data.revision || null;
+  renderMessagesStats(data.stats || messageStatsFromText(data.text || ""));
+  $("#message-use-shared").hidden = !scope;
+  $("#message-backup").hidden = Boolean(scope);
+  $("#message-source-hint").textContent = scope
+    ? (data.source === "personal" ? "У этого профиля свой текст. Остальные профили не изменятся."
+       : "Пока используется общий набор. Сохраните здесь свой текст для этого профиля.")
+    : "Общий набор используют профили без своего текста. Каждое сообщение — с новой строки.";
   $("#message-editor-state").textContent = "Загружено";
+}
+
+function renderProfileSelectors(diag) {
+  const profiles = diag.profiles?.items || [];
+  if (!profiles.length) return;
+  const options = profiles.map(p => `<option value="${escapeHtml(p.key)}">${escapeHtml(p.label || p.key)}</option>`).join("");
+  const launch = $("#launch-profile");
+  if (launch.dataset.options !== options) { launch.innerHTML = options; launch.dataset.options = options; }
+  if (!profiles.some(p => p.key === state.launchProfileKey)) state.launchProfileKey = diag.state?.active_profile || profiles[0].key;
+  launch.value = state.launchProfileKey;
+  const messages = $("#message-scope");
+  if (messages.dataset.options !== options) {
+    messages.innerHTML = '<option value="">Общий набор сообщений</option>' + options;
+    messages.dataset.options = options;
+    messages.value = state.messageScope;
+  }
+  const tg = $("#home-telegram");
+  tg.dataset.action = diag.telegram_bot?.running ? "stop_telegram" : "start_telegram";
+  tg.textContent = diag.telegram_bot?.running ? "Выключить Telegram" : "Включить Telegram";
+  tg.disabled = !diag.telegram_bot?.running && diag.telegram_ready === false;
+}
+
+async function loadHomeProfile() {
+  const key = state.launchProfileKey;
+  if (!key) return;
+  const request = ++state.homeRequest;
+  try {
+    const data = await api(`/api/profile-overview?profile_key=${encodeURIComponent(key)}`);
+    if (request !== state.homeRequest || key !== state.launchProfileKey) return;
+    $("#launch-readiness").textContent = data.readiness.label + (data.scheduled ? " · выбран для расписания" : "");
+    $("#launch-selected").disabled = data.readiness.kind !== "ok";
+    const result = data.run?.outcome;
+    const run = data.run || {};
+    const at = Number(run.completed_at || run.updated_at || 0);
+    const reason = run.reason || run.summary?.results?.find(item => item.success === false)?.reason || "";
+    const reasons = {
+      cooldown: "Ещё не прошла пауза до следующей отправки.",
+      chat_not_ready: "Чат TikTok не открылся. Отправка не начиналась.",
+      chat_blocked: "Чат не удалось открыть. Отправка не начиналась.",
+      chat_not_confirmed: "Не удалось проверить адресата. Отправка не начиналась.",
+      auth_failed: "Не удалось проверить вход в TikTok.",
+      session_import_required: "Нужно снова войти в TikTok.",
+      auth_check_inconclusive: "Страница TikTok не загрузилась для проверки.",
+      delivery_unconfirmed: "Перед повтором проверьте чат TikTok.",
+      send_failed: "Перед повтором проверьте чат TikTok.",
+      send_rejected: "TikTok отклонил сообщение.",
+      offline: "Не было соединения с интернетом.",
+      no_targets: "В профиле нет адресата.",
+      stop_requested: "Остановлено пользователем.",
+      paused: "Была включена пауза.",
+      dry_run: "Проверка без отправки.",
+    };
+    $("#home-last-result").textContent = reason === "cooldown" ? "Пропущено: ещё не прошла пауза"
+      : result?.label || "Запусков пока нет";
+    $("#home-last-meta").textContent = [at ? `Когда: ${formatDate(at)}` : "", reasons[reason] || ""].filter(Boolean).join(" · ");
+    $("#home-current-state").textContent = data.worker_running ? "Сейчас выполняется отправка."
+      : "Сейчас отправка не выполняется.";
+    $("#home-last-result").className = `result-${result?.kind || "info"}`;
+    const report = data.run?.notification;
+    $("#home-notification").textContent = report
+      ? (report.ok ? "Итог передан в Telegram" : report.reason === "disabled" || report.reason === "not_configured"
+        ? "Уведомления Telegram выключены или не настроены" : "Итог не дошёл в Telegram. Повторной отправки в TikTok не было.")
+        + (report.photos?.failed_count ? " Фото не дошло." : "")
+      : "";
+  } catch (error) {
+    if (request !== state.homeRequest) return;
+    $("#launch-selected").disabled = true;
+    $("#launch-readiness").textContent = error.message;
+  }
 }
 
 function renderProfileLoginShortcut(diag) {
@@ -585,7 +668,7 @@ function renderProfiles(diag) {
         <div class="profile-actions">
           <div class="profile-run-actions"></div>
           <button class="btn secondary" data-profile-select="${escapeHtml(profile.key)}" ${selected ? "disabled" : ""}>Адресаты</button>
-          <details class="inline-disclosure profile-options"><summary>Настройки</summary><div class="profile-actions">${activateControl}${toggleControl}</div></details>
+          <div class="profile-actions">${activateControl}${toggleControl}</div>
         </div>
       </div>
     `;
@@ -603,7 +686,7 @@ function renderProfiles(diag) {
     return;
   }
 
-  targetsBox.innerHTML = targets.map((target) => {
+  targetsBox.innerHTML = targets.map((target, index) => {
     const targetState = target.state || {};
     const unconfirmed = Boolean(targetState.delivery_unconfirmed);
     const ready = Boolean(targetState.ready);
@@ -628,12 +711,13 @@ function renderProfiles(diag) {
         <div class="target-cooldown ${ready ? "ready" : ""}">
           <span style="width:${ready ? 100 : cooldownProgress}%"></span>
         </div>
-        <details class="inline-disclosure"><summary>Изменить серию или паузу</summary><div class="target-actions">
+        <div class="target-actions">
           <button class="btn secondary" data-target-action="reset_cooldown" data-unconfirmed="${unconfirmed}" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">${unconfirmed ? "Разрешить новую попытку" : "Сброс паузы"}</button>
           <button class="btn secondary" data-copy-text="${escapeHtml(target.url || target.name || "")}" data-copy-label="Ссылка на адресата">Скопировать ссылку</button>
           <input class="mini-input" type="number" min="0" step="1" value="${streak}" data-streak-input />
           <button class="btn secondary" data-target-action="set_streak" data-profile-key="${escapeHtml(selectedProfile.key)}" data-target-name="${escapeHtml(target.name || target.url || "")}">Серия</button>
-        </div></details>
+          <button class="btn danger" data-remove-target="${index}" data-profile-key="${escapeHtml(selectedProfile.key)}">Удалить адресата</button>
+        </div>
       </div>
     `;
   }).join("");
@@ -778,7 +862,7 @@ function renderFocusPanel(diag = {}) {
   setText("#focus-next-meta", nextMeta);
   setText("#focus-blocker", blocker ? blocker.title || blocker.severity : "Блокеров нет");
   setText("#focus-blocker-meta", blocker ? blocker.details || "" : "Критичных действий сейчас нет.");
-  setText("#focus-last", runLabels[runStatus] || runStatus || (last ? last.event : "Результата пока нет"));
+  setText("#focus-last", run.outcome?.label || runLabels[runStatus] || runStatus || (last ? last.event : "Результата пока нет"));
   setText(
     "#focus-last-meta",
     runMeta || (last
@@ -795,14 +879,14 @@ function renderRunProgress(run = {}) {
   const percent = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0;
   runProgress.innerHTML = `
     <div class="progress-head">
-      <span>${escapeHtml(run.status || "idle")}</span>
+      <span>${escapeHtml(run.outcome?.label || "Ожидание отправки")}</span>
       <span>${percent}%</span>
     </div>
     <div class="progress-track"><span style="width:${percent}%"></span></div>
     <div class="progress-meta">
-      <span>ok: ${Number(run.success_count || 0)}</span>
-      <span>skip: ${Number(run.skipped_count || 0)}</span>
-      <span>fail: ${Number(run.failed_count || 0)}</span>
+      <span>Подтверждено: ${Number(run.outcome?.confirmed_count || 0)}</span>
+      <span>Пропущено: ${Number(run.skipped_count || 0)}</span>
+      <span>Ошибок: ${Number(run.failed_count || 0)}</span>
     </div>
   `;
 }
@@ -810,17 +894,18 @@ function renderRunProgress(run = {}) {
 function renderRunHistory(items = []) {
   const runHistory = $("#run-history");
   if (!runHistory) return;
-  const recent = Array.isArray(items) ? items.slice(-6).reverse() : [];
+  const historyState = state.diagnostics?.run_history_state || {};
+  const recent = Array.isArray(items) ? items.filter(item => !['lifecycle', 'phase_timing', 'notification_result'].includes(item.event)).slice(-6).reverse() : [];
   const visible = recent.length ? recent : [{ event: "empty", time: "--", reason: "Истории прогонов пока нет" }];
-  runHistory.innerHTML = visible.map((item) => {
-    const event = item.event || "event";
-    const ok = item.success === true || event === "run_finished";
-    const bad = item.success === false || event === "run_failed";
-    const kind = ok ? "ok" : bad ? "bad" : "info";
-    const title = item.target || event;
+  const warning = historyState.message ? `<p role="status">${escapeHtml(historyState.message)}</p>` : "";
+  runHistory.innerHTML = warning + visible.map((item) => {
+    const kind = item.outcome?.kind || "info";
+    const title = item.event === "empty"
+      ? (historyState.status === "unavailable" ? "История недоступна" : historyState.status === "partial" ? "История неполна" : "Отправок пока нет")
+      : [item.target, item.outcome?.label || "Запись истории"].filter(Boolean).join(" · ");
     const meta = [
       item.time || "--",
-      item.reason || "",
+      item.reason === 'chat_not_ready' ? 'Чат не открылся' : item.reason || "",
       item.duration_seconds ? `${item.duration_seconds}s` : "",
     ].filter(Boolean).join(" · ");
     return `
@@ -1285,6 +1370,8 @@ async function refresh(options = {}) {
     } else {
       renderDiagnostics(diag);
     }
+    renderProfileSelectors(state.diagnostics || diag);
+    if (state.activeView === "overview") await loadHomeProfile();
     if (state.activeView === "logs") {
       await loadLogs();
     }
@@ -1531,6 +1618,7 @@ function activateView(view) {
   if (view === "messages") {
     loadMessages().catch((error) => toast(error.message));
   }
+  if (view === "overview") loadHomeProfile().catch(error => toast(error.message));
   if (view === "protection") loadProtection().catch((error) => toast(error.message));
   if (view === "services" && !state.telegramLoaded) {
     loadTelegramSettings().catch((error) => toast(error.message));
@@ -1709,6 +1797,55 @@ function bindNavigation() {
 }
 
 function bindActions() {
+  $("#launch-profile").addEventListener("change", () => {
+    state.launchProfileKey = $("#launch-profile").value;
+    $("#launch-selected").disabled = true;
+    loadHomeProfile().catch(error => toast(error.message));
+  });
+  $("#launch-selected").addEventListener("click", async () => {
+    const button = $("#launch-selected");
+    button.disabled = true;
+    try {
+      const result = await api('/api/profile-action', { method: 'POST', body: JSON.stringify({action: 'start', profile_key: state.launchProfileKey}) });
+      toast(result.queued ? `В очереди: место ${result.queue_position}` : "Отправка запущена");
+      await refresh();
+    } catch (error) { toast(error.message); await loadHomeProfile(); }
+  });
+  $("#message-scope").addEventListener("change", async () => {
+    const selector = $("#message-scope");
+    if (state.messageDirty && !await confirmAction({title: "Текст не сохранён", message: "Перейти к другому профилю и убрать несохранённые изменения?", confirmLabel: "Перейти"})) {
+      selector.value = state.messageScope;
+      return;
+    }
+    state.messageScope = selector.value;
+    state.messageLoaded = false;
+    state.messageDirty = false;
+    state.messageRevision = null;
+    $("#message-editor").value = "";
+    $("#message-save").disabled = true;
+    await loadMessages(true).catch(error => toast(error.message));
+  });
+  $("#message-use-shared").addEventListener("click", async () => {
+    if (!state.messageScope) return;
+    if (!await confirmAction({title: "Вернуть общий набор?", message: "Свой текст этого профиля будет заменён общим набором.", confirmLabel: "Вернуть общий набор"})) return;
+    try {
+      await api('/api/profile-messages', {method:'POST', body:JSON.stringify({profile_key:state.messageScope, revision:state.messageRevision, use_shared:true})});
+      await loadMessages(true); toast("Профиль использует общий набор");
+    } catch (error) { toast(error.message); }
+  });
+  document.addEventListener("click", async event => {
+    const button = event.target.closest('[data-remove-target]');
+    if (!button) return;
+    const profile = state.diagnostics?.profiles?.items?.find(p => p.key === button.dataset.profileKey);
+    const index = Number(button.dataset.removeTarget);
+    const target = profile?.targets?.[index];
+    if (!target) return;
+    if (!await confirmAction({title: "Удалить адресата?", message: `Убрать ${target.name} из профиля ${profile.label || profile.key}? История сохранится.`, confirmLabel: "Удалить", danger:true})) return;
+    try {
+      await api('/api/target-action', {method:'POST', body:JSON.stringify({action:'remove', profile_key:profile.key, index, target_name:target.name, profile_url:target.url || null})});
+      await refresh({full:true}); toast("Адресат удалён");
+    } catch(error) { toast(error.message); }
+  });
   bindProtection();
   $("#worker-queue-clear").addEventListener("click", async () => {
     try {
@@ -1973,49 +2110,39 @@ function bindActions() {
   $("#message-save").addEventListener("click", async () => {
     const button = $("#message-save");
     button.disabled = true;
+    $("#message-scope").disabled = true;
     try {
-      const result = await api("/api/message-pool", {
+      const result = await api(state.messageScope ? "/api/profile-messages" : "/api/message-pool", {
         method: "POST",
         body: JSON.stringify({
           text: $("#message-editor").value,
+          profile_key: state.messageScope,
+          revision: state.messageRevision,
           backup: true,
           normalize: false,
         }),
       });
+      state.messageRevision = result.revision || null;
       state.messageLoaded = true;
       state.messageDirty = false;
       $("#message-editor-state").textContent = "Сохранено";
-      renderMessagesStats(result || {});
+      renderMessagesStats(state.messageScope ? messageStatsFromText(result.text || "") : result || {});
       toast("Сообщения сохранены");
       await refresh();
     } catch (error) {
       toast(error.message);
     } finally {
       button.disabled = false;
+      $("#message-scope").disabled = false;
     }
   });
 
   $("#message-normalize").addEventListener("click", async () => {
-    const button = $("#message-normalize");
-    button.disabled = true;
-    try {
-      await api("/api/message-pool", {
-        method: "POST",
-        body: JSON.stringify({
-          text: $("#message-editor").value,
-          backup: true,
-          normalize: true,
-        }),
-      });
-      state.messageDirty = false;
-      await loadMessages(true);
-      toast("Пул нормализован");
-      await refresh();
-    } catch (error) {
-      toast(error.message);
-    } finally {
-      button.disabled = false;
-    }
+    const editor = $("#message-editor");
+    editor.value = [...new Set(editor.value.split(/\r?\n/).map(line => line.trim()).filter(Boolean))].join("\n");
+    state.messageDirty = true;
+    renderMessagesStats(messageStatsFromText(editor.value));
+    $("#message-editor-state").textContent = "Повторы и пустые строки убраны. Нажмите «Сохранить».";
   });
 
   $("#message-backup").addEventListener("click", async () => {
@@ -2437,7 +2564,7 @@ function startQueueClock() {
     const left = nextAt ? Math.max(0, Math.round(nextAt - Date.now() / 1000)) : Number(queue.next_send_in_s || 0);
     const value = Number(queue.ready_count || 0) > 0 ? `${queue.ready_count} готово` : formatDuration(left);
     const meta = Number(queue.cooldown_count || 0) > 0
-      ? `${queue.cooldown_count} cooldown · ${queue.next_target || "ожидание"}`
+      ? `${queue.cooldown_count} ожидают · ${queue.next_target || "ожидание"}`
       : `${queue.target_count} адресатов · можно отправлять`;
     setPlainText("#queue-value", value);
     setPlainText("#queue-meta", meta);

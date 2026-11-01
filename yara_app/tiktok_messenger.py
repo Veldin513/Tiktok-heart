@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlparse
 
 from yara_app.auth_flow import explicitly_logged_out
 from yara_app.delivery import (
+    ChatNotReady,
     DeliveryRejected,
     DeliveryUnconfirmed,
     SendNotAttempted,
@@ -88,13 +89,52 @@ def _profile_handle(value: str) -> str:
     return handle.casefold() if handle and not any(c.isspace() or c in '/?#' for c in handle) else ''
 
 
+def _notice_kind(overlay) -> str:
+    """A backdrop alone is not evidence of a visible dialog."""
+    return overlay.evaluate('''node => {
+      const visible = el => {
+        if (!el || !el.getClientRects().length) return false;
+        for (let p = el; p; p = p.parentElement) {
+          const s = getComputedStyle(p);
+          if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+        }
+        return true;
+      };
+      if (!visible(node)) return 'decorative';
+      if (!node.matches('[role="dialog"]') && getComputedStyle(node).pointerEvents === 'none') return 'decorative';
+      const scope = node.parentElement;
+      const dialogs = [node, ...(scope ? scope.querySelectorAll('[role="dialog"], .TUXModal, .TUXModal-content') : [])];
+      return dialogs.some(el => visible(el) &&
+        (el.matches('[role="dialog"], .TUXModal, .TUXModal-content')) &&
+        (el.innerText.trim() || el.querySelector('button, input, iframe')))
+        ? 'dialog' : 'backdrop';
+    }''')
+
+
 def dismiss_chat_notice(page) -> None:
     """Dismiss only an explicit close/later control; never click consent/OK."""
     overlays = page.locator('.TUXModal-overlay:visible, [role="dialog"][aria-modal="true"]:visible')
+    # Portals and their backdrops can outlive a transition. Wait locally, without
+    # reloading TikTok or retrying a send, before declaring a real obstruction.
+    deadline = time.monotonic() + 2.0
+    while overlays.count() and time.monotonic() < deadline:
+        kinds = [_notice_kind(overlays.nth(i)) for i in range(min(overlays.count(), 20))]
+        if 'dialog' in kinds:
+            break
+        if all(kind == 'decorative' for kind in kinds):
+            return
+        _soft_wait(page, 150)
     for _ in range(2):
         if not overlays.count():
             return
-        overlay = overlays.first
+        candidates = [(overlays.nth(i), _notice_kind(overlays.nth(i))) for i in range(min(overlays.count(), 20))]
+        dialogs = [node for node, kind in candidates if kind == 'dialog']
+        if not dialogs:
+            if any(kind == 'backdrop' for _, kind in candidates):
+                raise ChatNotReady('Чат TikTok не открылся: страница ещё загружается или остался затемняющий слой. '
+                                   'Отправка не начиналась. Проверьте чат через «Браузер».')
+            return
+        overlay = dialogs[0]
         scopes = [overlay, overlay.locator('..')]
         closed = False
         for scope in scopes:
@@ -116,7 +156,7 @@ def dismiss_chat_notice(page) -> None:
                 'Всплывающее окно TikTok перекрывает чат. Закройте его вручную через отдельный Chrome '
                 'в разделе «Браузер», затем проверьте вход. Отправка не начиналась.'
             )
-    if overlays.count():
+    if any(_notice_kind(overlays.nth(i)) == 'dialog' for i in range(min(overlays.count(), 20))):
         raise SendNotAttempted('Всплывающее окно TikTok осталось открытым. Отправка не начиналась.')
 
 

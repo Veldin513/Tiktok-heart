@@ -119,6 +119,7 @@ class PersonalProfileControls:
         if not profile.enabled:
             lines.append('⏸ Профиль отключён администратором.')
         rows = []
+        rows.append([('✏ Мой текст', f'p:{token}:messages'), ('🕘 Последние отправки', f'p:{token}:history')])
         pages = max(1, (len(targets) + 7) // 8)
         page = min(max(0, page), pages - 1)
         for index, target in enumerate(targets[page * 8:page * 8 + 8], start=page * 8):
@@ -126,6 +127,8 @@ class PersonalProfileControls:
             lines.append(f'Адресат: {target.get("url") or target["name"]}; серия: {state["streak_count"]}')
             rows.append([(f'👤 Изменить адресата {index + 1}', f'p:{token}:target:{index}'),
                          (f'🔥 Серия {index + 1}', f'p:{token}:streak:{index}')])
+            fingerprint = hashlib.sha256(repr((target['name'], target.get('url'))).encode()).hexdigest()[:10]
+            rows.append([(f'Удалить адресата {index + 1}', f'p:{token}:remove:{index}:{fingerprint}')])
         pager = []
         if page:
             pager.append(('⬅ Адресаты', f'p:{token}:open:{page - 1}'))
@@ -165,6 +168,58 @@ class PersonalProfileControls:
         self._clear_pending(chat_id)
         if action == 'open':
             self._send_profile_panel(chat_id, profile, message_id, page=int(parts[3]) if len(parts) == 4 else 0)
+            return
+        if action == 'messages':
+            messages = self.adapter.get_profile_messages(profile.key)
+            self.pending_profile_inputs[chat_id] = {'profile': profile.key, 'action': 'messages',
+                'revision': messages['revision'], 'created_at': time.time()}
+            source = 'свой текст' if messages['source'] == 'personal' else 'общий набор'
+            self._safe_edit_or_send(chat_id, f'{profile.label}\nСейчас: {source}.\n'
+                'Пришлите свой текст. Для нескольких вариантов — каждое сообщение с новой строки.\n'
+                'Изменится только этот профиль.', keyboard([
+                    [('Использовать общий набор', f'p:{parts[1]}:shared_messages')],
+                    [('↩ Отмена', 'input:cancel')]]), message_id)
+            return
+        if action == 'shared_messages':
+            current = self.adapter.get_profile_messages(profile.key)
+            self.adapter.save_profile_messages(profile.key, use_shared=True, expected_revision=current['revision'])
+            self._send_profile_panel(chat_id, profile, message_id, notice='✅ Используется общий набор сообщений.')
+            return
+        if action == 'history':
+            history = self.adapter.get_run_history_snapshot(profile.key, limit=100)
+            items = [item for item in history['items'] if item.get('event') == 'target_result'][-6:]
+            lines = [profile.label, 'Последние отправки приложения']
+            if history.get('message'):
+                lines.append(history['message'])
+            for item in reversed(items):
+                result = item['outcome']
+                lines.append(f"{item.get('time') or ''} · {item.get('target') or ''}: {result['label']}")
+                if result['code'] == 'accepted' and item.get('message'):
+                    lines.append(str(item['message'])[:400])
+            if not items:
+                lines.append('Записей отправки пока нет.' if history['status'] == 'empty' else 'В доступной части истории записей отправки нет.')
+            self._safe_edit_or_send(chat_id, '\n'.join(lines)[:3800],
+                keyboard([[('⬅ К профилю', f'p:{parts[1]}:open')]]), message_id)
+            return
+        if action in {'remove', 'delete'}:
+            if len(parts) != 5 or not parts[3].isdigit():
+                raise ValueError('Откройте профиль заново.')
+            index = int(parts[3])
+            targets = profile.raw.get('targets') or []
+            if index >= len(targets):
+                raise ValueError('Адресат уже удалён. Обновите профиль.')
+            target = targets[index]
+            fingerprint = hashlib.sha256(repr((target['name'], target.get('url'))).encode()).hexdigest()[:10]
+            if fingerprint != parts[4]:
+                raise ValueError('Адресат изменён. Откройте профиль заново.')
+            if action == 'remove':
+                self._safe_edit_or_send(chat_id, f"Убрать {target['name']} из профиля? История сохранится.",
+                    keyboard([[('Удалить', f'p:{parts[1]}:delete:{index}:{fingerprint}')],
+                              [('↩ Отмена', f'p:{parts[1]}:open')]]), message_id)
+                return
+            self.adapter.remove_target(profile.key, index, expected_name=target['name'], expected_url=target.get('url'))
+            profile = next(p for p in self.adapter.get_profiles() if p.key == profile.key)
+            self._send_profile_panel(chat_id, profile, message_id, notice='✅ Адресат удалён.')
             return
         if action in {'target', 'streak'}:
             if len(parts) != 4 or not parts[3].isdigit():
@@ -292,7 +347,10 @@ class PersonalProfileControls:
             raise PermissionError('Доступ к этому профилю отозван.')
         if self.adapter.get_profile_worker_status(profile.key).running:
             raise ValueError('Сначала остановите worker этого профиля.')
-        if pending['action'] == 'streak':
+        if pending['action'] == 'messages':
+            self.adapter.save_profile_messages(profile.key, text, expected_revision=pending['revision'])
+            message = 'Свой текст сохранён.'
+        elif pending['action'] == 'streak':
             if not re.fullmatch(r'\d{1,7}', text) or int(text) > 1000000:
                 raise ValueError('Пришлите целое число от 0 до 1000000 или /cancel.')
             targets = profile.raw.get('targets') or []

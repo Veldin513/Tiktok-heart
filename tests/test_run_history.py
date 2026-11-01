@@ -122,3 +122,31 @@ def test_get_run_history_reads_recent_tail_without_partial_json_record(tmp_path:
     items = ProjectAdapter(tmp_path).get_run_history(limit=3)
 
     assert [item["index"] for item in items] == [297, 298, 299]
+
+
+def test_running_legacy_summary_is_not_verified_as_current_delivery(tmp_path: Path) -> None:
+    write_json(tmp_path / 'control/profiles.json', {'alpha': []})
+    write_json(tmp_path / 'control/control_state.json', {'active_profile': 'alpha'})
+    artifacts = tmp_path / 'profiles/alpha/artifacts'
+    write_json(artifacts / 'run_state.json', {'status': 'running'})
+    write_json(artifacts / 'run_summary.json', {
+        'success_count': 1, 'results': [{'success': True, 'confirmation': 'server_ack'}]})
+    run = ProjectAdapter(tmp_path).get_current_run_snapshot()
+    assert run['success_count'] == 1  # Keep legacy progress fields compatible.
+    assert run['delivery_verified'] is False
+    assert run['outcome']['code'] == 'running'
+
+
+def test_new_run_cannot_inherit_previous_success_or_telegram_report(tmp_path):
+    write_json(tmp_path / 'control/profiles.json', {'alpha': []})
+    write_json(tmp_path / 'control/control_state.json', {'active_profile': 'alpha'})
+    artifacts = tmp_path / 'profiles/alpha/artifacts'
+    write_json(artifacts / 'run_state.json', {'run_id': 'a' * 32, 'status': 'starting'})
+    write_json(artifacts / 'run_summary.json', {'run_id': 'b' * 32, 'success_count': 1,
+        'results': [{'success': True, 'confirmation': 'server_ack'}]})
+    write_json(artifacts / ('notification_' + 'b' * 32 + '.json'), {'run_id': 'b' * 32, 'notification': {'ok': True}})
+    run = ProjectAdapter(tmp_path).get_current_run_snapshot()
+    assert run['success_count'] == 0 and not run['delivery_verified']
+    assert run['notification'] is None
+    write_json(artifacts / ('notification_' + 'a' * 32 + '.json'), {'run_id': 'a' * 32, 'notification': {'ok': False}})
+    assert ProjectAdapter(tmp_path).get_current_run_snapshot()['notification'] == {'ok': False}

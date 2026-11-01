@@ -69,6 +69,37 @@ def add_recipient(bot, user_id, username):
     return key
 
 
+def test_personal_text_is_isolated_and_ownership_rechecked_on_submit(bot):
+    alice, bob = owned_key(bot, 200), owned_key(bot, 300)
+    before = bot.adapter.get_profile_messages(bob)
+    bot.process_update(callback(200, f'p:{profile_token(alice)}:messages'))
+    bot.process_update(message(200, 'My own text'))
+    assert bot.adapter.get_profile_messages(alice)['text'] == 'My own text'
+    assert bot.adapter.get_profile_messages(bob) == before
+    bot.process_update(callback(200, f'p:{profile_token(bob)}:messages'))
+    assert bot.adapter.get_profile_messages(bob) == before
+    bot.process_update(callback(200, f'p:{profile_token(alice)}:messages'))
+    config = json.loads(bot.adapter.telegram_config_path.read_text())
+    config['allowed_chat_ids'].remove(200)
+    bot.adapter.telegram_config_path.write_text(json.dumps(config))
+    bot.process_update(message(200, 'No longer allowed'))
+    assert bot.adapter.get_profile_messages(alice)['text'] == 'My own text'
+
+
+def test_telegram_delete_is_confirmed_and_old_button_cannot_delete_new_recipient(bot):
+    key = add_recipient(bot, 200, 'recipient')
+    profile = next(p for p in bot.adapter.get_profiles() if p.key == key)
+    bot._send_profile_panel(200, profile)
+    buttons = [b for row in bot.api.messages[-1][2]['inline_keyboard'] for b in row]
+    remove = next(b['callback_data'] for b in buttons if ':remove:' in b['callback_data'])
+    bot.process_update(callback(200, remove))
+    delete = bot.api.messages[-1][2]['inline_keyboard'][0][0]['callback_data']
+    assert next(p for p in bot.adapter.get_profiles() if p.key == key).raw['targets']
+    bot.adapter.update_target_recipient(key, 0, '@different', expected_name='recipient', expected_url='https://www.tiktok.com/@recipient')
+    bot.process_update(callback(200, delete))
+    assert len(next(p for p in bot.adapter.get_profiles() if p.key == key).raw['targets']) == 1
+
+
 def test_each_allowed_user_gets_one_profile_with_id_and_nick(bot):
     active = bot.adapter.get_control_state()['active_profile']
     alice = owned_key(bot, 200)

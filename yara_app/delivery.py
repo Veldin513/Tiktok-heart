@@ -27,6 +27,10 @@ class SendNotAttempted(RuntimeError):
     pass
 
 
+class ChatNotReady(SendNotAttempted):
+    reason = 'chat_not_ready'
+
+
 @dataclass(frozen=True)
 class SendReceipt:
     server_message_id: str

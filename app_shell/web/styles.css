@@ -2096,3 +2096,11 @@ h1 {
   }
 }
 .worker-queue-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; }
+/* Keep primary controls and profile forms visible without opening a disclosure. */
+#launch-profile, #message-scope { width: 100%; }
+.quick-card .button-grid { margin-top: 12px; }
+.quick-card .sub-title { margin-top: 20px; }
+.profile-create-disclosure { margin-top: 24px; }
+.result-ok { color: var(--success, #16803d); }
+.result-warn { color: var(--warning, #b26c00); }
+.result-bad { color: var(--danger, #d84444); }

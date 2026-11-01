@@ -75,6 +75,7 @@ class RunSummary:
     failed_count: int = 0
     results: list[TargetResult] = field(default_factory=list)
     duration_seconds: float = 0.0
+    run_id: str | None = None
 
     def add(self, result: TargetResult) -> None:
         self.results.append(result)
@@ -124,6 +125,7 @@ class RunSummary:
     def to_dict(self) -> dict[str, Any]:
         return {
             'profile_name': self.profile_name,
+            'run_id': self.run_id,
             'total_targets': self.total_targets,
             'success_count': self.success_count,
             'skipped_count': self.skipped_count,
@@ -379,7 +381,7 @@ class ControlStore:
         if profile_name not in profiles:
             raise ValueError(f'Профиль {profile_name!r} не найден')
 
-    def load_messages(self) -> list[str]:
+    def load_messages(self, profile_name: str | None = None) -> list[str]:
         lines = [line.strip() for line in MESSAGE_POOL_FILE.read_text(encoding='utf-8').splitlines()]
         lines = [line for line in lines if line and not line.startswith('#')]
         out: list[str] = []
@@ -388,4 +390,7 @@ class ControlStore:
             if item not in seen:
                 seen.add(item)
                 out.append(item)
+        if profile_name is not None:
+            from yara_app.profile_settings import effective_messages, profile_record
+            _, out = effective_messages(profile_record(read_json(PROFILES_FILE), profile_name), out)
         return out

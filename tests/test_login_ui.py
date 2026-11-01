@@ -150,7 +150,8 @@ def test_profile_buttons_start_and_queue_exact_profiles_in_simple_mode(login_ser
             assert running['starts'] == ['alpha']
             assert adapter.worker_queue().read()['waiting'][0]['profile'] == 'beta'
             assert adapter.get_control_state()['active_profile'] == initial_active
-            assert page.locator('#create-profile-form').is_hidden()
+            assert page.locator('#create-profile-form').is_visible()
+            assert page.locator('#add-target-form').is_visible()
             assert page.locator('#worker-queue-status').bounding_box()['y'] < 300
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             beta.get_by_role('button', name='Отменить ожидание', exact=True).click()

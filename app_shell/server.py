@@ -384,6 +384,14 @@ class AppShellHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/profiles":
                     self._send_json({"ok": True, "data": self.adapter.get_profiles()})
                     return
+                if parsed.path in {'/api/profile-overview', '/api/profile-messages'}:
+                    key = (parse_qs(parsed.query).get('profile_key') or [''])[0].strip()
+                    if not key:
+                        raise ValueError('Выберите профиль.')
+                    result = (self.adapter.get_profile_overview(key) if parsed.path.endswith('overview')
+                              else self.adapter.get_profile_messages(key))
+                    self._send_json({'ok': True, 'data': result})
+                    return
                 if parsed.path == '/api/worker-queue':
                     self._send_json({'ok': True, 'data': self.adapter.worker_queue().snapshot()})
                     return
@@ -504,6 +512,15 @@ class AppShellHandler(BaseHTTPRequestHandler):
                     return
                 if parsed.path == "/api/profile-action":
                     self._handle_profile_action(payload)
+                    return
+                if parsed.path == '/api/profile-messages':
+                    revision = str(payload.get('revision') or '')
+                    if not revision:
+                        raise ValueError('Сначала загрузите сообщения профиля.')
+                    result = self.adapter.save_profile_messages(str(payload.get('profile_key') or ''),
+                        str(payload.get('text') or ''), use_shared=payload.get('use_shared') is True,
+                        expected_revision=revision)
+                    self._send_json({'ok': True, 'data': result})
                     return
                 if parsed.path == "/api/target-action":
                     self._handle_target_action(payload)
@@ -757,6 +774,9 @@ class AppShellHandler(BaseHTTPRequestHandler):
             raise ValueError("target_name is required")
         if action == "add":
             result = self.adapter.add_target(profile_key or '', target_name, str(payload.get('profile_url') or ''))
+        elif action == 'remove':
+            result = self.adapter.remove_target(profile_key or '', int(payload.get('index', -1)),
+                expected_name=target_name, expected_url=payload.get('profile_url'))
         elif action == "reset_cooldown":
             removed, path = self.adapter.reset_target_cooldown(target_name, profile_key)
             result = {"removed": removed, "path": path}

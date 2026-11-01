@@ -19,6 +19,7 @@ REASONS = {
     'delivery_unconfirmed': 'TikTok не подтвердил доставку. Проверьте чат; повтор заблокирован.',
     'chat_not_confirmed': 'Не удалось подтвердить чат адресата.',
     'chat_blocked': 'Открытию чата мешает окно или ограничение TikTok.',
+    'chat_not_ready': 'Чат TikTok не открылся. Отправка не начиналась.',
     'send_failed': 'Во время отправки произошла ошибка. Проверьте чат перед повтором.',
     'send_rejected': 'TikTok отклонил отправку.',
     'send_not_attempted': 'Отправка не выполнялась: чат недоступен.',
@@ -124,6 +125,7 @@ def notify_worker_result(adapter, summary: dict, *, status: str, reason: str = '
         text = report_text(summary, status=status, reason=reason, dry_run=dry_run)
         photos = error_photos(adapter, summary)
         sent = 0
+        photos_sent = 0
         for chat_id in ids:
             try:
                 result = setup._call('sendMessage', {'chat_id': chat_id, 'text': text})
@@ -134,6 +136,7 @@ def notify_worker_result(adapter, summary: dict, *, status: str, reason: str = '
                             attachment = setup._call('sendPhoto', {'chat_id': chat_id, 'caption': caption}, photo_path=path)
                             if not isinstance(attachment, dict) or not attachment.get('message_id'):
                                 raise ValueError('Telegram не подтвердил получение фото.')
+                            photos_sent += 1
                         except Exception as exc:
                             logger.warning('Фото ошибки не доставлено; текст отправлен: %s', redact_secrets(str(exc)))
                 else:
@@ -142,7 +145,10 @@ def notify_worker_result(adapter, summary: dict, *, status: str, reason: str = '
                 logger.warning('Итог Telegram не доставлен: %s', redact_secrets(str(exc)))
         if sent:
             logger.info('Итог запуска передан в Telegram: %s чатов; постоянный бот не запускался', sent)
-        return {'ok': bool(ids) and sent == len(ids), 'sent_count': sent, 'failed_count': len(ids) - sent}
+        result = {'ok': bool(ids) and sent == len(ids), 'sent_count': sent, 'failed_count': len(ids) - sent}
+        if photos:
+            result['photos'] = {'sent_count': photos_sent, 'failed_count': len(ids) * len(photos) - photos_sent}
+        return result
     except Exception as exc:
         logger.warning('Не удалось подготовить итог Telegram: %s', redact_secrets(str(exc)))
         return {'ok': False, 'reason': 'notification_error'}

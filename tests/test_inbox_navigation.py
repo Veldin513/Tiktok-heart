@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from yara_app.delivery import SendNotAttempted
+from yara_app.delivery import ChatNotReady, SendNotAttempted
 from yara_app.tiktok_messenger import dismiss_chat_notice, open_chat_by_list, open_messages, send_message
 
 pytestmark = pytest.mark.skipif(
@@ -130,3 +130,36 @@ def test_consent_dialog_is_not_accepted_and_send_never_starts(page):
         send_message(page, 'not sent', confirmation_timeout_ms=100)
     assert page.evaluate('window.clicked') == 0
     assert page.locator('.public-DraftEditor-content').inner_text() == ''
+
+
+def test_decorative_backdrop_does_not_hide_an_accessible_chat(page):
+    seed_inbox(page)
+    page.evaluate('''() => {
+      const node = document.createElement('div'); node.className = 'TUXModal-overlay';
+      node.style = 'position:fixed;inset:0;pointer-events:none'; document.body.append(node);
+    }''')
+    assert open_chat_by_list(page, 'er.mine', 'https://www.tiktok.com/@recipient')
+
+
+def test_transient_backdrop_waits_without_clicking_any_control(page):
+    page.set_content('<div class="TUXModal-overlay" style="position:fixed;inset:0"></div>'
+                     '<script>setTimeout(()=>document.querySelector("div").remove(),350)</script>')
+    dismiss_chat_notice(page)
+    assert page.locator('.TUXModal-overlay').count() == 0
+
+
+def test_bare_backdrop_has_accurate_error_and_never_types(page):
+    page.set_content('<div class="public-DraftEditor-content" contenteditable="true"></div>'
+                     '<div class="TUXModal-overlay" style="position:fixed;inset:0"></div>')
+    with pytest.raises(ChatNotReady, match='Чат TikTok не открылся'):
+        send_message(page, 'never typed', confirmation_timeout_ms=100)
+    assert page.locator('.public-DraftEditor-content').inner_text() == ''
+
+
+def test_real_dialog_is_not_ignored_after_decorative_backdrop(page):
+    modal(page, label='Accept')
+    page.evaluate('''() => { const node = document.createElement('div'); node.className='TUXModal-overlay';
+      node.style='position:fixed;inset:0;pointer-events:none'; document.body.prepend(node); }''')
+    with pytest.raises(SendNotAttempted, match='Всплывающее окно'):
+        dismiss_chat_notice(page)
+    assert page.evaluate('window.clicked') == 0

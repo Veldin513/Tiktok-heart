@@ -9,6 +9,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,12 +197,13 @@ logger = configure_logging(PATHS)
 tg = TelegramClient(TG_TOKEN, TG_CHAT_IDS, enabled=not TG_DISABLE_NOTIFICATIONS)
 store = StateStore(PATHS.state_dir, state.cooldown_hours)
 run_lock = RunLock(PATHS.run_lock_file)
-message_selector = MessageSelector(control_store.load_messages())
+message_selector = MessageSelector(control_store.load_messages(ACTIVE_PROFILE))
 auth_coord_adapter = ProjectAdapter()
 RUN_STATE_FILE = PATHS.artifacts_dir / 'run_state.json'
 RUN_HISTORY_FILE = PATHS.artifacts_dir / 'run_history.jsonl'
 RUN_HISTORY_MAX_BYTES = 1_500_000
 RUN_HISTORY_KEEP_BYTES = 500_000
+RUN_ID = uuid.uuid4().hex
 AUTH_BACKOFF_FILE = PATHS.state_dir / 'auth_backoff.json'
 TARGET_GUARD_DIR = PATHS.state_dir / 'target_send_guards'
 TARGET_SEND_GUARD_SECONDS = max(30, int(os.getenv('TIKTOK_TARGET_GUARD_SECONDS', '300')))
@@ -248,6 +250,7 @@ def _resume_control_bot_after_auth(was_suspended: bool) -> None:
 def _write_run_state(**data) -> None:
     payload = {
         'profile_name': ACTIVE_PROFILE,
+        'run_id': RUN_ID,
         'pid': os.getpid(),
         'timestamp': time.time(),
         **data,
@@ -279,6 +282,7 @@ def _append_run_history(event: str, **data: Any) -> None:
         'timestamp': time.time(),
         'time': time.strftime('%Y-%m-%d %H:%M:%S'),
         'profile_name': ACTIVE_PROFILE,
+        'run_id': RUN_ID,
         'event': event,
         **data,
     }
@@ -554,7 +558,7 @@ def process_target(page, target: Target, summary: RunSummary) -> None:
                 chat_opened = open_chat_by_profile(page, target.profile_url)
     except SendNotAttempted as exc:
         logger.warning('Чат недоступен: %s', exc)
-        record_target_failure(summary, page, target.name, 'chat_blocked', str(exc))
+        record_target_failure(summary, page, target.name, getattr(exc, 'reason', 'chat_blocked'), str(exc))
         return
     except (AuthSessionUnavailable, AuthCheckInconclusive):
         raise
@@ -788,6 +792,8 @@ def release_worker_run() -> None:
 
 
 def check_tiktok_streak() -> None:
+    global RUN_ID
+    RUN_ID = uuid.uuid4().hex
     logger.info('=== Запуск TikTok (%s) ===', ACTIVE_PROFILE)
     log_lifecycle('worker_start', profile=ACTIVE_PROFILE, pid=os.getpid())
     if not run_lock.acquire():
@@ -808,7 +814,7 @@ def check_tiktok_streak() -> None:
     run_start = time.time()
     profiles = control_store.load_profiles()
     targets = [Target(name=item['name'], profile_url=item.get('url')) for item in profiles.get(ACTIVE_PROFILE, [])]
-    summary = RunSummary(profile_name=ACTIVE_PROFILE, total_targets=len(targets))
+    summary = RunSummary(profile_name=ACTIVE_PROFILE, total_targets=len(targets), run_id=RUN_ID)
     notify_run_finished = True
     terminal_status = 'idle'
     terminal_reason = ''
@@ -936,6 +942,7 @@ def check_tiktok_streak() -> None:
                 success_count=summary.success_count,
                 skipped_count=summary.skipped_count,
                 failed_count=summary.failed_count,
+                confirmed_count=sum(r.success and r.confirmation == 'server_ack' for r in summary.results),
                 duration_seconds=round(summary.duration_seconds, 2),
             )
             log_lifecycle(
@@ -956,8 +963,17 @@ def check_tiktok_streak() -> None:
             finally:
                 try:
                     if notify_run_finished:
-                        notify_worker_result(auth_coord_adapter, summary.to_dict(), status=terminal_status,
-                                             reason=terminal_reason, dry_run=runtime_state.dry_run)
+                        notification = notify_worker_result(auth_coord_adapter, summary.to_dict(), status=terminal_status,
+                                                            reason=terminal_reason, dry_run=runtime_state.dry_run)
+                        # A next worker may already own run_state.json after lock
+                        # release. Keep the report in a per-attempt file instead.
+                        try:
+                            atomic_write_text(PATHS.artifacts_dir / f'notification_{summary.run_id}.json',
+                                              json.dumps({'run_id': summary.run_id, 'notification': notification,
+                                                          'completed_at': time.time()}, ensure_ascii=False))
+                            _append_run_history('notification_result', notification=notification)
+                        except OSError:
+                            logger.warning('Не удалось сохранить результат уведомления Telegram.')
                 finally:
                     try:
                         auth_coord_adapter.resume_worker_queue()

@@ -33,6 +33,8 @@ from yara_app.native_login import (
 )
 from yara_app.performance import PerformanceService
 from yara_app.processes import run_bounded
+from yara_app.profile_settings import effective_messages, message_lines, messages_revision, profile_record
+from yara_app.run_results import outcome
 from yara_app.runtime_paths import browser_profile_needs_recovery, extend_env_with_site_packages
 from yara_app.scheduler import WorkerScheduleService
 from yara_app.ttbot.models import legacy_safe_filename, safe_name_key
@@ -1618,6 +1620,7 @@ class ProjectAdapter:
         targets = list(profile.raw.get("targets") or [])
         ready_count = 0
         cooldown_count = 0
+        unconfirmed_count = 0
         next_item: dict[str, Any] | None = None
         for target in targets:
             name = str(target.get("name") or target.get("url") or "")
@@ -1626,6 +1629,7 @@ class ProjectAdapter:
                 ready_count += 1
                 continue
             if target_state.get('delivery_unconfirmed'):
+                unconfirmed_count += 1
                 continue
             cooldown_count += 1
             next_send_at = target_state.get("next_send_at")
@@ -1643,6 +1647,7 @@ class ProjectAdapter:
             "target_count": len(targets),
             "ready_count": ready_count,
             "cooldown_count": cooldown_count,
+            "unconfirmed_count": unconfirmed_count,
             "next_target": str((next_item or {}).get("target") or ""),
             "next_send_at": (next_item or {}).get("next_send_at"),
             "next_send_at_text": str((next_item or {}).get("next_send_at_text") or ""),
@@ -1982,8 +1987,80 @@ class ProjectAdapter:
     def _active_profile_artifacts_dir(self) -> Path:
         return self._bot_profile_root() / 'artifacts'
 
-    def get_current_run_snapshot(self) -> dict[str, Any]:
-        artifacts_dir = self._active_profile_artifacts_dir()
+    def get_profile_messages(self, profile_key: str) -> dict[str, Any]:
+        record = profile_record(self._read_json(self.profiles_path, {}), profile_key)
+        shared = [line.strip() for line in self.get_message_pool_text().splitlines()
+                  if line.strip() and not line.lstrip().startswith('#')]
+        source, values = effective_messages(record, list(dict.fromkeys(shared)))
+        return {'profile_key': profile_key, 'source': source, 'text': '\n'.join(values),
+                'count': len(values), 'revision': messages_revision(source, values)}
+
+    def save_profile_messages(self, profile_key: str, text: str = '', *, use_shared: bool = False,
+                              expected_revision: str | None = None) -> dict[str, Any]:
+        values = None if use_shared else message_lines(text)
+        with file_lock(self.control_dir / 'worker_launch'), _PROFILE_EDIT_LOCK, file_lock(self.profiles_path):
+            if self.get_profile_worker_status(profile_key).running:
+                raise RuntimeError('Дождитесь окончания отправки этого профиля, затем сохраните текст.')
+            current = self.get_profile_messages(profile_key)
+            if expected_revision is not None and current['revision'] != expected_revision:
+                raise ValueError('Сообщения уже изменены. Обновите страницу и повторите изменение.')
+            payload = self._read_json(self.profiles_path, {})
+            record = profile_record(payload, profile_key, update=True)
+            previous = record.get('message_settings')
+            settings = dict(previous) if isinstance(previous, dict) else {}
+            settings['source'] = 'shared' if use_shared else 'personal'
+            if values is None:
+                settings.pop('messages', None)
+            else:
+                settings['messages'] = values
+            record['message_settings'] = settings
+            self._write_json(self.profiles_path, payload)
+            removed = self.worker_queue().cancel(profile_key)
+        return {**self.get_profile_messages(profile_key), 'cancelled_jobs': removed}
+
+    def remove_target(self, profile_key: str, target_index: int, *, expected_name: str,
+                      expected_url: str | None = None) -> dict[str, Any]:
+        with file_lock(self.control_dir / 'worker_launch'), _PROFILE_EDIT_LOCK, file_lock(self.profiles_path):
+            if self.get_profile_worker_status(profile_key).running:
+                raise RuntimeError('Дождитесь окончания отправки этого профиля, затем удалите адресата.')
+            payload = self._read_json(self.profiles_path, {})
+            record = profile_record(payload, profile_key, update=True)
+            targets = record.get('targets')
+            if not isinstance(targets, list) or not 0 <= target_index < len(targets):
+                raise ValueError('Адресат больше не существует. Обновите список.')
+            target = targets[target_index]
+            if target.get('name') != expected_name or target.get('url') != expected_url:
+                raise ValueError('Адресат уже изменён. Обновите список.')
+            targets.pop(target_index)
+            self._write_json(self.profiles_path, payload)
+            removed = self.worker_queue().cancel(profile_key)
+        return {'removed': True, 'cancelled_jobs': removed}
+
+    def get_profile_overview(self, profile_key: str) -> dict[str, Any]:
+        profile = next((p for p in self.get_profiles() if p.key == profile_key), None)
+        if profile is None:
+            raise ValueError('Выберите существующий профиль.')
+        browser = self.browser_profile_live_status(profile_key)
+        queue = self.queue_snapshot(profile_key)
+        history = self.get_run_history_snapshot(profile_key)
+        if not profile.enabled:
+            readiness = {'label': 'Профиль выключен', 'kind': 'warn', 'action': 'profiles'}
+        elif not profile.raw.get('targets'):
+            readiness = {'label': 'Добавьте адресата', 'kind': 'warn', 'action': 'profiles'}
+        elif browser.get('session_import_required') or not self.profile_login_confirmed(profile_key):
+            readiness = {'label': 'Нужен вход в TikTok', 'kind': 'warn', 'action': 'browser'}
+        elif queue.get('unconfirmed_count'):
+            readiness = {'label': 'Проверьте предыдущую отправку', 'kind': 'warn', 'action': 'profiles'}
+        else:
+            readiness = {'label': 'Можно запустить', 'kind': 'ok', 'action': None}
+        return {'profile_key': profile.key, 'label': profile.label, 'enabled': profile.enabled,
+                'worker_running': self.get_profile_worker_status(profile_key).running,
+                'targets': profile.raw.get('targets') or [], 'readiness': readiness,
+                'queue': queue, 'browser': browser, 'run': self.get_current_run_snapshot(profile_key),
+                'history': history, 'scheduled': profile.active, 'messages': self.get_profile_messages(profile_key)}
+
+    def get_current_run_snapshot(self, profile_key: str | None = None) -> dict[str, Any]:
+        artifacts_dir = self._bot_profile_root(profile_key) / 'artifacts'
         run_state_path = artifacts_dir / "run_state.json"
         run_summary_path = artifacts_dir / "run_summary.json"
 
@@ -1992,6 +2069,10 @@ class ProjectAdapter:
         if not isinstance(run_state, dict):
             run_state = {}
         if not isinstance(run_summary, dict):
+            run_summary = {}
+
+        run_id = run_state.get('run_id')
+        if run_id and run_summary.get('run_id') != run_id:
             run_summary = {}
 
         inline_summary = run_state.get("summary") if isinstance(run_state.get("summary"), dict) else {}
@@ -2010,9 +2091,17 @@ class ProjectAdapter:
             elif skipped_count:
                 status = "skipped"
         updated_at = float(run_state.get("completed_at") or run_state.get("timestamp") or 0)
+        notification = run_state.get('notification') or summary.get('notification')
+        if isinstance(run_id, str) and re.fullmatch(r'[a-f0-9]{32}', run_id):
+            report = self._read_json(artifacts_dir / f'notification_{run_id}.json', {})
+            if isinstance(report, dict) and report.get('run_id') == run_id:
+                notification = report.get('notification')
 
         return {
-            "profile_name": self._active_profile_name(),
+            "profile_name": profile_key or self._active_profile_name(),
+            "run_id": run_id or summary.get('run_id'),
+            "outcome": outcome({**summary, 'status': status, 'reason': run_state.get('reason')}),
+            "notification": notification,
             "artifacts_dir": str(artifacts_dir),
             "run_state_path": str(run_state_path),
             "run_summary_path": str(run_summary_path),
@@ -2026,7 +2115,7 @@ class ProjectAdapter:
             "current_target": run_state.get("current_target"),
             "total_targets": int(run_state.get("total_targets") or summary.get("total_targets") or 0),
             "success_count": success_count,
-            "delivery_verified": success_count > 0 and sum(
+            "delivery_verified": (bool(run_id) or status not in {'starting', 'running'}) and success_count > 0 and sum(
                 1 for result in results if isinstance(result, dict) and result.get('success')
                 and result.get('confirmation') == 'server_ack'
             ) == success_count,
@@ -2038,11 +2127,14 @@ class ProjectAdapter:
         }
 
     def get_run_history(self, profile_key: str | None = None, *, limit: int = 40) -> list[dict[str, Any]]:
+        return self.get_run_history_snapshot(profile_key, limit=limit)['items']
+
+    def get_run_history_snapshot(self, profile_key: str | None = None, *, limit: int = 40) -> dict[str, Any]:
         profile = str(profile_key or self._active_profile_name() or "default")
         history_path = self._bot_profile_root(profile) / 'artifacts' / 'run_history.jsonl'
         limit = max(1, min(300, int(limit)))
         if not history_path.exists():
-            return []
+            return {'items': [], 'status': 'empty', 'message': 'Отправок пока нет.'}
         items: list[dict[str, Any]] = []
         try:
             file_size = history_path.stat().st_size
@@ -2051,19 +2143,26 @@ class ProjectAdapter:
                 handle.seek(start)
                 raw = handle.read()
         except OSError:
-            return []
+            return {'items': [], 'status': 'unavailable', 'message': 'Не удалось прочитать историю. Не повторяйте отправку без проверки чата.'}
         if start:
             separator = raw.find(b"\n")
             raw = raw[separator + 1:] if separator >= 0 else b""
+        damaged = 0
         for line in raw.decode("utf-8", errors="replace").splitlines()[-limit:]:
             try:
                 payload = json.loads(line)
             except Exception:
+                damaged += 1
                 continue
             if isinstance(payload, dict):
                 payload.setdefault("profile_name", profile)
+                payload['outcome'] = outcome(payload)
                 items.append(payload)
-        return items
+            else:
+                damaged += 1
+        return {'items': items, 'status': 'partial' if damaged else 'ok' if items else 'empty',
+                'message': 'Часть истории не удалось прочитать.' if damaged else '',
+                'damaged_records': damaged, 'older_records_omitted': bool(start)}
 
     def worker_lifecycle_summary(self, profile_key: str | None = None, *, limit: int = 12) -> dict[str, Any]:
         events = [
@@ -3452,7 +3551,8 @@ class ProjectAdapter:
         message_pool = self.get_message_pool_stats()
         telegram_ready, telegram_reason = self.telegram_bot_ready()
         run = self.get_current_run_snapshot()
-        run_history = self.get_run_history(str(state.get("active_profile") or "") or None)
+        history_snapshot = self.get_run_history_snapshot(str(state.get("active_profile") or "") or None)
+        run_history = history_snapshot['items']
         worker_lifecycle = self.worker_lifecycle_summary(str(state.get("active_profile") or "") or None, limit=12)
         queue = self.queue_snapshot(str(state.get("active_profile") or "") or None)
         dependencies = self.dependency_report()
@@ -3556,6 +3656,7 @@ class ProjectAdapter:
             "state": state,
             "run": run,
             "run_history": run_history,
+            "run_history_state": {key: value for key, value in history_snapshot.items() if key != 'items'},
             "worker_lifecycle": worker_lifecycle,
             "queue": queue,
             "performance": self.performance_summary(str(state.get("active_profile") or "") or None),

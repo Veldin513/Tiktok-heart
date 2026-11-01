@@ -200,6 +200,7 @@ def test_error_report_delivers_text_first_then_photo_to_owner_and_admin(tmp_path
     result = notify_worker_result(adapter, {'profile_name': 'alpha', 'results': [
         {'target': 'alice', 'reason': 'chat_blocked', 'error': 'Всплывающее окно', 'screenshot_path': str(photo)}]}, status='failed')
     assert result['ok'] and result['sent_count'] == 2
+    assert result['photos'] == {'sent_count': 0 if photo_fails else 2, 'failed_count': 2 if photo_fails else 0}
     assert [(method, data['chat_id']) for method, data, _ in calls] == [
         ('sendMessage', 100), ('sendPhoto', 100), ('sendMessage', 200), ('sendPhoto', 200)]
     assert all('Всплывающее окно' in data.get('text', data.get('caption', '')) for _, data, _ in calls)

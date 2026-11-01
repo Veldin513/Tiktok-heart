@@ -76,11 +76,20 @@
             </article>
             <article class="quick-card">
               <div class="panel-title">Быстрые действия</div>
+              <label class="field-label" for="launch-profile">Профиль для отправки</label>
+              <select id="launch-profile" class="select" aria-label="Профиль для отправки"></select>
+              <p id="launch-readiness" class="hint" role="status">Загрузка…</p>
+              <p id="home-current-state" class="hint" role="status"></p>
               <div class="button-grid">
-                <button class="btn primary" data-go-view="profiles">Профили и очередь</button>
-                <button class="btn secondary" data-action="toggle_pause">Пауза</button>
+                <button id="launch-selected" class="btn primary" disabled>Запустить</button>
+                <button id="home-telegram" class="btn secondary" data-action="start_telegram">Включить Telegram</button>
                 <button class="btn danger" data-action="stop_all">Остановить всё</button>
               </div>
+              <p class="hint">Закрытие окна не отменяет расписание.</p>
+              <div class="panel-title sub-title">Последняя попытка</div>
+              <p id="home-last-result" role="status">Загрузка…</p>
+              <p id="home-last-meta" class="hint"></p>
+              <p id="home-notification" class="hint"></p>
               <details class="inline-disclosure">
                 <summary>Дополнительные действия</summary>
                 <div class="button-grid compact-actions">
@@ -182,12 +191,16 @@
         <section class="view" id="view-messages">
           <div class="content-grid">
             <article class="panel editor-panel">
-              <div class="panel-title">Пул сообщений</div>
+              <div class="panel-title">Сообщения</div>
+              <label class="field-label" for="message-scope">Для кого изменить текст</label>
+              <select id="message-scope" class="select"><option value="">Общий набор сообщений</option></select>
+              <p id="message-source-hint" class="hint">Общий набор используют профили без своего текста. Каждое сообщение — с новой строки.</p>
               <textarea id="message-editor" class="text-editor" spellcheck="false"></textarea>
               <div class="editor-actions">
                 <button id="message-save" class="btn primary">Сохранить</button>
                 <button id="message-normalize" class="btn secondary">Нормализовать</button>
                 <button id="message-backup" class="btn secondary">Создать копию</button>
+                <button id="message-use-shared" class="btn secondary" hidden>Вернуть общий набор</button>
                 <span id="message-editor-state" class="hint">Готово</span>
               </div>
             </article>
@@ -217,8 +230,8 @@
             <article class="panel">
               <div class="panel-title">Профили</div>
               <div id="profiles-list" class="profile-list"></div>
-              <details id="create-profile-details" class="inline-disclosure profile-create-disclosure">
-              <summary>Новый профиль</summary>
+              <div id="create-profile-details" class="profile-create-disclosure">
+              <div class="panel-title sub-title">Новый профиль</div>
               <form id="create-profile-form" class="profile-form">
                 <label class="field-label" for="new-profile-key">Название нового профиля</label>
                 <input id="new-profile-key" class="input" placeholder="Например: main" required maxlength="48" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,47}">
@@ -226,15 +239,15 @@
                 <button class="btn primary" type="submit">Создать профиль</button>
                 <p id="profile-create-status" class="hint" role="status" aria-live="polite"></p>
               </form>
-              </details>
+              </div>
             </article>
             <article class="panel">
               <div class="panel-title">Адресаты</div>
               <p id="target-profile-caption" class="hint"></p>
               <button id="profile-import-shortcut" class="btn secondary full" hidden>Войти в TikTok для этого профиля</button>
               <div id="targets-list" class="target-list"></div>
-              <details id="add-target-details" class="inline-disclosure profile-create-disclosure">
-              <summary>Добавить адресата</summary>
+              <div id="add-target-details" class="profile-create-disclosure">
+              <div class="panel-title sub-title">Добавить адресата</div>
               <form id="add-target-form" class="profile-form">
                 <label class="field-label" for="new-target-name">Имя в списке чатов TikTok</label>
                 <input id="new-target-name" class="input" placeholder="Имя собеседника, как в сообщениях" required maxlength="80">
@@ -243,7 +256,7 @@
                 <button class="btn primary" type="submit">Добавить адресата</button>
                 <p id="target-create-status" class="hint" role="status" aria-live="polite"></p>
               </form>
-              </details>
+              </div>
             </article>
           </div>
         </section>
