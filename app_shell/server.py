@@ -213,6 +213,7 @@ class AppShellHandler(BaseHTTPRequestHandler):
     _live_cache_at = 0.0
     _live_cache_ttl = 1.25
     _schedule_lock = threading.Lock()
+    _diagnostic_run_lock = threading.Lock()
     _login_lock = threading.Lock()
     _login_service = None
 
@@ -355,6 +356,14 @@ class AppShellHandler(BaseHTTPRequestHandler):
                     query = parse_qs(parsed.query)
                     self._send_json({"ok": True, "data": self._get_diagnostics(fresh=query.get("fresh") == ["1"])})
                     return
+                if parsed.path in {'/api/checks', '/api/checks/history'}:
+                    from yara_app.diagnostic_service import DiagnosticService
+                    service = DiagnosticService(self.adapter)
+                    query = parse_qs(parsed.query)
+                    data = service.history() if parsed.path.endswith('/history') else service.collect(
+                        (query.get('profile_key') or [None])[0])
+                    self._send_json({'ok': True, 'data': data})
+                    return
                 if parsed.path == "/api/live":
                     query = parse_qs(parsed.query)
                     self._send_json({"ok": True, "data": self._get_live_status(fresh=query.get("fresh") == ["1"])})
@@ -388,7 +397,7 @@ class AppShellHandler(BaseHTTPRequestHandler):
                     key = (parse_qs(parsed.query).get('profile_key') or [''])[0].strip()
                     if not key:
                         raise ValueError('Выберите профиль.')
-                    result = (self.adapter.get_profile_overview(key) if parsed.path.endswith('overview')
+                    result = (self.adapter.get_profile_overview(key, compact=parse_qs(parsed.query).get('compact') == ['1']) if parsed.path.endswith('overview')
                               else self.adapter.get_profile_messages(key))
                     self._send_json({'ok': True, 'data': result})
                     return
@@ -438,6 +447,18 @@ class AppShellHandler(BaseHTTPRequestHandler):
             try:
                 payload = read_json_body(self)
                 self._clear_diagnostics_cache()
+                if parsed.path in {'/api/checks/run', '/api/checks/self-test'}:
+                    from yara_app.diagnostic_service import DiagnosticService
+                    if not self._diagnostic_run_lock.acquire(blocking=False):
+                        self._send_json({'ok': False, 'error': 'Проверка уже выполняется. Дождитесь результата.'}, status=409)
+                        return
+                    try:
+                        report = DiagnosticService(self.adapter).run(str(payload.get('profile_key') or '') or None,
+                                                                    self_test=parsed.path.endswith('/self-test'))
+                        self._send_json({'ok': True, 'data': report})
+                    finally:
+                        self._diagnostic_run_lock.release()
+                    return
                 if parsed.path.startswith('/api/protection/'):
                     from yara_app.profile_keys import ProfileProtection
                     from yara_app.profile_vault import enable_protection

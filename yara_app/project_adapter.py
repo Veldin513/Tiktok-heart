@@ -2036,13 +2036,13 @@ class ProjectAdapter:
             removed = self.worker_queue().cancel(profile_key)
         return {'removed': True, 'cancelled_jobs': removed}
 
-    def get_profile_overview(self, profile_key: str) -> dict[str, Any]:
+    def get_profile_overview(self, profile_key: str, *, compact: bool = False) -> dict[str, Any]:
         profile = next((p for p in self.get_profiles() if p.key == profile_key), None)
         if profile is None:
             raise ValueError('Выберите существующий профиль.')
         browser = self.browser_profile_live_status(profile_key)
         queue = self.queue_snapshot(profile_key)
-        history = self.get_run_history_snapshot(profile_key)
+        history = {} if compact else self.get_run_history_snapshot(profile_key)
         if not profile.enabled:
             readiness = {'label': 'Профиль выключен', 'kind': 'warn', 'action': 'profiles'}
         elif not profile.raw.get('targets'):
@@ -2057,7 +2057,8 @@ class ProjectAdapter:
                 'worker_running': self.get_profile_worker_status(profile_key).running,
                 'targets': profile.raw.get('targets') or [], 'readiness': readiness,
                 'queue': queue, 'browser': browser, 'run': self.get_current_run_snapshot(profile_key),
-                'history': history, 'scheduled': profile.active, 'messages': self.get_profile_messages(profile_key)}
+                'history': history, 'scheduled': profile.active,
+                'messages': {} if compact else self.get_profile_messages(profile_key)}
 
     def get_current_run_snapshot(self, profile_key: str | None = None) -> dict[str, Any]:
         artifacts_dir = self._bot_profile_root(profile_key) / 'artifacts'
@@ -2687,7 +2688,10 @@ class ProjectAdapter:
         if status.running and self._running_worker_profile(status) == profile_key:
             return status
         queue_data = queue.read()
-        if status.running or queue_data['waiting'] or queue_data.get('current'):
+        manual_login_pending = (self._bot_profile_root(profile_key) / 'browser' / LOGIN_PENDING).exists()
+        if (status.running or queue_data['waiting'] or queue_data.get('current')
+                or any(item['profile'] == profile_key for item in queue_data['awaiting_login'])
+                or queue.needs_login(profile_key) and not manual_login_pending):
             position = queue.enqueue_locked(profile, ignore_cooldown=ignore_cooldown, requester=requester_id)
             if not queue.kick():
                 raise RuntimeError('Заявка сохранена, но очередь не запустилась. Обновите приложение.')
@@ -3092,7 +3096,8 @@ class ProjectAdapter:
             "browser_profile": self.browser_profile_summary(profile_root.name),
         }
 
-    def worker_starter_self_test(self, *, no_browser: bool = True) -> dict[str, Any]:
+    def worker_starter_self_test(self, *, no_browser: bool = True, diagnostic_only: bool = False,
+                                 profile_key: str | None = None) -> dict[str, Any]:
         starter = self.base_dir / "scripts" / "start_worker_once.py"
         if not starter.exists():
             return {"ok": False, "error": f"Starter not found: {starter}", "starter": str(starter)}
@@ -3105,6 +3110,14 @@ class ProjectAdapter:
         args = [python, str(starter), "--self-test"]
         if no_browser:
             args.append("--no-browser")
+        if diagnostic_only:
+            if not no_browser:
+                raise ValueError('Диагностический самотест не открывает браузер.')
+            args.append('--diagnostic-only')
+            if profile_key:
+                args.append('--profile=' + profile_key)
+            env['PYTHONDONTWRITEBYTECODE'] = '1'
+            env['TG_DISABLE_NOTIFICATIONS'] = '1'
         try:
             result = run_bounded(
                 args,

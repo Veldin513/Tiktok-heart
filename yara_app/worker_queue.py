@@ -19,6 +19,10 @@ from yara_app.telegram_setup import parse_chat_ids
 logger = logging.getLogger(__name__)
 
 
+class LoginRequired(ValueError):
+    """A queued job has not started and can safely wait for login."""
+
+
 def targets_fingerprint(profile) -> str:
     return hashlib.sha256(json.dumps(profile.raw.get('targets') or [], ensure_ascii=False,
                                     sort_keys=True).encode()).hexdigest()
@@ -34,19 +38,24 @@ class WorkerQueue:
     def read(self):
         data = read_json(self.path, {'waiting': [], 'current': None, 'history': []})
         if (not isinstance(data, dict) or not isinstance(data.get('waiting'), list)
-                or not isinstance(data.get('history'), list) or len(data['waiting']) > 100
+                or not isinstance(data.get('history'), list)
+                or not isinstance(data.get('awaiting_login', []), list)
+                or len(data['waiting']) + len(data.get('awaiting_login', [])) > 100
                 or data.get('current') is not None and not isinstance(data['current'], dict)):
             raise ValueError('Не удалось прочитать очередь. Данные сохранены; обратитесь к администратору.')
+        data.setdefault('awaiting_login', [])  # Existing queues need no separate migration.
+        data.setdefault('current', None)
+        pending = data['waiting'] + data['awaiting_login']
         profiles = set()
-        for index, item in enumerate(data['waiting'] + ([data['current']] if data['current'] is not None else [])):
+        for index, item in enumerate(pending + ([data['current']] if data['current'] is not None else [])):
             if (not isinstance(item, dict) or not isinstance(item.get('id'), str)
                     or not isinstance(item.get('profile'), str) or not isinstance(item.get('fingerprint'), str)
                     or type(item.get('ignore_cooldown')) is not bool or type(item.get('boot_force')) is not bool
                     or type(item.get('dry_run')) is not bool
                     or item.get('requester') is not None and (type(item['requester']) is not int or item['requester'] <= 0)
-                    or index < len(data['waiting']) and item['profile'] in profiles):
+                    or index < len(pending) and item['profile'] in profiles):
                 raise ValueError('Очередь повреждена. Автоматический запуск остановлен, данные сохранены.')
-            if index < len(data['waiting']):
+            if index < len(pending):
                 profiles.add(item['profile'])
         return data
 
@@ -58,7 +67,7 @@ class WorkerQueue:
         try:
             data = self.read()
         except ValueError:
-            return {'waiting': [], 'current': None, 'paused': True,
+            return {'waiting': [], 'awaiting_login': [], 'current': None, 'paused': True,
                     'error': 'Очередь не удалось прочитать. Данные сохранены; нужен администратор.'}
         labels = {p.key: p.label for p in self.adapter.get_profiles()}
         state = self.adapter.get_control_state()
@@ -72,6 +81,10 @@ class WorkerQueue:
         return {'waiting': [{'profile': item['profile'], 'label': labels.get(item['profile'], item['profile']),
                              'position': index + 1, 'created_at': item.get('created_at')}
                             for index, item in enumerate(data['waiting'])],
+                'awaiting_login': [{'profile': item['profile'], 'label': labels.get(item['profile'], item['profile']),
+                                    'created_at': item.get('created_at'),
+                                    'can_resume': self.adapter.profile_login_confirmed(item['profile'])}
+                                   for item in data['awaiting_login']],
                 'current': current, 'paused': bool(state.get('paused') or state.get('stop_requested'))}
 
     def position(self, profile):
@@ -88,19 +101,34 @@ class WorkerQueue:
 
     def enqueue_locked(self, profile, *, ignore_cooldown=False, requester=None):
         data = self.read()
+        held = next((item for item in data['awaiting_login'] if item['profile'] == profile.key), None)
+        if held is not None:
+            # Validate the original request, including its original owner. A new
+            # click must not rescue a revoked request by replacing its requester.
+            self._validate(held)
+            if not self.adapter.profile_login_confirmed(profile.key):
+                raise LoginRequired('Сначала войдите в TikTok для этого профиля, затем нажмите «Запустить».')
+            data['awaiting_login'].remove(held)
+            # The old boot exception is no longer current after waiting for login.
+            held.update(boot_force=False, ignore_cooldown=ignore_cooldown)
+            held.pop('blocked_at', None)
+            data['waiting'].append(held)
+            self.save(data)
+            return len(data['waiting'])
         position = next((i + 1 for i, item in enumerate(data['waiting']) if item['profile'] == profile.key), None)
         if position is not None:
             changed = False
-            if ignore_cooldown:
-                data['waiting'][position - 1].update(ignore_cooldown=True, requester=requester)
+            if ignore_cooldown and data['waiting'][position - 1].get('requester') == requester:
+                data['waiting'][position - 1]['ignore_cooldown'] = True
                 changed = True
-            if str(os.getenv('WORKER_FORCE_SEND_ON_BOOT', '')).lower() in {'1', 'true', 'yes', 'on'}:
+            if (data['waiting'][position - 1].get('requester') == requester
+                    and str(os.getenv('WORKER_FORCE_SEND_ON_BOOT', '')).lower() in {'1', 'true', 'yes', 'on'}):
                 data['waiting'][position - 1]['boot_force'] = True
                 changed = True
             if changed:
                 self.save(data)
             return position
-        if len(data['waiting']) >= 100:
+        if len(data['waiting']) + len(data['awaiting_login']) >= 100:
             raise ValueError('Очередь заполнена. Дождитесь завершения отправок.')
         data['waiting'].append({'id': secrets.token_hex(12), 'profile': profile.key, 'requester': requester,
             'ignore_cooldown': ignore_cooldown,
@@ -114,8 +142,10 @@ class WorkerQueue:
     def cancel(self, profile=None):
         with file_lock(self.launch_lock):
             data = self.read()
-            removed = [item for item in data['waiting'] if profile is None or item['profile'] == profile]
-            data['waiting'] = [item for item in data['waiting'] if item not in removed]
+            removed = []
+            for name in ('waiting', 'awaiting_login'):
+                removed.extend(item for item in data[name] if profile is None or item['profile'] == profile)
+                data[name] = [item for item in data[name] if profile is not None and item['profile'] != profile]
             for item in removed:
                 data['history'].append({**item, 'status': 'cancelled', 'finished_at': time.time()})
             self.save(data)
@@ -158,10 +188,17 @@ class WorkerQueue:
         self.authorize(profile.key, job.get('requester'))
         if targets_fingerprint(profile) != job['fingerprint']:
             raise ValueError('Получатели изменились. Нажмите запуск ещё раз, чтобы подтвердить новый список.')
-        state = self.adapter._get_profile_state_dir(profile.key)
-        if (state / 'session_import_required.json').exists():
-            raise ValueError('Нужно войти в TikTok. После входа нажмите запуск ещё раз.')
+        if self.needs_login(profile.key):
+            raise LoginRequired('Нужно войти в TikTok. Заявка сохранена; после входа нажмите «Запустить».')
         return profile
+
+    def needs_login(self, profile):
+        from yara_app.native_login import LOGIN_PENDING
+
+        root = self.adapter._bot_profile_root(profile)
+        return ((root / 'state' / 'session_import_required.json').exists()
+                or (root / 'browser' / LOGIN_PENDING).exists()
+                or self.adapter._session_validation_summary(root).get('valid') is False)
 
     def _report_failed(self, job, message):
         notify_worker_result(self.adapter, {'profile_name': job['profile'], 'failed_count': 1,
@@ -194,6 +231,7 @@ class WorkerQueue:
     def _run_owned(self, lease):
         while True:
             failure = None
+            awaiting_login = None
             interrupted = None
             job = None
             with file_lock(self.launch_lock):
@@ -220,19 +258,36 @@ class WorkerQueue:
                         self.save(data)  # Claim before starting; never replay an uncertain launch.
                         try:
                             self._validate(job)
-                            started = self.adapter._start_worker_profile(job['profile'],
-                                ignore_cooldown=job['ignore_cooldown'], boot_force=job['boot_force'])
-                            if not started.running or not started.pid:
-                                raise RuntimeError('Не удалось запустить отправку из очереди.')
-                            pid = started.pid
-                            data['current'] = {**job, 'pid': pid, 'started_at': time.time()}
+                        except LoginRequired as exc:
+                            # Only pre-launch validation can put a job on hold.
+                            # Once launch begins, an exception has an uncertain
+                            # result and must never become a retryable login job.
+                            awaiting_login = str(exc)
+                            data['current'] = None
+                            data['awaiting_login'].append({**job, 'blocked_at': time.time()})
                             self.save(data)
-                            logger.info('Начат запуск профиля %s из очереди', job['profile'])
+                            pid = None
                         except Exception as exc:
                             failure = str(exc)
                             pid = None
+                        else:
+                            try:
+                                started = self.adapter._start_worker_profile(job['profile'],
+                                    ignore_cooldown=job['ignore_cooldown'], boot_force=job['boot_force'])
+                                if not started.running or not started.pid:
+                                    raise RuntimeError('Не удалось запустить отправку из очереди.')
+                                pid = started.pid
+                                data['current'] = {**job, 'pid': pid, 'started_at': time.time()}
+                                self.save(data)
+                                logger.info('Начат запуск профиля %s из очереди', job['profile'])
+                            except Exception as exc:
+                                failure = str(exc)
+                                pid = None
             if interrupted:
                 self._report_failed(interrupted, 'Результат прерванного запуска нужно проверить. Автоматического повтора нет.')
+            if awaiting_login:
+                self._report_failed(job, awaiting_login)
+                continue
             if failure:
                 self._finish(job, 'failed', failure)
                 self._report_failed(job, failure)

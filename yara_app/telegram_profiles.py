@@ -108,6 +108,10 @@ class PersonalProfileControls:
         lines.append('▶ Отправка выполняется' if status.running else '⏹ Отправка не запущена')
         if position:
             lines.append(f'📋 Место в очереди: {position}')
+        held = next((item for item in self.adapter.worker_queue().snapshot().get('awaiting_login', [])
+                     if item['profile'] == profile.key), None)
+        if held:
+            lines.append('📋 Заявка сохранена. После входа нажмите «Запустить отправку»; остальные профили работают дальше.')
         pending_file = self.adapter._bot_profile_root(profile.key) / 'browser' / LOGIN_PENDING
         pending_login = pending_file.exists()
         pending_flow = (read_json(pending_file, {}) or {}).get('flow')
@@ -149,7 +153,7 @@ class PersonalProfileControls:
         else:
             rows.append([('🔐 Настройки входа', f'p:{token}:login_info')])
         rows += [
-            [('Убрать из очереди', f'p:{token}:stop')] if position and not status.running else
+            [('Убрать из очереди', f'p:{token}:stop')] if (position or held and not held['can_resume']) and not status.running else
             [('⏹ Остановить отправку', f'p:{token}:stop')] if status.running else
             [('▶ Запустить отправку', f'p:{token}:start')],
             [('♻ Обновить профиль', f'p:{token}:open'), ('⬅ Профили', 'nav:recipients')],
@@ -299,7 +303,12 @@ class PersonalProfileControls:
         for item in visible[:30]:
             lines.append(f'{item["position"]}. {item["label"]}')
             rows.append([(f'Отменить: {item["label"][:35]}', f'q:{profile_token(item["profile"])}:cancel')])
-        if not visible:
+        held = [item for item in snapshot.get('awaiting_login', []) if self._can_access_profile(chat_id, item['profile'])]
+        for item in held[:30]:
+            lines.append(f'{item["label"]}: {"можно продолжить" if item["can_resume"] else "нужен вход"}. Заявка сохранена.')
+            rows.append([(f'Открыть: {item["label"][:35]}', f'p:{profile_token(item["profile"])}:open'),
+                         ('Отменить', f'q:{profile_token(item["profile"])}:cancel')])
+        if not visible and not held:
             lines.append('Ваших ожидающих запусков нет.' if not self._is_admin(chat_id) else 'Ожидающих запусков нет.')
         lines.append('Профили запускаются по очереди. Повторные нажатия не добавляют копий.')
         if self._is_admin(chat_id):

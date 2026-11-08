@@ -162,6 +162,69 @@ def test_profile_buttons_start_and_queue_exact_profiles_in_simple_mode(login_ser
             browser.close()
 
 
+@pytest.mark.parametrize('theme,width', [('light', 980), ('dark', 1280)])
+def test_login_wait_is_visible_and_resumes_only_after_click(login_server, monkeypatch, theme, width):
+    from playwright.sync_api import sync_playwright
+
+    from yara_app.fileio import atomic_write_text
+    from yara_app.project_adapter import WorkerStatus
+    from yara_app.worker_queue import WorkerQueue
+
+    port, _service = login_server
+    adapter = AppShellHandler.adapter
+    adapter.add_target('alpha', 'friend', '@friend')
+    payload = adapter._read_json(adapter.profiles_path, {})
+    payload['alpha'] = {'name': 'Личный профиль ' + 'ДлинноеИмя' * 12,
+                        'targets': payload['alpha'], 'enabled': True}
+    atomic_write_text(adapter.profiles_path, json.dumps(payload, ensure_ascii=False))
+    adapter.update_control_state({'paused': False, 'stop_requested': False})
+    monkeypatch.setattr(adapter, 'get_worker_status', lambda: WorkerStatus(False, None))
+    monkeypatch.setattr(WorkerQueue, 'kick', lambda _self: True)
+    monkeypatch.setattr(WorkerQueue, '_report_failed', lambda *_args: None)
+    confirmed = set()
+    monkeypatch.setattr(adapter, 'profile_login_confirmed', lambda key: key in confirmed)
+    starts = []
+    monkeypatch.setattr(adapter, '_start_worker_profile', lambda *args, **kw: starts.append(args) or WorkerStatus(True, 123))
+    profile = next(p for p in adapter.get_profiles() if p.key == 'alpha')
+    adapter.worker_queue().enqueue_locked(profile)
+    marker = adapter._bot_profile_root('alpha') / 'state' / 'session_import_required.json'
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{}')
+    WorkerQueue(adapter).run()
+    with sync_playwright() as runtime:
+        browser = runtime.chromium.launch(channel='chrome', headless=True)
+        page = browser.new_page(viewport={'width': width, 'height': 1000})
+        errors = []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        try:
+            page.add_init_script(f'localStorage.setItem("tiktok-heart-theme", "{theme}")')
+            page.goto(f'http://127.0.0.1:{port}/')
+            assert page.locator('html').get_attribute('data-theme') == theme
+            page.locator('[data-view="profiles"]').click()
+            box = page.locator('#worker-queue-list')
+            box.get_by_text(f'{profile.label} · Нужен вход', exact=True).wait_for()
+            assert page.locator('#worker-queue-clear').is_visible()
+            box.get_by_role('button', name='Войти в TikTok', exact=True).click()
+            assert page.locator('#bot-profile').input_value() == 'alpha'
+            assert page.locator('[data-login-method="qr"]').is_visible()
+            assert not starts
+            marker.unlink()
+            confirmed.add('alpha')
+            AppShellHandler._clear_diagnostics_cache()
+            page.reload()
+            page.locator('[data-view="profiles"]').click()
+            box.get_by_text(f'{profile.label} · Можно продолжить', exact=True).wait_for()
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            assert not starts  # Rendering or restored login alone cannot send.
+            box.get_by_role('button', name='Продолжить', exact=True).click()
+            page.locator('.profile-run-status').get_by_text('В очереди · №1', exact=True).wait_for()
+            data = WorkerQueue(adapter).read()
+            assert not data['awaiting_login'] and len(data['waiting']) == 1
+            assert not starts and not errors
+        finally:
+            browser.close()
+
+
 def test_desktop_login_form_walks_username_password_code_and_clears_input(login_server):
     from playwright.sync_api import sync_playwright
     port, service = login_server

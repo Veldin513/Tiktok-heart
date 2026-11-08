@@ -94,16 +94,33 @@ def test_all_profile_entry_points_reject_unsafe_directory_names(tmp_path, key):
         profile_directory(tmp_path, key)
 
 
-def test_timeout_kills_descendant_with_inherited_output(tmp_path):
+def test_timeout_kills_descendant_with_inherited_output(tmp_path, monkeypatch):
     pid_file = tmp_path / 'child.pid'
     script = ("import subprocess,sys,time; from pathlib import Path; "
               "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
               "Path(sys.argv[1]).write_text(str(child.pid)); print('started',flush=True); time.sleep(30)")
-    start = time.monotonic()
+    command = [sys.executable, '-c', script, str(pid_file)]
+    popen = subprocess.Popen
+    ready_at = []
+    def launch_ready(args, **kwargs):
+        process = popen(args, **kwargs)
+        if args == command:
+            # Test termination of an existing descendant, not whether Windows
+            # can cold-start two Python interpreters within a single second.
+            deadline = time.monotonic() + 10
+            while not pid_file.exists():
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    process.kill()
+                    process.wait(timeout=2)
+                    pytest.fail('Test process did not create its descendant before the termination check')
+                time.sleep(0.01)
+            ready_at.append(time.monotonic())
+        return process
+    monkeypatch.setattr(subprocess, 'Popen', launch_ready)
     with pytest.raises(subprocess.TimeoutExpired):
-        run_bounded([sys.executable, '-c', script, str(pid_file)], timeout=1,
+        run_bounded(command, timeout=1,
                     creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    assert time.monotonic() - start < 5
+    assert time.monotonic() - ready_at[0] < 5
     assert pid_file.exists()
     pid = int(pid_file.read_text())
     try:

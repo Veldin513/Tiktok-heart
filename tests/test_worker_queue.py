@@ -11,7 +11,7 @@ import pytest
 
 from yara_app.fileio import file_lock
 from yara_app.project_adapter import ProjectAdapter, WorkerStatus
-from yara_app.worker_queue import WorkerQueue
+from yara_app.worker_queue import LoginRequired, WorkerQueue
 
 
 @pytest.fixture
@@ -110,7 +110,173 @@ def test_invalid_job_is_reported_and_next_profile_starts(runtime, change):
     WorkerQueue(adapter).run()
     assert [p for p, _ in state['starts']] == ['gamma']
     assert len(state['reports']) == 1 and state['reports'][0][0] == 'beta'
-    assert adapter.worker_queue().read()['history'][0]['status'] == 'failed'
+    data = adapter.worker_queue().read()
+    if change == 'login':
+        assert [j['profile'] for j in data['awaiting_login']] == ['beta']
+        assert not any(j['profile'] == 'beta' for j in data['history'])
+    else:
+        assert data['history'][0]['status'] == 'failed'
+
+
+def hold_for_login(adapter, *, requester=200):
+    enqueue(adapter, 'beta', requester=requester)
+    root = adapter._bot_profile_root('beta')
+    root.joinpath('state').mkdir(parents=True, exist_ok=True)
+    marker = root / 'state' / 'session_import_required.json'
+    marker.write_text('{}')
+    WorkerQueue(adapter).run()
+    return marker
+
+
+@pytest.mark.parametrize('blocker', ['expired', 'manual', 'invalid'])
+def test_login_wait_survives_reload_and_never_blocks_or_retries(runtime, monkeypatch, blocker):
+    from yara_app.auth_flow import record_session_validation
+    from yara_app.native_login import LOGIN_PENDING
+
+    adapter, state = runtime
+    enqueue(adapter, 'beta', requester=200)
+    enqueue(adapter, 'gamma')
+    root = adapter._bot_profile_root('beta')
+    if blocker == 'invalid':
+        record_session_validation(root / 'state', valid=False, source='test')
+    else:
+        marker = root / ('browser' if blocker == 'manual' else 'state') / (LOGIN_PENDING if blocker == 'manual' else 'session_import_required.json')
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{}')
+    WorkerQueue(adapter).run()
+    assert [p for p, _ in state['starts']] == ['gamma']
+    assert WorkerQueue(adapter).snapshot()['awaiting_login'][0]['can_resume'] is False
+    WorkerQueue(adapter).run()
+    assert len(state['reports']) == 1  # Reading/restarting does not notify repeatedly.
+    # Successful login alone must not send anything. The user resumes explicitly.
+    if blocker != 'invalid':
+        marker.unlink()
+    record_session_validation(root / 'state', valid=True, source='test')
+    monkeypatch.setattr(adapter, 'profile_login_confirmed', lambda key: key == 'beta')
+    WorkerQueue(adapter).run()
+    assert len(state['starts']) == 1
+    held_id = WorkerQueue(adapter).read()['awaiting_login'][0]['id']
+    result = adapter.start_profile_worker('beta', requester_id=200)
+    assert result.queued and result.queue_position == 1
+    assert WorkerQueue(adapter).read()['waiting'][0]['id'] == held_id
+    assert not WorkerQueue(adapter).read()['awaiting_login']
+    WorkerQueue(adapter).run()
+    assert [p for p, _ in state['starts']] == ['gamma', 'beta']
+
+
+def test_resume_requires_verified_login_and_preserves_job(runtime, monkeypatch):
+    adapter, state = runtime
+    marker = hold_for_login(adapter)
+    before = WorkerQueue(adapter).read()['awaiting_login'][0]
+    with pytest.raises(LoginRequired):
+        adapter.start_profile_worker('beta', requester_id=200)
+    marker.unlink()
+    with pytest.raises(LoginRequired):
+        adapter.start_profile_worker('beta', requester_id=200)
+    assert WorkerQueue(adapter).read()['awaiting_login'][0] == before
+    assert not state['starts']
+
+
+@pytest.mark.parametrize('change', ['revoked', 'recipient', 'disabled', 'deleted', 'mode'])
+def test_login_resume_revalidates_original_request(runtime, monkeypatch, change):
+    adapter, state = runtime
+    marker = hold_for_login(adapter)
+    marker.unlink()
+    monkeypatch.setattr(adapter, 'profile_login_confirmed', lambda _key: True)
+    if change == 'revoked':
+        config = json.loads(adapter.telegram_config_path.read_text())
+        config['profile_owners'] = {}
+        adapter.telegram_config_path.write_text(json.dumps(config))
+    elif change == 'mode':
+        adapter.update_control_state({'dry_run': True})
+    else:
+        profiles = json.loads(adapter.profiles_path.read_text())
+        if change == 'deleted':
+            del profiles['beta']
+        elif change == 'disabled':
+            profiles['beta'] = {'enabled': False, 'targets': profiles['beta']}
+        else:
+            profiles['beta'][0]['url'] = '@someone_else'
+        adapter.profiles_path.write_text(json.dumps(profiles))
+    # Even an admin's new click must not replace the original revoked owner.
+    with pytest.raises((ValueError, PermissionError)):
+        adapter.start_profile_worker('beta', requester_id=100)
+    assert not state['starts']
+    assert WorkerQueue(adapter).read()['awaiting_login'][0]['requester'] == 200
+    assert WorkerQueue(adapter).cancel('beta') == 1
+
+
+def test_duplicate_click_does_not_replace_original_requester(runtime):
+    adapter, state = runtime
+    enqueue(adapter, 'beta', requester=200)
+    enqueue(adapter, 'beta', ignore_cooldown=True, requester=100)
+    item = WorkerQueue(adapter).read()['waiting'][0]
+    assert item['requester'] == 200 and item['ignore_cooldown'] is False
+    config = json.loads(adapter.telegram_config_path.read_text())
+    config['profile_owners'] = {}
+    adapter.telegram_config_path.write_text(json.dumps(config))
+    WorkerQueue(adapter).run()
+    assert not state['starts']
+
+
+def test_resume_drops_old_boot_and_manual_exceptions(runtime, monkeypatch):
+    adapter, state = runtime
+    monkeypatch.setenv('WORKER_FORCE_SEND_ON_BOOT', '1')
+    enqueue(adapter, 'beta', requester=200, ignore_cooldown=True)
+    marker = hold_for_login(adapter)
+    marker.unlink()
+    monkeypatch.setattr(adapter, 'profile_login_confirmed', lambda _key: True)
+    adapter.start_profile_worker('beta', requester_id=200)
+    WorkerQueue(adapter).run()
+    assert state['starts'] == [('beta', {'ignore_cooldown': False, 'boot_force': False})]
+
+
+def test_error_after_launch_attempt_is_never_treated_as_safe_login_wait(runtime, monkeypatch):
+    adapter, _state = runtime
+    enqueue(adapter, 'beta')
+    def uncertain_start(*_args, **_kwargs):
+        raise LoginRequired('A process might already have started')
+    monkeypatch.setattr(adapter, '_start_worker_profile', uncertain_start)
+    WorkerQueue(adapter).run()
+    data = WorkerQueue(adapter).read()
+    assert not data['awaiting_login'] and not data['waiting']
+    assert data['history'][0]['status'] == 'failed'
+
+
+def test_stop_all_also_cancels_jobs_waiting_for_login(runtime, monkeypatch):
+    adapter, state = runtime
+    hold_for_login(adapter)
+    monkeypatch.setattr(adapter, 'stop_worker', lambda: WorkerStatus(False, None))
+    monkeypatch.setattr(adapter, 'stop_telegram_bot', lambda: WorkerStatus(False, None))
+    adapter.stop_all()
+    data = WorkerQueue(adapter).read()
+    assert not data['awaiting_login'] and not state['starts']
+    assert data['history'][0]['status'] == 'cancelled'
+
+
+def test_held_only_queue_does_not_start_idle_dispatcher(tmp_path, monkeypatch):
+    adapter = ProjectAdapter(tmp_path)
+    adapter.ensure_runtime_files()
+    adapter.create_profile('beta')
+    enqueue(adapter, 'beta')
+    queue = WorkerQueue(adapter)
+    data = queue.read()
+    data['awaiting_login'].append(data['waiting'].pop())
+    queue.save(data)
+    monkeypatch.setattr('yara_app.worker_queue.subprocess.Popen', lambda *_a, **_kw: pytest.fail('idle dispatcher started'))
+    assert queue.kick()
+
+
+def test_legacy_queue_is_read_without_overwriting_or_losing_fields(runtime):
+    adapter, _state = runtime
+    queue = WorkerQueue(adapter)
+    old = {'waiting': [], 'current': None, 'history': [], 'extension': {'keep': True}}
+    original = json.dumps(old)
+    queue.path.write_text(original)
+    data = queue.read()
+    assert data['awaiting_login'] == [] and queue.path.read_text() == original
+    queue.save(data)
+    assert queue.read()['extension'] == {'keep': True}
 
 
 def test_cancellation_cannot_stop_other_profile(runtime, monkeypatch):
@@ -167,7 +333,9 @@ def test_crashed_current_is_never_replayed(runtime):
 
 
 @pytest.mark.parametrize('bad', ['{broken', '{"waiting":[],"history":[],"current":{}}',
-                                 '{"waiting":[{}],"history":[],"current":null}'])
+                                 '{"waiting":[{}],"history":[],"current":null}',
+                                 '{"waiting":[],"history":[],"awaiting_login":{}}',
+                                 '{"waiting":[],"history":[],"awaiting_login":[{}]}'])
 def test_corrupt_queue_fails_closed_without_overwrite(runtime, bad):
     adapter, state = runtime
     queue = adapter.worker_queue()

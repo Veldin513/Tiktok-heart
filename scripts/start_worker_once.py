@@ -193,8 +193,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Start the Yara worker once.")
     parser.add_argument("--self-test", action="store_true", help="validate runtime without starting worker")
     parser.add_argument("--no-browser", action="store_true", help="skip Chromium auth probe during self-test")
+    parser.add_argument('--diagnostic-only', action='store_true', help='read-only diagnostic self-test')
+    parser.add_argument('--profile', help='profile to check during diagnostic self-test')
     parser.add_argument("--boot-force", action="store_true", help="force one cooldown bypass for a Windows startup task")
     args = parser.parse_args()
+
+    if args.diagnostic_only:
+        if not args.self_test or not args.no_browser:
+            parser.error('--diagnostic-only requires --self-test --no-browser')
+        from yara_app.diagnostic_service import DiagnosticService
+        report = DiagnosticService(ProjectAdapter(PROJECT_ROOT)).collect(args.profile, include_schedule=False)
+        ok = not any(c.get('blocking') or c['status'] == 'unknown' for c in report['checks'] if c['essential'])
+        print(json.dumps({'ok': ok, 'safe_mode': 'no_send', 'report': report}, ensure_ascii=False))
+        return 0 if ok else 2
 
     adapter = ProjectAdapter(PROJECT_ROOT)
     adapter.ensure_runtime_files()

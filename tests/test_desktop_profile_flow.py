@@ -33,7 +33,9 @@ def test_home_profile_selection_and_personal_text_do_not_change_schedule(tmp_pat
             if path in {'/api/live', '/api/diagnostics'}:
                 data = diag
             elif path == '/api/profile-overview':
-                data = {'readiness': {'label': 'Можно запустить', 'kind': 'ok'}, 'scheduled': key == 'alpha',
+                data = {'label': key, 'readiness': {'label': 'Можно запустить', 'kind': 'ok'}, 'scheduled': key == 'alpha',
+                        'queue': {'target_count': 1, 'ready_count': int(key == 'beta'),
+                                  'cooldown_count': int(key == 'alpha'), 'next_send_in_s': 7200},
                         'run': {'completed_at': 1793556099, 'reason': 'chat_blocked',
                                 'outcome': {'code': 'failed', 'label': f'{key}: отправка не выполнена', 'kind': 'bad'}}}
             elif path == '/api/profile-messages':
@@ -64,6 +66,10 @@ def test_home_profile_selection_and_personal_text_do_not_change_schedule(tmp_pat
         page.select_option('#launch-profile', 'beta')
         page.wait_for_function("document.querySelector('#home-last-result').textContent.includes('beta')")
         assert page.locator('#launch-selected').is_enabled()
+        assert page.locator('#queue-value').inner_text() == 'Можно отправить'
+        assert 'alpha' in page.locator('#home-schedule-profile').inner_text()
+        assert page.locator('#view-overview #open-checks').count() == 1
+        assert 'Профилей: 2' in page.locator('.home-system-summary').inner_text()
         page.click('[data-view="messages"]')
         page.select_option('#message-scope', 'beta')
         page.wait_for_function("document.querySelector('#message-editor').value === 'Own text'")
@@ -84,6 +90,9 @@ def test_home_profile_selection_and_personal_text_do_not_change_schedule(tmp_pat
                 assert page.locator('#launch-selected').is_visible()
                 assert page.locator('#home-telegram').is_visible()
                 assert page.locator('#view-overview [data-action="stop_all"]').is_visible()
-            page.screenshot(path=str(tmp_path / f'home-{theme}.png'), full_page=True)
+                assert page.locator('#view-overview details').count() == 0
+                assert page.locator('#view-overview [data-action="stop_all"]').bounding_box()['y'] < 500
+                assert page.locator('#queue-value').bounding_box()['y'] < 720
+            page.screenshot(path=str(tmp_path / f'home-{theme}.png'), full_page=True, animations='disabled')
         assert not errors
         browser.close()

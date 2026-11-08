@@ -261,6 +261,36 @@ def test_queue_menu_hides_other_profiles_and_scopes_cancel(bot, monkeypatch):
     assert not bot.adapter.worker_queue().read()['waiting']
 
 
+def test_login_wait_menu_hides_other_users_and_cancels_only_own_job(bot, monkeypatch):
+    from yara_app.worker_queue import WorkerQueue
+
+    alice = add_recipient(bot, 200, 'alice_target')
+    bob = add_recipient(bot, 300, 'bob_target')
+    adapter = bot.adapter
+    adapter.update_control_state({'paused': False, 'stop_requested': False})
+    monkeypatch.setattr(adapter, 'get_worker_status', lambda: WorkerStatus(False, None))
+    monkeypatch.setattr(WorkerQueue, 'kick', lambda _self: True)
+    monkeypatch.setattr(WorkerQueue, '_report_failed', lambda *_args: None)
+    for user, key in [(200, alice), (300, bob)]:
+        profile = next(p for p in adapter.get_profiles() if p.key == key)
+        adapter.worker_queue().enqueue_locked(profile, requester=user)
+        marker = adapter._bot_profile_root(key) / 'state' / 'session_import_required.json'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{}')
+    WorkerQueue(adapter).run()
+    bot.process_update(callback(200, 'nav:queue'))
+    text = bot.api.messages[-1][1]
+    assert '200' in text and '300' not in text and 'нужен вход' in text
+    bot.process_update(callback(200, f'q:{profile_token(bob)}:cancel'))
+    assert 'недоступен' in bot.api.messages[-1][1]
+    bot.process_update(callback(200, f'p:{profile_token(alice)}:open'))
+    assert 'Заявка сохранена' in bot.api.messages[-1][1]
+    bot.process_update(callback(200, f'q:{profile_token(alice)}:cancel'))
+    assert [j['profile'] for j in WorkerQueue(adapter).read()['awaiting_login']] == [bob]
+    bot.process_update(callback(100, 'q:all:cancel'))
+    assert not WorkerQueue(adapter).read()['awaiting_login']
+
+
 def test_reports_go_to_admin_and_own_user_only(bot, monkeypatch):
     monkeypatch.delenv('TG_DISABLE_NOTIFICATIONS', raising=False)
     calls = []

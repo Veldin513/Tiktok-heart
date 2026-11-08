@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ru" data-ui-mode="simple">
+<html lang="ru" data-ui-mode="simple" data-current-view="overview">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -17,13 +17,13 @@
           </div>
         </div>
         <nav class="nav">
-          <button class="nav-item active" data-view="overview">Обзор</button>
+          <button class="nav-item active" data-view="overview">Главная</button>
           <button class="nav-item" data-view="browser">Браузер</button>
           <button class="nav-item" data-view="messages">Сообщения</button>
           <button class="nav-item" data-view="profiles">Профили и очередь</button>
           <button class="nav-item" data-view="protection">Защита</button>
           <button class="nav-item" data-view="services" data-advanced-nav>Управление</button>
-          <button class="nav-item" data-view="diagnostics" data-advanced-nav>Проверка</button>
+          <button class="nav-item" data-view="diagnostics">Диагностика</button>
           <button class="nav-item" data-view="logs" data-advanced-nav>Журнал</button>
         </nav>
         <div class="sidebar-footer">
@@ -61,131 +61,61 @@
         </section>
 
         <section class="view active" id="view-overview">
-          <div class="hero-grid">
-            <article class="health-panel">
-              <div class="panel-title">Готовность к запуску</div>
-              <div class="health-head">
-                <div>
-                  <div id="health-label" class="health-label">Проверка</div>
-                  <div id="health-summary" class="health-summary">Загрузка...</div>
-                </div>
-                <div class="health-score"><span id="health-score">--</span><small>/100</small></div>
+          <article class="panel home-control">
+              <div class="row-title home-heading">
+                <h2>Отправка сообщения</h2>
               </div>
-              <div class="score-track"><span id="health-score-fill"></span></div>
-              <div id="health-flags" class="health-flags"></div>
-            </article>
-            <article class="quick-card">
-              <div class="panel-title">Быстрые действия</div>
               <label class="field-label" for="launch-profile">Профиль для отправки</label>
               <select id="launch-profile" class="select" aria-label="Профиль для отправки"></select>
-              <p id="launch-readiness" class="hint" role="status">Загрузка…</p>
-              <p id="home-current-state" class="hint" role="status"></p>
-              <div class="button-grid">
+              <div class="home-status-line">
+                <span id="home-readiness" class="badge" role="status">Проверяем профиль…</span>
+                <span id="launch-readiness" class="hint">Загрузка…</span>
+              </div>
+              <div class="home-primary-actions">
                 <button id="launch-selected" class="btn primary" disabled>Запустить</button>
                 <button id="home-telegram" class="btn secondary" data-action="start_telegram">Включить Telegram</button>
                 <button class="btn danger" data-action="stop_all">Остановить всё</button>
               </div>
-              <p class="hint">Закрытие окна не отменяет расписание.</p>
-              <div class="panel-title sub-title">Последняя попытка</div>
+              <p id="home-current-state" class="hint" role="status"></p>
+          </article>
+
+          <div class="home-summary-grid">
+            <article class="panel home-summary-card">
+              <div class="panel-title">Последняя попытка</div>
               <p id="home-last-result" role="status">Загрузка…</p>
               <p id="home-last-meta" class="hint"></p>
               <p id="home-notification" class="hint"></p>
-              <details class="inline-disclosure">
-                <summary>Дополнительные действия</summary>
-                <div class="button-grid compact-actions">
-                  <button class="btn secondary" data-action="restart_all">Перезапустить всё</button>
-                  <button class="btn secondary" data-action="reset_runtime_flags">Сброс флагов</button>
-                </div>
-              </details>
             </article>
-          </div>
-
-          <div class="card-grid six">
-            <article class="metric-card">
-              <div class="metric-label">Профиль</div>
-              <div class="metric-value" id="profile-value">--</div>
-              <div class="metric-meta" id="profile-meta">--</div>
-            </article>
-            <article class="metric-card">
-              <div class="metric-label">Следующий запуск</div>
+            <article class="panel home-summary-card">
+              <div class="panel-title">Ближайшая автоматика</div>
               <div class="metric-value" id="schedule-value">--</div>
               <div class="metric-meta" id="schedule-card-meta">--</div>
+              <p id="home-schedule-profile" class="hint"></p>
+              <p class="hint">Закрытие окна не отключает настроенное расписание.</p>
             </article>
-            <article class="metric-card">
-              <div class="metric-label">Готовность адресатов</div>
+            <article class="panel home-summary-card">
+              <div class="panel-title">Следующее сообщение профиля</div>
               <div class="metric-value" id="queue-value">--</div>
               <div class="metric-meta" id="queue-meta">--</div>
+              <p id="home-queue-status" class="hint"></p>
+              <button class="btn secondary mini" data-go-view="profiles">Открыть очередь</button>
             </article>
           </div>
 
-          <div class="content-grid focus-grid">
-            <article class="panel focus-card">
-              <div class="panel-title">Следующее действие</div>
-              <div id="focus-next" class="focus-value">--</div>
-              <div id="focus-next-meta" class="focus-meta">--</div>
-            </article>
-            <article class="panel focus-card">
-              <div class="panel-title">Что мешает</div>
-              <div id="focus-blocker" class="focus-value">--</div>
-              <div id="focus-blocker-meta" class="focus-meta">--</div>
-            </article>
-          </div>
-
-          <details id="overview-details" class="disclosure overview-disclosure">
-            <summary>Подробности и диагностика</summary>
-            <div class="disclosure-content">
-          <div class="content-grid">
-            <article class="panel">
-              <div class="panel-title">Операционная сводка</div>
-              <div id="setup-summary" class="setup-summary"></div>
-              <div id="overview-timeline" class="timeline-list"></div>
-              <div class="button-grid top-gap">
-                <button class="btn secondary" data-go-view="browser">Вход в TikTok</button>
-                <button class="btn secondary" data-go-view="services">Автозапуск</button>
-                <button class="btn secondary" data-open-kind="browser_profile">Открыть профиль</button>
-                <button class="btn secondary" data-open-kind="logs">Логи</button>
+          <article class="panel home-system-summary">
+            <div>
+              <div class="panel-title">Техническая сводка <span id="home-version" class="hint"></span></div>
+              <div class="home-system-line">
+                <span id="home-environment">Компоненты: проверяются…</span>
+                <span id="home-protection">Защита: проверяется…</span>
+                <span id="home-profile-count">Профилей: —</span>
+                <span id="home-mode">Режим —</span>
               </div>
-            </article>
-            <article class="panel">
-              <div class="panel-title">Текущий прогон</div>
-              <div id="run-progress" class="run-progress"></div>
-              <pre id="run-state" class="mono-block"></pre>
-              <div id="run-history" class="history-list"></div>
-            </article>
-          </div>
-
-          <div class="content-grid">
-            <article class="panel span-2">
-              <div class="panel-title row-title">
-                <span>Этапы работы</span>
-                <button id="overview-worker-self-test-button" class="btn secondary mini">Проверить без отправки</button>
-              </div>
-              <div id="worker-lifecycle" class="lifecycle-list"></div>
-            </article>
-          </div>
-
-          <div class="content-grid">
-            <article class="panel">
-              <div class="panel-title">Сигналы</div>
-              <div id="health-signals" class="signal-list"></div>
-            </article>
-            <article class="panel">
-              <div class="panel-title">Что сделать</div>
-              <div id="recommendations" class="list-block"></div>
-            </article>
-          </div>
-          <div class="content-grid">
-            <article class="panel span-2">
-              <div class="panel-title row-title">
-                <span>Быстродействие</span>
-                <button class="btn secondary mini" data-open-log-source="app_shell_perf">Открыть лог</button>
-              </div>
-              <div id="performance-summary" class="performance-grid"></div>
-            </article>
-          </div>
             </div>
-          </details>
-          <pre id="setup-report" class="visually-hidden"></pre>
+            <button class="btn secondary mini" id="open-checks">Подробнее в диагностике</button>
+          </article>
+
+
         </section>
 
         <section class="view" id="view-messages">
@@ -389,6 +319,8 @@
                 <button class="btn secondary" data-go-view="profiles">Открыть профили и очередь</button>
                 <button class="btn secondary" data-action="stop_worker">Остановить текущую</button>
                 <button class="btn secondary" data-action="restart_worker">Перезапустить</button>
+                <button class="btn secondary" data-action="restart_all">Перезапустить всё</button>
+                <button class="btn secondary" data-action="reset_runtime_flags">Сброс флагов</button>
               </div>
             </article>
             <article class="panel">
@@ -470,15 +402,31 @@
 
         <section class="view" id="view-diagnostics">
           <div class="content-grid">
-            <article class="panel">
-              <div class="panel-title">Сигналы</div>
-              <div id="diagnostic-issues" class="list-block"></div>
+            <article class="panel span-2">
+              <div class="panel-title">Проверка приложения</div>
+              <p class="hint">Покажет, что мешает работе и как это исправить. Сообщения не отправляются.</p>
+              <label class="field-label" for="diagnostic-profile">Профиль для проверки</label>
+              <select id="diagnostic-profile" class="select" aria-label="Профиль для проверки"></select>
+              <div class="diagnostic-actions">
+                <button id="diagnostic-run" class="btn primary">Проверить приложение</button>
+                <button id="diagnostic-self-test" class="btn secondary">Самотест запуска</button>
+                <button id="diagnostic-copy" class="btn secondary" disabled>Скопировать отчёт</button>
+              </div>
+              <p id="diagnostic-summary" class="hint" role="status" aria-live="polite">Выберите профиль и выполните проверку.</p>
+              <p id="diagnostic-meta" class="hint"></p>
+              <p id="diagnostic-test-result" class="hint" role="status"></p>
             </article>
-            <article class="panel">
+            <div id="diagnostic-results" class="diagnostic-grid span-2"></div>
+            <article class="panel span-2">
+              <div class="panel-title">Предыдущие проверки</div>
+              <div id="diagnostic-history" class="list-block">Проверок пока нет.</div>
+              <p class="hint">Самотест проверяет запуск отдельного процесса и данные приложения без браузера. Проверки кода разработчика выполняются отдельно на временных данных.</p>
+            </article>
+            <article class="panel" data-advanced>
               <div class="panel-title">Зависимости</div>
               <div id="dependency-list" class="dependency-list"></div>
             </article>
-            <article class="panel span-2">
+            <article class="panel span-2" data-advanced>
               <div class="panel-title row-title">
                 <span>Файлы проекта</span>
                 <span>
@@ -489,12 +437,67 @@
               </div>
               <div id="file-list" class="file-list"></div>
             </article>
-            <details class="disclosure span-2 raw-diagnostics">
+            <details class="disclosure span-2 raw-diagnostics" data-advanced>
               <summary>Технические данные</summary>
               <div class="disclosure-content">
                 <pre id="raw-diagnostics" class="mono-block compact"></pre>
               </div>
             </details>
+          <details id="diagnostic-technical-summary" class="disclosure overview-disclosure span-2" data-advanced>
+            <summary>Техническая сводка профиля расписания</summary>
+            <div class="disclosure-content">
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Операционная сводка</div>
+              <div id="setup-summary" class="setup-summary"></div>
+              <div id="overview-timeline" class="timeline-list"></div>
+              <div class="button-grid top-gap">
+                <button class="btn secondary" data-go-view="browser">Вход в TikTok</button>
+                <button class="btn secondary" data-go-view="services">Автозапуск</button>
+                <button class="btn secondary" data-open-kind="browser_profile">Открыть профиль</button>
+                <button class="btn secondary" data-open-kind="logs">Логи</button>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Текущий прогон</div>
+              <div id="run-progress" class="run-progress"></div>
+              <pre id="run-state" class="mono-block"></pre>
+              <div id="run-history" class="history-list"></div>
+            </article>
+          </div>
+
+          <div class="content-grid">
+            <article class="panel span-2">
+              <div class="panel-title row-title">
+                <span>Этапы работы</span>
+                <button id="overview-worker-self-test-button" class="btn secondary mini">Проверить без отправки</button>
+              </div>
+              <div id="worker-lifecycle" class="lifecycle-list"></div>
+            </article>
+          </div>
+
+          <div class="content-grid">
+            <article class="panel">
+              <div class="panel-title">Сигналы</div>
+              <div id="health-signals" class="signal-list"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-title">Что сделать</div>
+              <div id="recommendations" class="list-block"></div>
+            </article>
+          </div>
+          <div class="content-grid">
+            <article class="panel span-2">
+              <div class="panel-title row-title">
+                <span>Быстродействие</span>
+                <button class="btn secondary mini" data-open-log-source="app_shell_perf">Открыть лог</button>
+              </div>
+              <div id="performance-summary" class="performance-grid"></div>
+            </article>
+          </div>
+            </div>
+          </details>
+          <pre id="setup-report" class="visually-hidden"></pre>
           </div>
         </section>
 

@@ -19,6 +19,13 @@ const state = {
   activeView: "overview",
   selectedProfileKey: null,
   launchProfileKey: null,
+  diagnosticProfileKey: null,
+  diagnosticRequest: 0,
+  diagnosticBusy: false,
+  diagnosticReport: null,
+  diagnosticHistory: [],
+  homeReadiness: null,
+  homeQueue: null,
   messageScope: "",
   messageRevision: null,
   homeRequest: 0,
@@ -240,7 +247,7 @@ function applyTheme(theme) {
 }
 
 function isAdvancedView(view) {
-  return ["services", "diagnostics", "logs"].includes(view);
+  return ["services", "logs"].includes(view);
 }
 
 function applyUiMode(mode) {
@@ -357,10 +364,6 @@ function renderLiveStatus(diag, options = {}) {
     ? `Просрочено: ${schedule.next_run_time || ""}`
     : (schedule.next_run_time || "");
   setText("#schedule-card-meta", scheduleMetaLabel(schedule));
-  setText("#queue-value", queue.ready_count ? `${queue.ready_count} готово` : formatDuration(queue.next_send_in_s));
-  setText("#queue-meta", queue.target_count
-    ? `${queue.cooldown_count || 0} ожидают · ${queue.next_target || "без очереди"}`
-    : "адресатов нет");
   if (browser.size_bytes !== undefined) {
     setText("#browser-size-value", formatBytes(browser.size_bytes));
   }
@@ -399,26 +402,13 @@ function renderLiveStatus(diag, options = {}) {
 }
 
 function renderHealth(health) {
-  const hasScore = Number.isFinite(health.score);
-  const score = hasScore ? Math.max(0, Math.min(100, health.score)) : 0;
-  const kind = healthKind(health.status);
-  const panel = $(".health-panel");
-  panel.className = `health-panel ${kind}`;
-  $("#health-score").textContent = hasScore ? String(score) : "--";
-  $("#health-label").textContent = text(health.label, "Проверка");
-  $("#health-summary").textContent = text(health.summary, "Нет данных");
-  $("#health-score-fill").style.width = `${score}%`;
-
-  const flags = $("#health-flags");
-  flags.innerHTML = "";
-  const visible = (health.issues || []).filter((item) => item.severity !== "info").slice(0, 3);
-  const data = visible.length ? visible : [{ severity: kind, title: kind === "ok" ? "Блокеров нет" : text(health.label) }];
-  for (const item of data) {
-    const flag = document.createElement("div");
-    flag.className = `health-flag ${healthKind(item.severity)}`;
-    flag.textContent = item.title || item.severity;
-    flags.appendChild(flag);
-  }
+  // The overview describes its selected profile, never a percentage calculated
+  // from another profile, optional services or historical log lines.
+  const selected = state.homeReadiness;
+  const ready = selected && selected.key === state.launchProfileKey;
+  const badge = $("#home-readiness");
+  badge.className = `badge ${ready ? badgeKind(selected.kind) : ""}`;
+  badge.textContent = ready ? selected.label : "Проверяем профиль…";
 }
 
 function renderHealthSignals(items) {
@@ -568,6 +558,13 @@ function renderProfileSelectors(diag) {
   tg.dataset.action = diag.telegram_bot?.running ? "stop_telegram" : "start_telegram";
   tg.textContent = diag.telegram_bot?.running ? "Выключить Telegram" : "Включить Telegram";
   tg.disabled = !diag.telegram_bot?.running && diag.telegram_ready === false;
+  setText("#home-profile-count", `Профилей: ${diag.profiles?.total ?? profiles.length}`);
+  const scheduled = profiles.find(p => p.active);
+  setText("#home-schedule-profile", scheduled?.key === state.launchProfileKey ? "Для выбранного профиля" : `Для профиля: ${scheduled?.label || diag.state?.active_profile || "не выбран"}`);
+  const queue = diag.worker_queue || {};
+  const waiting = (queue.waiting || []).find(p => p.profile === state.launchProfileKey);
+  const held = (queue.awaiting_login || []).find(p => p.profile === state.launchProfileKey);
+  setText("#home-queue-status", waiting ? `В очереди: место ${waiting.position}` : held ? "Заявка сохранена до входа и продолжения" : queue.current ? `Сейчас работает: ${queue.current.label || queue.current.profile}` : "Очередь свободна");
 }
 
 async function loadHomeProfile() {
@@ -575,10 +572,26 @@ async function loadHomeProfile() {
   if (!key) return;
   const request = ++state.homeRequest;
   try {
-    const data = await api(`/api/profile-overview?profile_key=${encodeURIComponent(key)}`);
+    const data = await api(`/api/profile-overview?profile_key=${encodeURIComponent(key)}&compact=1`);
     if (request !== state.homeRequest || key !== state.launchProfileKey) return;
-    $("#launch-readiness").textContent = data.readiness.label + (data.scheduled ? " · выбран для расписания" : "");
-    $("#launch-selected").disabled = data.readiness.kind !== "ok";
+    $("#launch-readiness").textContent = data.readiness.kind !== "ok" ? ({browser: "Проверьте вход в разделе «Браузер»", profiles: "Откройте профиль и проверьте адресата"})[data.readiness.action] || "Откройте диагностику для подробностей" : data.scheduled ? "Используется в расписании" : "Разовый запуск; профиль расписания не меняется";
+    state.homeReadiness = {key, ...data.readiness, details: `${data.label}. Это локальная готовность профиля; подробные проверки — в диагностике.`};
+    renderHealth({});
+    const queue = state.diagnostics?.worker_queue || {};
+    const paused = Boolean(state.diagnostics?.state?.paused);
+    const dryRun = Boolean(state.diagnostics?.state?.dry_run);
+    if (paused || dryRun) {
+      state.homeReadiness = {key, kind: "warn", label: paused ? "Общая пауза" : "Режим проверки"};
+      renderHealth({});
+      $("#launch-readiness").textContent = paused ? "Снимите паузу в управлении для продолжения" : "Проверка без настоящей отправки";
+    }
+    const waiting = (queue.waiting || []).find(p => p.profile === key);
+    const held = (queue.awaiting_login || []).find(p => p.profile === key);
+    $("#launch-selected").disabled = data.readiness.kind !== "ok" || paused || Boolean(waiting) || Boolean(data.worker_running);
+    $("#launch-selected").textContent = data.worker_running ? "Отправляется…" : waiting ? `В очереди · №${waiting.position}` : held ? "Продолжить" : queue.current ? "В очередь" : dryRun ? "Запустить проверку" : "Запустить";
+    state.homeQueue = data.queue || {};
+    setText("#home-protection", data.browser?.protection_error ? "Защита: нужна проверка" : data.browser?.protected ? "Защита: включена" : "Защита: не включена");
+    renderHomeQueue();
     const result = data.run?.outcome;
     const run = data.run || {};
     const at = Number(run.completed_at || run.updated_at || 0);
@@ -614,6 +627,11 @@ async function loadHomeProfile() {
       : "";
   } catch (error) {
     if (request !== state.homeRequest) return;
+    state.homeReadiness = {key, kind: "warning", label: "Не удалось проверить", details: error.message};
+    state.homeQueue = null;
+    setText("#home-protection", "Защита: не удалось проверить");
+    renderHomeQueue();
+    renderHealth({});
     $("#launch-selected").disabled = true;
     $("#launch-readiness").textContent = error.message;
   }
@@ -731,14 +749,15 @@ function renderProfileRunControls(diag) {
     const profile = profiles.find((p) => p.key === key);
     if (!profile) continue;
     const waiting = (queue.waiting || []).find((p) => p.profile === key);
+    const held = (queue.awaiting_login || []).find((p) => p.profile === key);
     const running = queue.current?.profile === key;
     const empty = !Number(profile.target_count || profile.targets?.length || 0);
-    const label = running ? "Выполняется" : waiting ? `В очереди · №${waiting.position}` : !profile.enabled ? "Отключён" : empty ? "Нет адресата" : "Не запущен";
+    const label = running ? "Выполняется" : waiting ? `В очереди · №${waiting.position}` : held ? (held.can_resume ? "Можно продолжить" : "Нужен вход") : !profile.enabled ? "Отключён" : empty ? "Нет адресата" : "Не запущен";
     const badge = item.querySelector(".profile-run-status");
     badge.textContent = label;
     badge.className = `badge profile-run-status ${running ? "ok" : waiting ? "info" : ""}`;
-    const action = running ? "stop" : waiting ? "cancel_queue" : "start";
-    const buttonText = running ? "Остановить" : waiting ? "Отменить ожидание" : queue.current || queue.waiting?.length ? "В очередь" : "Запустить";
+    const action = running ? "stop" : waiting || held && !held.can_resume ? "cancel_queue" : "start";
+    const buttonText = running ? "Остановить" : action === "cancel_queue" ? "Отменить ожидание" : held ? "Продолжить" : queue.current || queue.waiting?.length ? "В очередь" : "Запустить";
     const disabled = action === "start" && (!profile.enabled || empty || queue.paused || queue.error);
     const reason = empty ? "Добавьте адресата" : queue.paused ? "Снимите общую паузу" : !profile.enabled ? "Включите профиль в его настройках" : "";
     const html = `<button class="btn ${action === "start" ? "primary" : "secondary"}" data-profile-action="${action}" data-profile-key="${escapeHtml(key)}" title="${escapeHtml(disabled ? reason : buttonText)}" ${disabled ? "disabled" : ""}>${buttonText}</button>`;
@@ -954,6 +973,10 @@ function renderOverviewSummary(diag) {
   const telegram = diag.telegram_bot || {};
   const run = diag.run || {};
   const app = diag.app || {};
+  setText("#home-version", app.version ? `· ${app.version}` : "");
+  setText("#home-mode", stateData.dry_run ? "Режим: проверка без отправки" : "Режим: отправка сообщений");
+  const required = (diag.dependencies?.modules || []).filter(item => item.required);
+  setText("#home-environment", !required.length ? "Компоненты: ещё не проверены" : required.every(item => item.installed) ? "Компоненты: найдены" : "Компоненты: нужна проверка");
   const summary = $("#setup-summary");
   const report = $("#setup-report");
   const timeline = $("#overview-timeline");
@@ -1608,12 +1631,17 @@ function activateView(view) {
     view = "overview";
   }
   state.activeView = view;
+  document.documentElement.dataset.currentView = view;
   const navButton = $(`.nav-item[data-view="${view}"]`);
   $$(".nav-item").forEach((item) => item.classList.toggle("active", item === navButton));
   $$(".view").forEach((node) => node.classList.toggle("active", node.id === `view-${view}`));
   $("#page-title").textContent = navButton ? navButton.textContent.trim() : "TikTok Heart";
-  if (["browser", "profiles", "services", "diagnostics"].includes(view)) {
+  if (["browser", "profiles", "services"].includes(view)) {
     loadFullDiagnostics().catch((error) => toast(error.message));
+  }
+  if (view === "diagnostics") {
+    loadAppChecks().catch(error => toast(error.message));
+    loadCheckHistory().catch(error => { $("#diagnostic-history").textContent = error.message; });
   }
   if (view === "messages") {
     loadMessages().catch((error) => toast(error.message));
@@ -1628,16 +1656,122 @@ function activateView(view) {
   }
 }
 
+function renderAppChecks(report, historical = false) {
+  state.diagnosticReport = report;
+  const selector = $("#diagnostic-profile");
+  selector.innerHTML = (report.profiles || []).map(p => `<option value="${escapeHtml(p.key)}">${escapeHtml(p.label)}</option>`).join("");
+  state.diagnosticProfileKey = report.profile_key || null;
+  selector.value = report.profile_key || "";
+  $("#diagnostic-summary").textContent = `${historical ? "Сохранённая проверка. " : ""}${report.summary}`;
+  $("#diagnostic-meta").textContent = `${report.profile_label || "Профиль не выбран"} · ${formatDate(report.checked_at)} · ${report.duration_ms} мс. ${report.scope}${report.log_saved === false ? " Журнал не удалось сохранить; скопируйте отчёт." : ""}`;
+  const actions = {browser: "Открыть вход", profiles: "Открыть профиль", messages: "Настроить текст", services: "Открыть управление", logs: "Открыть журнал", protection: "Открыть защиту"};
+  $("#diagnostic-results").innerHTML = (report.checks || []).map(item => `
+    <article class="panel diagnostic-check" data-check-key="${escapeHtml(item.key)}">
+      <span class="badge ${badgeKind(item.status)}">${escapeHtml(item.state)}</span>
+      <h3>${escapeHtml(item.title)}</h3><p class="hint">${escapeHtml(item.details)}</p>
+      ${item.verified_at ? `<p class="hint">Когда проверялся вход: ${escapeHtml(formatDate(item.verified_at))}</p>` : ""}
+      ${item.attempt_at ? `<p class="hint">Время попытки: ${escapeHtml(formatDate(item.attempt_at))}</p>` : ""}
+      ${item.status !== "ok" && actions[item.action] ? `<button class="btn secondary mini" data-check-action="${escapeHtml(item.action)}">${actions[item.action]}</button>` : ""}
+    </article>`).join("");
+  const probe = report.self_test;
+  $("#diagnostic-test-result").textContent = probe ? `${probe.ok ? "Самотест пройден" : "Самотест требует внимания"}. ${probe.details} TikTok и отправка не запускались.` : "Самотест отдельного процесса в этой проверке не выполнялся.";
+  if (probe && !probe.ok) {
+    const failures = (probe.checks || []).filter(c => c.blocking || c.status === "unknown");
+    if (failures.length) $("#diagnostic-test-result").textContent += ` Причины: ${failures.map(c => `${c.title}: ${c.state}`).join("; ")}.`;
+  }
+  $("#diagnostic-copy").disabled = false;
+}
+
+async function loadAppChecks(mode = "preview") {
+  if (state.diagnosticBusy) return;
+  const run = mode !== "preview";
+  const request = ++state.diagnosticRequest;
+  const key = state.diagnosticProfileKey || state.launchProfileKey || "";
+  if (run) state.diagnosticBusy = true;
+  for (const id of ["diagnostic-run", "diagnostic-self-test", "diagnostic-profile"]) $("#" + id).disabled = run;
+  $("#diagnostic-summary").textContent = mode === "self-test" ? "Выполняется самотест запуска. Подождите…" : "Проверяем приложение…";
+  try {
+    const report = await api(run ? `/api/checks/${mode}` : `/api/checks?profile_key=${encodeURIComponent(key)}`,
+      run ? {method: "POST", body: JSON.stringify({profile_key: key}), timeoutMs: 110000} : {});
+    if (request !== state.diagnosticRequest) return;
+    renderAppChecks(report);
+    if (run) await loadCheckHistory();
+  } catch (error) {
+    if (request === state.diagnosticRequest) {
+      state.diagnosticReport = null;
+      $("#diagnostic-summary").textContent = `Проверку не удалось завершить: ${error.message}`;
+      $("#diagnostic-results").replaceChildren();
+      $("#diagnostic-meta").textContent = "Предыдущие результаты доступны в журнале проверок.";
+      $("#diagnostic-test-result").textContent = "";
+      $("#diagnostic-copy").disabled = true;
+    }
+  } finally {
+    if (run) state.diagnosticBusy = false;
+    if (request === state.diagnosticRequest) {
+      for (const id of ["diagnostic-run", "diagnostic-self-test", "diagnostic-profile"]) $("#" + id).disabled = false;
+    }
+  }
+}
+
+async function loadCheckHistory() {
+  state.diagnosticHistory = await api('/api/checks/history');
+  $("#diagnostic-history").innerHTML = state.diagnosticHistory.slice(0, 5).map((report, index) => `
+    <div class="list-item"><strong>${escapeHtml(report.profile_label || "Без профиля")}</strong>
+      <p class="hint">${report.kind === "self_test" ? "Самотест · " : ""}${escapeHtml(formatDate(report.checked_at))} · ${escapeHtml(report.summary)}</p>
+      <button class="btn secondary mini" data-check-history="${index}">Открыть результат</button></div>`).join("") || "Проверок пока нет.";
+}
+
+function bindAppChecks() {
+  $("#open-checks").addEventListener("click", () => {
+    state.diagnosticProfileKey = state.launchProfileKey;
+    activateView("diagnostics");
+  });
+  $("#diagnostic-profile").addEventListener("change", () => {
+    state.diagnosticProfileKey = $("#diagnostic-profile").value;
+    loadAppChecks();
+  });
+  $("#diagnostic-run").addEventListener("click", () => loadAppChecks("run"));
+  $("#diagnostic-self-test").addEventListener("click", () => loadAppChecks("self-test"));
+  $("#diagnostic-copy").addEventListener("click", async () => {
+    if (!state.diagnosticReport) return;
+    try { await navigator.clipboard.writeText(JSON.stringify(state.diagnosticReport, null, 2)); toast("Отчёт скопирован"); }
+    catch { toast("Не удалось скопировать отчёт. Результат сохранён в журнале проверок, если запись журнала доступна."); }
+  });
+  document.addEventListener("click", event => {
+    const history = event.target.closest('[data-check-history]');
+    if (history && !state.diagnosticBusy) {
+      ++state.diagnosticRequest;
+      const report = state.diagnosticHistory[Number(history.dataset.checkHistory)];
+      if (report) renderAppChecks(report, true);
+    }
+    const button = event.target.closest('[data-check-action]');
+    if (!button || !state.diagnosticReport || state.diagnosticBusy) return;
+    const view = button.dataset.checkAction;
+    const key = state.diagnosticReport.profile_key;
+    if (view === "browser") {
+      if (state.loginInProgress) { toast("Сначала завершите или отмените вход."); return; }
+      $("#bot-profile").value = key;
+    }
+    if (view === "profiles") state.selectedProfileKey = key;
+    if (view === "messages") { state.messageScope = key; state.messageLoaded = false; }
+    if (isAdvancedView(view)) applyUiMode("advanced");
+    activateView(view);
+    if (view === "browser") loadSelectedBrowserProfile().catch(error => toast(error.message));
+  });
+}
+
 function renderWorkerQueue(queue) {
   const box = $("#worker-queue-list");
   if (!box) return;
   box.replaceChildren();
   const current = queue.current;
   const entries = queue.waiting || [];
-  $(".queue-help").hidden = Boolean(current || entries.length);
-  $("#worker-queue-status").textContent = queue.error || (queue.paused ? "Отправка на паузе. Ожидающие профили сохранены." : current ? `Сейчас: ${current.label || current.profile}. Ожидают: ${entries.length}.` : entries.length ? `Ожидают запуска: ${entries.length}.` : "Очередь пуста. Выберите профиль ниже и нажмите «Запустить».");
-  $("#worker-queue-clear").hidden = !entries.length;
-  $("#worker-queue-pause").hidden = !entries.length && !current && !queue.paused;
+  const held = queue.awaiting_login || [];
+  $(".queue-help").hidden = Boolean(current || entries.length || held.length);
+  const summary = queue.paused ? "Отправка на паузе. Ожидающие профили сохранены." : current ? `Сейчас: ${current.label || current.profile}. Ожидают: ${entries.length}.` : entries.length ? `Ожидают запуска: ${entries.length}.` : held.length ? "Других отправок в очереди нет." : "Очередь пуста. Выберите профиль ниже и нажмите «Запустить».";
+  $("#worker-queue-status").textContent = queue.error || summary + (held.length ? ` Ждут входа или продолжения: ${held.length}. Остальные профили могут работать.` : "");
+  $("#worker-queue-clear").hidden = !entries.length && !held.length;
+  $("#worker-queue-pause").hidden = !entries.length && !held.length && !current && !queue.paused;
   $("#worker-queue-pause").textContent = queue.paused ? "Продолжить отправку" : "Пауза отправки";
   $("#worker-queue-recovery").hidden = !entries.length || Boolean(current) || queue.paused;
   if (current) {
@@ -1651,11 +1785,30 @@ function renderWorkerQueue(queue) {
     row.append(name, status);
     box.append(row);
   }
-  for (const item of entries) {
+  for (const item of [...entries, ...held]) {
+    const needsLogin = held.includes(item);
     const row = document.createElement("div");
     row.className = "worker-queue-row";
     const title = document.createElement("span");
-    title.textContent = `${item.position}. ${item.label}`;
+    title.textContent = needsLogin ? `${item.label} · ${item.can_resume ? "Можно продолжить" : "Нужен вход"}` : `${item.position}. ${item.label}`;
+    if (needsLogin) {
+      const action = document.createElement("button");
+      action.className = "btn secondary mini";
+      action.textContent = item.can_resume ? "Продолжить" : "Войти в TikTok";
+      action.disabled = Boolean(queue.error || item.can_resume && queue.paused);
+      if (item.can_resume) {
+        action.dataset.profileAction = "start";
+        action.dataset.profileKey = item.profile;
+      } else {
+        action.addEventListener("click", () => {
+          if (state.loginInProgress) { toast("Сначала завершите или отмените вход."); return; }
+          $("#bot-profile").value = item.profile;
+          activateView("browser");
+          loadSelectedBrowserProfile().catch(error => toast(error.message));
+        });
+      }
+      row.append(action);
+    }
     const cancel = document.createElement("button");
     cancel.className = "btn secondary mini";
     cancel.textContent = "Отменить";
@@ -1665,7 +1818,8 @@ function renderWorkerQueue(queue) {
         await refresh();
       } catch (error) { toast(error.message); }
     });
-    row.append(title, cancel);
+    row.prepend(title);
+    row.append(cancel);
     box.append(row);
   }
 }
@@ -1799,6 +1953,12 @@ function bindNavigation() {
 function bindActions() {
   $("#launch-profile").addEventListener("change", () => {
     state.launchProfileKey = $("#launch-profile").value;
+    state.homeQueue = null;
+    state.homeReadiness = null;
+    setText("#home-protection", "Защита: проверяется…");
+    renderProfileSelectors(state.diagnostics || {});
+    renderHomeQueue();
+    renderHealth({});
     $("#launch-selected").disabled = true;
     loadHomeProfile().catch(error => toast(error.message));
   });
@@ -2092,7 +2252,7 @@ function bindActions() {
   $("#mode-toggle").addEventListener("click", () => {
     applyUiMode(state.uiMode === "simple" ? "advanced" : "simple");
   });
-  $("#overview-details").addEventListener("toggle", (event) => {
+  $("#diagnostic-technical-summary").addEventListener("toggle", (event) => {
     if (event.currentTarget.open) {
       loadFullDiagnostics().catch((error) => toast(error.message));
     }
@@ -2555,19 +2715,23 @@ function startAutoRefresh() {
   }, state.autoRefreshIntervalMs);
 }
 
+function renderHomeQueue() {
+  const queue = state.homeQueue;
+  if (!queue) { setPlainText("#queue-value", "Проверяем…"); setPlainText("#queue-meta", ""); return; }
+  const nextAt = Number(queue.next_send_at || 0);
+  const left = nextAt ? Math.max(0, Math.round(nextAt - Date.now() / 1000)) : Number(queue.next_send_in_s || 0);
+  const ready = Number(queue.ready_count || 0);
+  const unknown = Number(queue.unconfirmed_count || 0);
+  const value = !queue.target_count ? "Нет адресата" : unknown ? "Проверьте чат" : ready > 0 ? "Можно отправить" : formatDuration(left);
+  const meta = !queue.target_count ? "Добавьте адресата в профиле" : unknown ? "Есть отправка без подтверждения" : ready ? `Готовы адресаты: ${ready} из ${queue.target_count}` : queue.next_target ? `Адресат: ${queue.next_target}` : "Пауза между отправками";
+  setPlainText("#queue-value", value);
+  setPlainText("#queue-meta", meta);
+}
+
 function startQueueClock() {
   window.setInterval(() => {
-    if (document.hidden) return;
-    const queue = state.activeQueue || {};
-    if (!queue.target_count) return;
-    const nextAt = Number(queue.next_send_at || 0);
-    const left = nextAt ? Math.max(0, Math.round(nextAt - Date.now() / 1000)) : Number(queue.next_send_in_s || 0);
-    const value = Number(queue.ready_count || 0) > 0 ? `${queue.ready_count} готово` : formatDuration(left);
-    const meta = Number(queue.cooldown_count || 0) > 0
-      ? `${queue.cooldown_count} ожидают · ${queue.next_target || "ожидание"}`
-      : `${queue.target_count} адресатов · можно отправлять`;
-    setPlainText("#queue-value", value);
-    setPlainText("#queue-meta", meta);
+    if (document.hidden || state.activeView !== "overview") return;
+    renderHomeQueue();
   }, 1000);
 }
 
@@ -2628,6 +2792,7 @@ applyTheme(state.theme);
 applyUiMode(state.uiMode);
 bindNavigation();
 bindActions();
+bindAppChecks();
 bindShortcuts();
 refresh().catch((error) => toast(error.message));
 startAutoRefresh();
